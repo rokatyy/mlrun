@@ -3158,6 +3158,39 @@ class HTTPRunDB(RunDBInterface):
         resp = self.api_call("GET", endpoint_path, error)
         return resp.json()
 
+    def create_api_gateway(
+        self,
+        project: str,
+        name: str,
+        path: str,
+        functions: list,
+        username: str = None,
+        password: str = None,
+        canary: Union[None, Dict] = None,
+    ) -> bool:
+        """
+        Creates api gateway
+        :param project: optional str parameter to filter by project, if not passed, default Nuclio's value is taken
+        :param name: api gateway name
+        :param path: api gateway path
+        :param functions: the list of functions
+        :param password: password if authentication is required
+        :param username: username if authentication is required
+        :param canary: the list of canary function percent in the same sequence as functions has been passed
+
+        @return: true if response api gateway was created successfully
+        """
+        params = {"functions": functions, "path": path}
+        if username and password:
+            params["username"] = username
+            params["password"] = password
+        if canary:
+            params["canary"] = canary
+        error = "create api gateways"
+        endpoint_path = f"projects/{project}/nuclio/api-gateways/{name}"
+        response = self.api_call("POST", endpoint_path, error, params=params)
+        return response.ok
+
     def trigger_migrations(self) -> Optional[mlrun.common.schemas.BackgroundTask]:
         """Trigger migrations (will do nothing if no migrations are needed) and wait for them to finish if actually
         triggered

@@ -45,6 +45,7 @@ import mlrun.runtimes
 import mlrun.runtimes.pod
 import mlrun.runtimes.utils
 import mlrun.utils.regex
+import mlrun.runtimes.api_gateway
 from mlrun.datastore.datastore_profile import DatastoreProfile, DatastoreProfile2Json
 
 from ..artifacts import Artifact, ArtifactProducer, DatasetArtifact, ModelArtifact
@@ -3390,6 +3391,56 @@ class MlrunProject(ModelObj):
         :raise MLRunInvalidArgumentError: In case the packager was not in the list.
         """
         self.spec.remove_custom_packager(packager=packager)
+
+    def create_api_gateway(
+        self,
+        name: str,
+        path: str = "",
+        functions: list = [],
+        username: Union[None, str] = None,
+        password: Union[None, str] = None,
+        canary: Union[Dict, None] = None,
+    ) -> Union[mlrun.runtimes.api_gateway.APIGateway, None]:
+        """
+        Creates nuclio api gateway. Nuclio docs here: https://docs.nuclio.io/en/latest/reference/api-gateway/http.html
+
+        :param name: api gateway name
+        :param path: api gateway path
+        :param functions: the list of function names. For non-canary function pass a list of len=1
+        :param password: password if authentication is required
+        :param username: username if authentication is required
+        :param canary
+
+        @return: api gateway object
+
+        """
+        ok = mlrun.db.get_run_db().create_api_gateway(
+            project=self.name,
+            name=name,
+            path=path,
+            functions=functions,
+            username=username,
+            password=password,
+            canary=canary,
+        )
+        return (
+            mlrun.runtimes.api_gateway.new_api_gateway(
+                project=self.name,
+                name=name,
+                path=path,
+                username=username,
+                password=password,
+            )
+            if ok
+            else None
+        )
+
+    def list_api_gateways(self):
+        """
+        Lists nuclio api gateways. Nuclio docs here: https://docs.nuclio.io/en/latest/reference/api-gateway/http.html
+        :return api gateways json
+        """
+        mlrun.db.get_run_db().list_api_gateways(self.name)
 
     def _run_authenticated_git_action(
         self,

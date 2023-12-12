@@ -37,7 +37,7 @@ async def list_api_gateways(
     ).list_api_gateways(project)
 
     return await server.api.utils.auth.verifier.AuthVerifier().filter_project_resources_by_permissions(
-        mlrun.common.schemas.AuthorizationResourceTypes.api_gateways,
+        mlrun.common.schemas.AuthorizationResourceTypes.api_gateway,
         list(api_gateways.values()) if api_gateways else [],
         lambda _api_gateway: (
             _api_gateway.get("metadata", {})
@@ -46,4 +46,37 @@ async def list_api_gateways(
             _api_gateway.get("metadata", {}).get("name"),
         ),
         auth_info,
+    )
+
+
+@router.post("/projects/{project}/nuclio/api-gateways/{api-gateway}")
+async def create_api_gateway(
+    project: str,
+    api_gateway_name: str,
+    function_name: str = fastapi.Query(alias="function-name"),
+    path: str = fastapi.Query(alias="path"),
+    authentication_mode: str = fastapi.Query(alias="authentication-mode"),
+    description: str = fastapi.Query(alias="description"),
+    username: str = fastapi.Query(alias="username"),
+    password: str = fastapi.Query(alias="password"),
+    auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
+):
+    """await server.api.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
+        mlrun.common.schemas.AuthorizationResourceTypes.api_gateways,
+        project,
+        "",
+        mlrun.common.schemas.AuthorizationAction.create,
+        auth_info,
+    )"""
+    return await server.api.utils.clients.async_nuclio.Client(
+        auth_info
+    ).create_api_gateway(
+        project_name=project,
+        api_gateway_name=api_gateway_name,
+        function_name=function_name,
+        path=path,
+        authentication_mode=authentication_mode,
+        description=description,
+        username=username,
+        password=password,
     )
