@@ -32,6 +32,7 @@ import mlrun.common.schemas
 import mlrun.model_monitoring.model_endpoint
 import mlrun.platforms
 import mlrun.projects
+import mlrun.runtimes.api_gateway
 from mlrun.errors import MLRunInvalidArgumentError, err_to_str
 
 from ..artifacts import Artifact
@@ -3160,35 +3161,35 @@ class HTTPRunDB(RunDBInterface):
 
     def create_api_gateway(
         self,
-        project: str,
-        name: str,
-        path: str,
-        functions: list,
-        username: str = None,
-        password: str = None,
-        canary: Union[None, Dict] = None,
+        api_gateway: mlrun.runtimes.api_gateway.APIGateway,
+        auth: tuple,
     ) -> bool:
         """
         Creates api gateway
-        :param project: optional str parameter to filter by project, if not passed, default Nuclio's value is taken
-        :param name: api gateway name
-        :param path: api gateway path
-        :param functions: the list of functions
-        :param password: password if authentication is required
-        :param username: username if authentication is required
-        :param canary: the list of canary function percent in the same sequence as functions has been passed
+        :param api_gateway - api gateway entity
+        :param auth - pair of (username, password) if authentication is required
 
         @return: true if response api gateway was created successfully
         """
-        params = {"functions": functions, "path": path}
-        if username and password:
+        params = {
+            "functions": api_gateway.functions,
+            "path": api_gateway.path,
+            "description": api_gateway.description,
+            "host": api_gateway.host,
+        }
+        if api_gateway.requires_auth():
+            username, password = auth
             params["username"] = username
             params["password"] = password
         if canary:
             params["canary"] = canary
         error = "create api gateways"
-        endpoint_path = f"projects/{project}/nuclio/api-gateways/{name}"
+        endpoint_path = (
+            f"projects/{api_gateway.project}/nuclio/api-gateways/{api_gateway.name}"
+        )
         response = self.api_call("POST", endpoint_path, error, params=params)
+        if not response:
+            return False
         return response.ok
 
     def trigger_migrations(self) -> Optional[mlrun.common.schemas.BackgroundTask]:

@@ -14,6 +14,7 @@
 #
 import copy
 import urllib.parse
+from typing import Union
 
 import aiohttp
 
@@ -23,7 +24,7 @@ import mlrun.errors
 from mlrun.utils import logger
 
 NUCLIO_API_SESSIONS_ENDPOINT = "/api/sessions/"
-NUCLIO_API_GATEWAYS_ENDPOINT = "/api/api_gateways/{api_gateway}"
+NUCLIO_API_GATEWAYS_ENDPOINT = "/api/api_gateways/"
 API_GATEWAY_NAMESPACE_HEADER = "X-Nuclio-Api-Gateway-Namespace"
 NUCLIO_PROJECT_NAME_HEADER = "X-Nuclio-Project-Name"
 
@@ -55,14 +56,15 @@ class Client:
 
     async def create_api_gateway(
         self,
-        project_name,
-        api_gateway_name,
-        function_name,
+        project_name: str,
+        api_gateway_name: str,
+        functions: list,
+        host: Union[str, None] = None,
         path="/",
-        authentication_mode="none",
         description="",
-        username=None,
-        password=None,
+        username: Union[str, None] = None,
+        password: Union[str, None] = None,
+        canary: Union[list, None] = None,
     ):
         headers = {}
 
@@ -72,19 +74,19 @@ class Client:
         body = self._generate_nuclio_api_gateway_body(
             project_name=project_name,
             api_gateway_name=api_gateway_name,
-            function_name=function_name,
+            functions=functions,
+            host=host,
             path=path,
-            authentication_mode=authentication_mode,
             description=description,
             username=username,
             password=password,
-            canary=None,
+            canary=canary,
         )
 
         return await self._send_request_to_api(
             method="POST",
             url=self._nuclio_dashboard_url,
-            path=NUCLIO_API_GATEWAYS_ENDPOINT.format(api_gateway=api_gateway_name),
+            path=NUCLIO_API_GATEWAYS_ENDPOINT,
             headers=headers,
             json=body,
         )
@@ -149,15 +151,27 @@ class Client:
         self,
         project_name,
         api_gateway_name,
-        function_name,
+        functions,
+        host,
         path,
-        authentication_mode,
-        description,
-        username,
-        password,
-        canary,
-    ) -> Dict:
-        host = f"{api_gateway_name}-{project_name}.{self._nuclio_domain}"
+        description="",
+        username=None,
+        password=None,
+        canary=None,
+    ) -> dict:
+        if not functions:
+            raise ValueError("functions should contain at least one object")
+        host = (
+            f"{api_gateway_name}-{project_name}.{self._nuclio_domain[self._nuclio_domain.find('.')+1:]}"
+            if not host
+            else host
+        )
+
+        authentication_mode = (
+            NO_AUTH_NUCLIO_API_GATEWAY_AUTH_MODE
+            if not username and not password
+            else BASIC_AUTH_NUCLIO_API_GATEWAY_AUTH_MODE
+        )
         body = {
             "spec": {
                 "name": api_gateway_name,
@@ -168,7 +182,7 @@ class Client:
                     {
                         "kind": "nucliofunction",
                         "nucliofunction": {
-                            "name": function_name,
+                            "name": functions[0],
                         },
                         "percentage": 0,
                     }
@@ -199,6 +213,20 @@ class Client:
 
         # increments canary func info
         if canary:
-            body["spec"]["upstreams"] = []
+            if len(canary) != len(functions):
+                raise ValueError("Functions list should be the same length as canary list")
+            upstream = []
+            for index in range(len(functions)):
+                name, percentage = functions[index], canary[index]
+                upstream.append(
+                    {
+                        "kind": "nucliofunction",
+                        "nucliofunction": {
+                            "name": name,
+                        },
+                        "percentage": percentage,
+                    }
+                )
+            body["spec"]["upstreams"] = upstream
 
         return body

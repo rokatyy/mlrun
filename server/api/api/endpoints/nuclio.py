@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Body
 
 import mlrun.common.schemas
 import server.api.utils.clients.async_nuclio
 from server.api.api import deps
+from typing import Union
 
 router = APIRouter()
 
@@ -49,16 +50,17 @@ async def list_api_gateways(
     )
 
 
-@router.post("/projects/{project}/nuclio/api-gateways/{api-gateway}")
+@router.post("/projects/{project}/nuclio/api-gateways/{gateway}")
 async def create_api_gateway(
     project: str,
-    api_gateway_name: str,
-    function_name: str = fastapi.Query(alias="function-name"),
-    path: str = fastapi.Query(alias="path"),
-    authentication_mode: str = fastapi.Query(alias="authentication-mode"),
-    description: str = fastapi.Query(alias="description"),
-    username: str = fastapi.Query(alias="username"),
-    password: str = fastapi.Query(alias="password"),
+    gateway: str,
+    functions: list = Query(alias="functions"),
+    host: Union[str, None] = None,
+    path: Union[str, None] = None,
+    description: Union[str, None] = None,
+    username: Union[str, None] = None,
+    password: Union[str, None] = None,
+    canary: Union[list, None] = None,
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
 ):
     """await server.api.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
@@ -68,15 +70,16 @@ async def create_api_gateway(
         mlrun.common.schemas.AuthorizationAction.create,
         auth_info,
     )"""
-    return await server.api.utils.clients.async_nuclio.Client(
+    await server.api.utils.clients.async_nuclio.Client(
         auth_info
     ).create_api_gateway(
         project_name=project,
-        api_gateway_name=api_gateway_name,
-        function_name=function_name,
+        api_gateway_name=gateway,
+        functions=functions,
+        host=host,
         path=path,
-        authentication_mode=authentication_mode,
         description=description,
         username=username,
         password=password,
+        canary=canary,
     )

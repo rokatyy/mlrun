@@ -3396,10 +3396,11 @@ class MlrunProject(ModelObj):
         self,
         name: str,
         path: str = "",
+        description: str = "",
         functions: list = [],
         username: Union[None, str] = None,
         password: Union[None, str] = None,
-        canary: Union[Dict, None] = None,
+        canary: Union[Dict[str, int], None] = None,
     ) -> Union[mlrun.runtimes.api_gateway.APIGateway, None]:
         """
         Creates nuclio api gateway. Nuclio docs here: https://docs.nuclio.io/en/latest/reference/api-gateway/http.html
@@ -3414,26 +3415,21 @@ class MlrunProject(ModelObj):
         @return: api gateway object
 
         """
-        ok = mlrun.db.get_run_db().create_api_gateway(
+        gateway_instance = mlrun.runtimes.api_gateway.new_api_gateway(
             project=self.name,
             name=name,
+            host=host,
             path=path,
+            description=description,
             functions=functions,
             username=username,
             password=password,
             canary=canary,
         )
-        return (
-            mlrun.runtimes.api_gateway.new_api_gateway(
-                project=self.name,
-                name=name,
-                path=path,
-                username=username,
-                password=password,
-            )
-            if ok
-            else None
+        ok = mlrun.db.get_run_db().create_api_gateway(
+            gateway_instance, (username, password)
         )
+        return gateway_instance if ok else None
 
     def list_api_gateways(self):
         """

@@ -22,18 +22,24 @@ class APIGateway:
         self,
         project,
         name: str,
+        host: str,
         path: str,
+        description: str,
+        functions: list[str],
         username: Union[None, str],
         password: Union[None, str],
+        canary: Union[dict[str, int], None],
     ):
         self.project = project
         self.name = name
+        self.host = host
+        self.functions = functions
         self.path = path
+        self.description = description
         self.canary = canary
         self._auth = None
-        self._invoke_url = None
+        self._invoke_url = self._generate_invoke_url() if not host else host
         self._generate_auth(username, password)
-        self._generate_invoke_url()
 
     def invoke(self):
         headers = {} if not self._auth else {"Authorization": self._auth}
@@ -44,23 +50,30 @@ class APIGateway:
             token = base64.b64encode(f"{username}:{password}")
             self._auth = f"Basic {token}"
 
+    def requires_auth(self):
+        return self._auth is not None
+
     def _generate_invoke_url(self):
         nuclio_hostname = urllib.parse.urlparse(
             self.mlrun.mlconf.nuclio_dashboard_url
         ).netloc
         # cut nuclio prefix
-        common_hostname = nuclio_hostname[nuclio_hostname.find(".")+1:]
-        self._invoke_url = urllib.parse.urljoin(
+        common_hostname = nuclio_hostname[nuclio_hostname.find(".") + 1 :]
+        return urllib.parse.urljoin(
             f"{self.name}-{self.project}.{common_hostname}", self.path
         )
 
 
 def new_api_gateway(
-    project: str,
+    project,
     name: str,
+    host: str,
     path: str,
+    description: str,
+    functions: list[str],
     username: Union[None, str],
     password: Union[None, str],
+    canary: Union[dict[str, int], None],
 ) -> APIGateway:
     if not name:
         raise ValueError("API Gateway name cannot be empty")
@@ -76,5 +89,13 @@ def new_api_gateway(
                 f"Th sum of canary function percents should be equal to 100"
             )
     return APIGateway(
-        project=project, name=name, path=path, username=username, password=password
+        project=project,
+        name=name,
+        host=host,
+        path=path,
+        description=description,
+        functions=functions,
+        username=username,
+        password=password,
+        canary=canary,
     )
