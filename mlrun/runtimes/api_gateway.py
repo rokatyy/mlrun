@@ -16,6 +16,8 @@ from typing import Union
 import urllib.parse
 import requests
 
+import mlrun
+
 
 class APIGateway:
     def __init__(
@@ -37,6 +39,7 @@ class APIGateway:
         self.path = path
         self.description = description
         self.canary = canary
+        self._nuclio_dashboard_url = mlrun.mlconf.nuclio_dashboard_url
         self._auth = None
         self._invoke_url = self._generate_invoke_url() if not host else host
         self._generate_auth(username, password)
@@ -55,7 +58,7 @@ class APIGateway:
 
     def _generate_invoke_url(self):
         nuclio_hostname = urllib.parse.urlparse(
-            self.mlrun.mlconf.nuclio_dashboard_url
+            self._nuclio_dashboard_url
         ).netloc
         # cut nuclio prefix
         common_hostname = nuclio_hostname[nuclio_hostname.find(".") + 1 :]
@@ -73,18 +76,17 @@ def new_api_gateway(
     functions: list[str],
     username: Union[None, str],
     password: Union[None, str],
-    canary: Union[dict[str, int], None],
+    canary: Union[list[int], None],
 ) -> APIGateway:
     if not name:
         raise ValueError("API Gateway name cannot be empty")
 
     if canary:
-        for func in functions:
-            if func not in canary:
-                raise ValueError(
-                    f"Canary object doesn't contain percent value for function {func}"
-                )
-        if sum(canary.values()) != 100:
+        if len(functions) != len(canary):
+            raise ValueError(
+                f"Lengths of function and canary lists do not match"
+            )
+        if sum(canary) != 100:
             raise ValueError(
                 f"Th sum of canary function percents should be equal to 100"
             )

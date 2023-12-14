@@ -216,13 +216,12 @@ class Client:
             if len(canary) != len(functions):
                 raise ValueError("Functions list should be the same length as canary list")
             upstream = []
-            for index in range(len(functions)):
-                name, percentage = functions[index], canary[index]
+            for function_name, percentage in zip(functions, canary):
                 upstream.append(
                     {
                         "kind": "nucliofunction",
                         "nucliofunction": {
-                            "name": name,
+                            "name": function_name,
                         },
                         "percentage": percentage,
                     }

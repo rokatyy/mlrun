@@ -59,6 +59,7 @@ from ..model_monitoring.application import (
 )
 from ..run import code_to_function, get_object, import_function, new_function
 from ..runtimes.function import RemoteRuntime
+from ..runtimes.serving import ServingRuntime
 from ..secrets import SecretsStore
 from ..utils import (
     is_ipython,
@@ -3395,12 +3396,13 @@ class MlrunProject(ModelObj):
     def create_api_gateway(
         self,
         name: str,
+        host: str = None,
         path: str = "",
         description: str = "",
-        functions: list = [],
+        functions: list[Union[RemoteRuntime, ServingRuntime]] = [],
         username: Union[None, str] = None,
         password: Union[None, str] = None,
-        canary: Union[Dict[str, int], None] = None,
+        canary: Union[list[int], None] = None,
     ) -> Union[mlrun.runtimes.api_gateway.APIGateway, None]:
         """
         Creates nuclio api gateway. Nuclio docs here: https://docs.nuclio.io/en/latest/reference/api-gateway/http.html
@@ -3415,13 +3417,18 @@ class MlrunProject(ModelObj):
         @return: api gateway object
 
         """
+        for func in functions:
+            if not (isinstance(func, RemoteRuntime) or isinstance(func, ServingRuntime)):
+                raise ValueError(f"Input function {func.name} is not a Nuclio function")
+
+        function_names = [func.metadata.name for func in functions]
         gateway_instance = mlrun.runtimes.api_gateway.new_api_gateway(
             project=self.name,
             name=name,
             host=host,
             path=path,
             description=description,
-            functions=functions,
+            functions=function_names,
             username=username,
             password=password,
             canary=canary,

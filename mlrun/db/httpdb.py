@@ -3181,8 +3181,10 @@ class HTTPRunDB(RunDBInterface):
             username, password = auth
             params["username"] = username
             params["password"] = password
-        if canary:
-            params["canary"] = canary
+
+        # for user
+        if api_gateway.canary_dict:
+            params["canary"] = api_gateway.canary
         error = "create api gateways"
         endpoint_path = (
             f"projects/{api_gateway.project}/nuclio/api-gateways/{api_gateway.name}"
