@@ -85,7 +85,7 @@ class BasicAuth(APIGatewayAuthenticator):
         self,
     ) -> Optional[dict[str, Optional[mlrun.common.schemas.APIGatewayBasicAuth]]]:
         return {
-            "authentication": mlrun.common.schemas.APIGatewayBasicAuth(
+            "basicAuth": mlrun.common.schemas.APIGatewayBasicAuth(
                 username=self._username, password=self._password
             )
         }
@@ -262,10 +262,14 @@ class APIGateway:
         upstreams = (
             [
                 mlrun.common.schemas.APIGatewayUpstream(
-                    nucliofunction={"name": function_name},
-                    percentage=percentage,
-                )
-                for function_name, percentage in zip(self.functions, self.canary)
+                    nucliofunction={"name": self.functions[0]},
+                    percentage=self.canary[0],
+                ),
+                mlrun.common.schemas.APIGatewayUpstream(
+                    # do not set percent for the second function,
+                    # so we can define which function to display as a primary one in UI
+                    nucliofunction={"name": self.functions[1]},
+                ),
             ]
             if self.canary
             else [
@@ -300,6 +304,8 @@ class APIGateway:
 
         :return: (str) The invoke URL.
         """
+        if not self.host.startswith("http"):
+            self.host = f"https://{self.host}"
         return urljoin(self.host, self.path)
 
     def _validate(
