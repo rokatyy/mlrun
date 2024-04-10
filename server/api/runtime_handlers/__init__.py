@@ -19,6 +19,7 @@ from server.api.runtime_handlers.kubejob import (
     DatabricksRuntimeHandler,
     KubeRuntimeHandler,
 )
+from server.api.runtime_handlers.remote import RemoteRuntimeHandler
 from server.api.runtime_handlers.mpijob import (
     MpiRuntimeHandlerContainer,
     resolve_mpijob_crd_version,
@@ -49,6 +50,7 @@ def get_runtime_handler(kind: str) -> BaseRuntimeHandler:
         RuntimeKinds.remotespark: RemoteSparkRuntimeHandler,
         RuntimeKinds.job: KubeRuntimeHandler,
         RuntimeKinds.databricks: DatabricksRuntimeHandler,
+        RuntimeKinds.remote: RemoteRuntimeHandler,
     }
     runtime_handler_class = kind_runtime_handler_map[kind]
     if not runtime_handler_instances_cache.get(kind):
