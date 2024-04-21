@@ -19,11 +19,11 @@ from server.api.runtime_handlers.kubejob import (
     DatabricksRuntimeHandler,
     KubeRuntimeHandler,
 )
-from server.api.runtime_handlers.remote import RemoteRuntimeHandler
 from server.api.runtime_handlers.mpijob import (
     MpiRuntimeHandlerContainer,
     resolve_mpijob_crd_version,
 )
+from server.api.runtime_handlers.remote import RemoteRuntimeHandler
 from server.api.runtime_handlers.remotesparkjob import RemoteSparkRuntimeHandler
 from server.api.runtime_handlers.sparkjob.spark3job import Spark3RuntimeHandler
 

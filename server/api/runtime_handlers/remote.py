@@ -23,17 +23,8 @@ class RemoteRuntimeHandler(BaseRuntimeHandler):
     def _get_object_label_selector(object_id: str) -> str:
         pass
 
-    def run(
-        self,
-        runtime: mlrun.runtimes.BaseRuntime,
-        run: mlrun.run.RunObject,
-        execution: mlrun.execution.MLClientCtx,
-    ):
-        raise NotImplementedError(
-            "Execution of remote functions is done locally"
-        )
-
     def delete_resources(
+            
         self,
         db: DBInterface,
         db_session: Session,
