@@ -20,6 +20,7 @@ import semver
 import sqlalchemy.orm
 from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from sqlalchemy.orm import Session
 
 import mlrun.common.schemas
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
@@ -109,6 +110,7 @@ async def store_api_gateway(
     gateway: str,
     api_gateway: mlrun.common.schemas.APIGateway,
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
+    db_session: Session = Depends(deps.get_db_session),
 ):
     await server.api.utils.auth.verifier.AuthVerifier().query_project_permissions(
         project_name=project,
@@ -137,6 +139,16 @@ async def store_api_gateway(
             name=gateway,
             project_name=project,
         )
+        """
+    if api_gateway:
+        await run_in_threadpool(
+            server.api.crud.functions.Functions.update_functions_external_invocation_url,
+            db_session,
+            api_gateway,
+            project,
+        )
+    
+        """
     return api_gateway
 
 

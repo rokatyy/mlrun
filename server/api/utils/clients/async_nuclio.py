@@ -21,7 +21,7 @@ import aiohttp
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.utils
-from mlrun.common.constants import MLRUN_CREATED_LABEL
+from mlrun.common.constants import MLRUN_CREATED_LABEL, MLRUN_FUNCTIONS_LABEL
 from mlrun.utils import logger
 
 NUCLIO_API_SESSIONS_ENDPOINT = "/api/sessions/"
@@ -61,7 +61,9 @@ class Client:
         )
         parsed_api_gateways = {}
         for name, gw in api_gateways.items():
-            parsed_api_gateways[name] = mlrun.common.schemas.APIGateway.parse_obj(gw)
+            parsed_api_gateways[name] = self._replace_nuclio_names_with_mlrun_uri(
+                mlrun.common.schemas.APIGateway.parse_obj(gw)
+            )
         return parsed_api_gateways
 
     async def api_gateway_exists(self, name: str, project_name: str = None):
@@ -78,7 +80,9 @@ class Client:
             path=NUCLIO_API_GATEWAYS_ENDPOINT_TEMPLATE.format(api_gateway=name),
             headers=headers,
         )
-        return mlrun.common.schemas.APIGateway.parse_obj(api_gateway)
+        return self._replace_nuclio_names_with_mlrun_uri(
+            mlrun.common.schemas.APIGateway.parse_obj(api_gateway)
+        )
 
     async def store_api_gateway(
         self,
@@ -140,6 +144,50 @@ class Client:
     def _set_iguazio_labels(self, nuclio_object, project_name):
         nuclio_object.metadata.labels[NUCLIO_PROJECT_NAME_LABEL] = project_name
         nuclio_object.metadata.labels[MLRUN_CREATED_LABEL] = "true"
+
+    def _enrich_mlrun_function_names(
+        self, api_gateway: mlrun.common.schemas.APIGateway
+    ):
+        upstream_with_nuclio_names = []
+        mlrun_function_uris = []
+        for upstream in api_gateway.spec.upstreams:
+            uri = upstream.nucliofunction.get("name")
+            project, function_name, tag, _ = (
+                mlrun.common.helpers.parse_versioned_object_uri(uri)
+            )
+            upstream.nucliofunction["name"] = (
+                mlrun.runtimes.nuclio.function.get_fullname(function_name, project, tag)
+            )
+
+            upstream_with_nuclio_names.append(upstream)
+            mlrun_function_uris.append(uri)
+
+        api_gateway.spec.upstreams = upstream_with_nuclio_names
+        if len(mlrun_function_uris) == 1:
+            api_gateway.metadata.labels[MLRUN_FUNCTIONS_LABEL] = mlrun_function_uris[0]
+        elif len(mlrun_function_uris) == 2:
+            api_gateway.metadata.labels[MLRUN_FUNCTIONS_LABEL] = "&".join(
+                mlrun_function_uris
+            )
+
+    def _replace_nuclio_names_with_mlrun_uri(self, api_gateway):
+        mlrun_functions = api_gateway.metadata.labels.get(MLRUN_FUNCTIONS_LABEL)
+        if mlrun_functions is None:
+            mlrun_function_uris = (
+                mlrun_functions.split("&")
+                if "&" in mlrun_functions
+                else mlrun_functions
+            )
+            if len(mlrun_function_uris) != len(api_gateway.spec.upstreams):
+                raise mlrun.errors.MLRunValueError(
+                    "Error when translating nuclio names to mlrun names in api gateway:"
+                    " upstream length doesn't match with mlrun functions label"
+                )
+            for i in range(len(mlrun_function_uris)):
+                api_gateway.spec.upstreams[i].nucliofunction["name"] = (
+                    mlrun_function_uris[i]
+                )
+        return api_gateway
 
     async def _ensure_async_session(self):
         if not self._session:
@@ -217,4 +265,5 @@ class Client:
         api_gateway: mlrun.common.schemas.APIGateway,
     ) -> mlrun.common.schemas.APIGateway:
         self._set_iguazio_labels(api_gateway, project_name)
+        self._enrich_mlrun_function_names(api_gateway)
         return api_gateway

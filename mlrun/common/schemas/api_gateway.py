@@ -91,6 +91,13 @@ class APIGateway(_APIGatewayBaseModel):
     spec: APIGatewaySpec
     status: Optional[APIGatewayStatus]
 
+    def get_function_names(self):
+        return [
+            upstream.nucliofunction.get("name")
+            for upstream in self.spec.upstreams
+            if upstream.nucliofunction.get("name")
+        ]
+
 
 class APIGatewaysOutput(_APIGatewayBaseModel):
     api_gateways: typing.Optional[dict[str, APIGateway]] = {}

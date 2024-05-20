@@ -148,3 +148,21 @@ class Functions(
             project=project,
             updates=deleting_updates,
         )
+
+    def update_functions_external_invocation_url(
+        self,
+        db_session: sqlalchemy.orm.Session,
+        api_gateway: mlrun.common.schemas.APIGateway,
+        project: str,
+    ):
+        api_gateway_host = api_gateway.spec.host
+        function_names = api_gateway.get_function_names()
+        for function_name in function_names:
+            function = (
+                server.api.utils.singletons.db.get_db().get_function_by_nuclio_name(
+                    db_session, function_name, project
+                )
+            )
+            server.api.utils.singletons.db.get_db().add_function_external_invocation_url(
+                function, api_gateway_host
+            )

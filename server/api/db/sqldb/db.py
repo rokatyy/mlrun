@@ -27,7 +27,7 @@ from typing import Any
 import fastapi.concurrency
 import mergedeep
 import pytz
-from sqlalchemy import MetaData, and_, distinct, func, or_, text
+from sqlalchemy import JSON, MetaData, and_, cast, distinct, func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -1702,6 +1702,31 @@ class SQLDB(DBInterface):
             function.struct = struct
             self._upsert(session, [function])
             return function.struct
+
+    def get_function_by_nuclio_name(
+        self, session, nuclio_name: str, project: str = None
+    ):
+        project = project or config.default_project
+        query = self._query(session, Function, project=project)
+        query = query.filter(
+            func.json_extract(cast(Function.struct, JSON), "$.nuclio_name")
+            == nuclio_name
+        )
+        obj = query.one_or_none()
+        if obj:
+            return obj
+
+    def add_function_external_invocation_url(
+        self, function: Function, external_invocation_url: str
+    ):
+        struct = function.struct
+        existing_invocation_urls = struct["status"].get("external_invocation_url")
+        if existing_invocation_urls:
+            struct["status"]["external_invocation_urls"].append(external_invocation_url)
+        else:
+            struct["status"]["external_invocation_urls"] = [existing_invocation_urls]
+        function.struct = struct
+        self._upsert(session, [function])
 
     def _get_function(self, session, name, project="", tag="", hash_key=""):
         project = project or config.default_project
