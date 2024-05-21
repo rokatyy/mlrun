@@ -173,6 +173,7 @@ class APIGatewaySpec(ModelObj):
         canary: Optional[list[int]] = None,
         ports: Optional[list[int]] = None,
     ):
+        mlrun.runtimes.nuclio.api_gateway.BasicAuth
         """
         :param functions: The list of functions associated with the API gateway
             Can be a list of function names (["my-func1", "my-func2"])

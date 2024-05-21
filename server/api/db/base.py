@@ -21,7 +21,6 @@ import mlrun.alerts
 import mlrun.common.schemas
 import mlrun.lists
 import mlrun.model
-from server.api.db.sqldb.models import Function
 
 
 class DBError(Exception):
@@ -325,14 +324,26 @@ class DBInterface(ABC):
         pass
 
     @abstractmethod
-    def get_function_by_nuclio_name(
-        self, session, nuclio_name: str, project: str = None
+    def add_function_external_invocation_url(
+        self,
+        session,
+        name,
+        external_invocation_url: str,
+        project="",
+        tag="",
+        hash_key="",
     ):
         pass
 
     @abstractmethod
-    def add_function_external_invocation_url(
-        self, function: Function, external_invocation_url: str
+    def delete_function_external_invocation_url(
+        self,
+        session,
+        name,
+        external_invocation_url: str,
+        project="",
+        tag="",
+        hash_key="",
     ):
         pass
 

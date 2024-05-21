@@ -27,7 +27,7 @@ from typing import Any
 import fastapi.concurrency
 import mergedeep
 import pytz
-from sqlalchemy import JSON, MetaData, and_, cast, distinct, func, or_, text
+from sqlalchemy import MetaData, and_, distinct, func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -1703,30 +1703,53 @@ class SQLDB(DBInterface):
             self._upsert(session, [function])
             return function.struct
 
-    def get_function_by_nuclio_name(
-        self, session, nuclio_name: str, project: str = None
-    ):
-        project = project or config.default_project
-        query = self._query(session, Function, project=project)
-        query = query.filter(
-            func.json_extract(cast(Function.struct, JSON), "$.nuclio_name")
-            == nuclio_name
-        )
-        obj = query.one_or_none()
-        if obj:
-            return obj
-
     def add_function_external_invocation_url(
-        self, function: Function, external_invocation_url: str
+        self,
+        session,
+        name,
+        external_invocation_url: str,
+        project="",
+        tag="",
+        hash_key="",
     ):
+        normalized_function_name = mlrun.utils.normalize_name(name)
+        function = self._get_function_object(
+            session, normalized_function_name, project, tag, hash_key
+        )
         struct = function.struct
         existing_invocation_urls = struct["status"].get("external_invocation_url")
-        if existing_invocation_urls:
+        if (
+            existing_invocation_urls
+            and external_invocation_url not in existing_invocation_urls
+        ):
             struct["status"]["external_invocation_urls"].append(external_invocation_url)
         else:
-            struct["status"]["external_invocation_urls"] = [existing_invocation_urls]
+            struct["status"]["external_invocation_urls"] = [external_invocation_url]
         function.struct = struct
         self._upsert(session, [function])
+
+    def delete_function_external_invocation_url(
+        self,
+        session,
+        name,
+        external_invocation_url: str,
+        project="",
+        tag="",
+        hash_key="",
+    ):
+        normalized_function_name = mlrun.utils.normalize_name(name)
+        function = self._get_function_object(
+            session, normalized_function_name, project, tag, hash_key
+        )
+        struct = function.struct
+        existing_invocation_urls = struct["status"].get("external_invocation_url")
+        if (
+            existing_invocation_urls
+            and external_invocation_url in existing_invocation_urls
+        ):
+            struct["status"]["external_invocation_urls"].remove(external_invocation_url)
+            function.struct = struct
+            self._upsert(session, [function])
 
     def _get_function(self, session, name, project="", tag="", hash_key=""):
         project = project or config.default_project
@@ -1757,6 +1780,16 @@ class SQLDB(DBInterface):
         else:
             function_uri = generate_object_uri(project, name, tag, hash_key)
             raise mlrun.errors.MLRunNotFoundError(f"Function not found {function_uri}")
+
+    def _get_function_object(self, session, name, project="", tag="", hash_key=""):
+        project = project or config.default_project
+        query = self._query(session, Function, name=name, project=project)
+        uid = self._get_function_uid(
+            session=session, name=name, tag=tag, hash_key=hash_key, project=project
+        )
+        if uid:
+            query = query.filter(Function.uid == uid)
+        return query.one_or_none()
 
     def _get_function_uid(
         self, session, name: str, tag: str, hash_key: str, project: str
