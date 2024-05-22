@@ -1712,18 +1712,24 @@ class SQLDB(DBInterface):
         tag="",
         hash_key="",
     ):
+        logger.debug("Adding external invocation url to db", project=project, name=name, external_invocation_url=external_invocation_url)
+        project = project or config.default_project
         normalized_function_name = mlrun.utils.normalize_name(name)
         function = self._get_function_object(
             session, normalized_function_name, project, tag, hash_key
         )
         struct = function.struct
-        existing_invocation_urls = struct["status"].get("external_invocation_url")
+        existing_invocation_urls = struct["status"].get("external_invocation_urls")
         if (
             existing_invocation_urls
-            and external_invocation_url not in existing_invocation_urls
         ):
-            struct["status"]["external_invocation_urls"].append(external_invocation_url)
+            logger.debug("Adding additional external invocation url to db", project=project, name=name,
+                         external_invocation_url=external_invocation_url)
+            if external_invocation_url not in existing_invocation_urls:
+                struct["status"]["external_invocation_urls"].append(external_invocation_url)
         else:
+            logger.debug("Adding new external invocation url to db", project=project, name=name,
+                         external_invocation_url=external_invocation_url)
             struct["status"]["external_invocation_urls"] = [external_invocation_url]
         function.struct = struct
         self._upsert(session, [function])
@@ -1737,10 +1743,14 @@ class SQLDB(DBInterface):
         tag="",
         hash_key="",
     ):
+        project = project or config.default_project
         normalized_function_name = mlrun.utils.normalize_name(name)
-        function = self._get_function_object(
-            session, normalized_function_name, project, tag, hash_key
-        )
+        try:
+            function = self._get_function_object(
+                session, normalized_function_name, project, tag, hash_key
+            )
+        except mlrun.errors.MLRunNotFoundError:
+            return
         struct = function.struct
         existing_invocation_urls = struct["status"].get("external_invocation_url")
         if (

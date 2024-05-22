@@ -315,7 +315,10 @@ class APIGatewaySpec(ModelObj):
                     f"does not belong to this project"
                 )
             function_uri = mlrun.utils.generate_object_uri(
-                project, function_name, func.metadata.tag
+                project,
+                function_name,
+                func.metadata.tag,
+                func.metadata.hash_key,
             )
             function_names.append(function_uri)
         return function_names

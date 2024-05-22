@@ -160,7 +160,12 @@ class Functions(
             mlrun.common.helpers.parse_versioned_object_uri(function_uri)
         )
         server.api.utils.singletons.db.get_db().add_function_external_invocation_url(
-            db_session, function_name, invocation_url, project, tag, hash_key
+            session=db_session,
+            name=function_name,
+            external_invocation_url=invocation_url,
+            project=project,
+            tag=tag,
+            hash_key=hash_key,
         )
 
     def delete_function_external_invocation_url(
