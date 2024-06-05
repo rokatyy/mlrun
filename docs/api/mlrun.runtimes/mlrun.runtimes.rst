@@ -6,6 +6,8 @@ mlrun.runtimes
    :show-inheritance:
    :undoc-members:
 
+mlrun.runtimes.nuclio
+==============
 .. automodule:: mlrun.runtimes.nuclio.api_gateway
    :members:
    :show-inheritance:
