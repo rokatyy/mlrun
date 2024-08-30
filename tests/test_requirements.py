@@ -108,9 +108,6 @@ def test_requirement_specifiers_convention():
                 continue
 
     ignored_invalid_map = {
-        # 0.1.0 is not compatible with mlrun >=1.7.0rc19
-        "mlrun-pipelines-kfp-common": {"~=0.1.2"},
-        "mlrun-pipelines-kfp-v1-8": {"~=0.1.2"},
         # See comment near requirement for why we're limiting to patch changes only for all of these
         "aiobotocore": {">=2.5.0,<2.8"},
         "storey": {"~=1.7.23"},
@@ -140,7 +137,7 @@ def test_requirement_specifiers_convention():
         "apscheduler": {"~=3.6, !=3.10.2"},
         # used in tests
         "aioresponses": {"~=0.7"},
-        "scikit-learn": {"~=1.4.0"},
+        "scikit-learn": {"~=1.5.1"},
     }
 
     for (
