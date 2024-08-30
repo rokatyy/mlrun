@@ -322,14 +322,6 @@ class ApplicationRuntime(RemoteRuntime):
         self._ensure_reverse_proxy_configurations(self)
         self._configure_application_sidecar()
 
-        if (
-            authentication_mode == schemas.APIGatewayAuthenticationMode.basic
-            and not authentication_creds
-        ):
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                "Authentication credentials not provided"
-            )
-
         # We only allow accessing the application via the API Gateway
         self.spec.add_templated_ingress_host_mode = (
             NuclioIngressAddTemplatedIngressModes.never
@@ -463,6 +455,14 @@ class ApplicationRuntime(RemoteRuntime):
         if not set_as_default and name == self.resolve_default_api_gateway_name():
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"Non-default API gateway cannot use the default gateway name, {name=}."
+            )
+
+        if (
+            authentication_mode == schemas.APIGatewayAuthenticationMode.basic
+            and not authentication_creds
+        ):
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "Authentication credentials not provided"
             )
 
         ports = self.spec.internal_application_port if direct_port_access else []
