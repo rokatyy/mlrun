@@ -12,74 +12,104 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import subprocess
-from typing import List, Dict, Union, Any, Optional
+from typing import Any, Dict, List, Optional, Union
+
+import mlrun.common.schemas
 from mlrun.utils import logger
 
+
 class NIM:
-    def __init__(self,
-                 model: str,
-                 NGC_API_KEY: str,
-                 project_name: str,
-                 image_name: Optional[str],
-                 node_selection: Optional[Dict] = None,
-                 skip_deploy: Optional[bool] = True,
-                 ignore_secret_creation_errors: Optional[bool] = True,
-                 create_default_api_gateway = True,
-                 **invocation_kwargs):
+    def __init__(
+        self,
+        model: str,
+        NGC_API_KEY: str,
+        project_name: str,
+        image_name: Optional[str],
+        node_selection: Optional[Dict] = None,
+        skip_deploy: Optional[bool] = True,
+        ignore_secret_creation_errors: Optional[bool] = True,
+        authentication_mode: mlrun.common.schemas.APIGatewayAuthenticationMode = mlrun.common.schemas.APIGatewayAuthenticationMode.none,
+        authentication_creds: tuple[str, str] = None,
+        **invocation_kwargs,
+    ):
+        self.api_gateway = None
         self.model = model
         self.image_name = image_name or f"nvcr.io/nim/{model}:latest"
         self._NGC_API_KEY = NGC_API_KEY
         self.project = mlrun.get_or_create_project(project_name)
-        self.docker_creds_secret_name = f"{self.project.name}-{self.model}-nim-creds".replace('/', '-')
-        self.ngc_secret_name = f"{self.project.name}-{self.model}-ngc-api-key".replace('/', '-')
+        self.docker_creds_secret_name = (
+            f"{self.project.name}-{self.model}-nim-creds".replace("/", "-")
+        )
+        self.ngc_secret_name = f"{self.project.name}-{self.model}-ngc-api-key".replace(
+            "/", "-"
+        )
         self.application = None
         self.node_selection = node_selection
         self.ignore_secret_creation_errors = ignore_secret_creation_errors
-        self.application_name = self.model.replace('/', '-')
-        self.create_default_api_gateway = create_default_api_gateway
+        self.application_name = self.model.replace("/", "-")
+        self.api_gateway_name = f"{self.application_name}-gw"
+        self.authentication_mode = authentication_mode
+        self._authentication_creds = authentication_creds
 
         # Dynamically assign each kwarg to an instance variable
         self.invocation_kwargs = invocation_kwargs
         if not skip_deploy:
             self.deploy()
         else:
-            self.application = self.project.get_function(self.application_name, ignore_cache=True)
+            self.application = self.project.get_function(
+                self.application_name, ignore_cache=True
+            )
             if self.is_deployed():
-                logger.info(f"Found deployed application. Status: {self.application.status.to_json()}")
+                logger.info(
+                    f"Found deployed application. Status: {self.application.status.to_json()}"
+                )
 
-    def deploy(self):
+    def deploy(self, with_api_gateway: bool = True):
         self.create_secrets()
         self.deploy_application()
+        if with_api_gateway:
+            self.api_gateway = self.create_api_gateway(
+                name=self.api_gateway_name,
+                direct_port_access=True,
+                authentication_mode=self.authentication_mode,
+                authentication_creds=self._authentication_creds,
+            )
 
     def deploy_application(self):
-        application = self.project.set_function(name=self.application_name, kind="application", image=self.image_name)
+        application = self.project.set_function(
+            name=self.application_name, kind="application", image=self.image_name
+        )
         application.set_internal_application_port(port=8000)
         application.set_env_from_secret(secret=self.ngc_secret_name, name="NGC_API_KEY")
-        application.spec.env.append({"name": "LD_LIBRARY_PATH",
-                                     "value": "/usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs:"
-                                              "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:"
-                                              "/usr/local/lib/python3.10/dist-packages/tensorrt_libs"})
-        application.set_image_pull_configuration(image_pull_secret_name=self.docker_creds_secret_name)
+        application.spec.env.append(
+            {
+                "name": "LD_LIBRARY_PATH",
+                "value": "/usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs:"
+                "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:"
+                "/usr/local/lib/python3.10/dist-packages/tensorrt_libs",
+            }
+        )
+        application.set_image_pull_configuration(
+            image_pull_secret_name=self.docker_creds_secret_name
+        )
         if self.node_selection:
             application.with_node_selection(node_selector=self.node_selection)
         application.deploy(create_default_api_gateway=self.create_default_api_gateway)
         self.application = application
 
-        if not self.create_default_api_gateway:
-            logger.warning("API gateway is not deployed, use nim.create_api_gateway() to deploy it")
-
     def is_deployed(self):
         return self.application is not None
 
-    def create_api_gateway(self,
-                           name: str = None,
-                           path: str = None,
-                           direct_port_access: bool = False,
-                           authentication_mode: schemas.APIGatewayAuthenticationMode = None,
-                           authentication_creds: tuple[str, str] = None,
-                           ssl_redirect: bool = None,
-                           set_as_default: bool = False,
-                           ):
+    def create_api_gateway(
+        self,
+        name: str = None,
+        path: str = None,
+        direct_port_access: bool = False,
+        authentication_mode: schemas.APIGatewayAuthenticationMode = None,
+        authentication_creds: tuple[str, str] = None,
+        ssl_redirect: bool = None,
+        set_as_default: bool = False,
+    ):
         """
         Create the application API gateway. Once the application is deployed, the API gateway can be created.
         An application without an API gateway is not accessible.
@@ -97,13 +127,15 @@ class NIM:
         if not self.is_deployed():
             raise "API gateway can not be created - Application not deployed"
 
-        self.application.create_api_gateway(name=name,
-                                            path=path,
-                                            default_port_access=direct_port_access,
-                                            authentication_mode=authentication_mode,
-                                            authentication_creds=authentication_creds,
-                                            ssl_redirect=ssl_redirect,
-                                            set_as_default=set_as_default)
+        self.application.create_api_gateway(
+            name=name,
+            path=path,
+            default_port_access=direct_port_access,
+            authentication_mode=authentication_mode,
+            authentication_creds=authentication_creds,
+            ssl_redirect=ssl_redirect,
+            set_as_default=set_as_default,
+        )
 
     def create_secrets(self):
         self._create_docker_creds_secret()
@@ -112,25 +144,35 @@ class NIM:
     def _create_docker_creds_secret(self):
         # Command which creates a secret to pull NIM image
         command = [
-            "kubectl", "create", "secret", "docker-registry", self.docker_creds_secret_name,
+            "kubectl",
+            "create",
+            "secret",
+            "docker-registry",
+            self.docker_creds_secret_name,
             "--docker-server=nvcr.io",
-            "--docker-username=\$oauthtoken",
+            r"--docker-username=\$oauthtoken",
             f"--docker-password={self._NGC_API_KEY}",
-            "--namespace=default-tenant"
+            "--namespace=default-tenant",
         ]
         self._execute(command, self.ignore_secret_creation_errors)
 
     def _create_secret_with_api_key(self):
         command = [
-            "kubectl", "create", "secret", "generic", self.ngc_secret_name,
+            "kubectl",
+            "create",
+            "secret",
+            "generic",
+            self.ngc_secret_name,
             f"--from-literal=NGC_API_KEY={self._NGC_API_KEY}",
-            "--namespace=default-tenant"
+            "--namespace=default-tenant",
         ]
         self._execute(command, self.ignore_secret_creation_errors)
 
     @staticmethod
     def _execute(command: list[str], ignore_error: bool):
-        result = subprocess.run(" ".join(command), shell=True, capture_output=True, text=True)
+        result = subprocess.run(
+            " ".join(command), shell=True, capture_output=True, text=True
+        )
         if result.returncode != 0:
             error = f"Failed to execute command: {result.stderr}"
             if not ignore_error:
@@ -138,8 +180,9 @@ class NIM:
             else:
                 print(error)
 
-    def invoke(self, messages: Union[str, Dict[str, Any], List[Dict[str, Any]]], **kwargs):
-
+    def invoke(
+        self, messages: Union[str, Dict[str, Any], List[Dict[str, Any]]], **kwargs
+    ):
         # Normalize messages to a list of dictionaries
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
@@ -154,8 +197,9 @@ class NIM:
         return self._invoke(body)
 
     def _invoke(self, body):
-        return self.application.invoke(path="/v1/chat/completions",
-                                       body=body, method="POST")
+        return self.application.invoke(
+            path="/v1/chat/completions", body=body, method="POST"
+        )
 
     def _generate_invoke_data(self, messages, **kwargs):
         invocation_params = {**self.invocation_kwargs, **kwargs}
