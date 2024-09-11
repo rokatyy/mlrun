@@ -94,7 +94,7 @@ class NIM:
         )
         if self.node_selection:
             application.with_node_selection(node_selector=self.node_selection)
-        application.deploy(create_default_api_gateway=self.create_default_api_gateway)
+        application.deploy(create_default_api_gateway=False)
         self.application = application
 
     def is_deployed(self):
@@ -105,7 +105,7 @@ class NIM:
         name: str = None,
         path: str = None,
         direct_port_access: bool = False,
-        authentication_mode: schemas.APIGatewayAuthenticationMode = None,
+        authentication_mode: mlrun.common.schemas.APIGatewayAuthenticationMode = None,
         authentication_creds: tuple[str, str] = None,
         ssl_redirect: bool = None,
         set_as_default: bool = False,
@@ -178,7 +178,7 @@ class NIM:
             if not ignore_error:
                 raise Exception(error)
             else:
-                print(error)
+                logger.error(error)
 
     def invoke(
         self, messages: Union[str, Dict[str, Any], List[Dict[str, Any]]], **kwargs
