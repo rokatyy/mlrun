@@ -20,19 +20,18 @@ from mlrun.utils import logger
 
 class NIM:
     def __init__(
-        self,
-        model: str,
-        NGC_API_KEY: str,
-        project_name: str,
-        image_name: Optional[str],
-        node_selection: Optional[Dict] = None,
-        skip_deploy: Optional[bool] = True,
-        ignore_secret_creation_errors: Optional[bool] = True,
-        authentication_mode: mlrun.common.schemas.APIGatewayAuthenticationMode = mlrun.common.schemas.APIGatewayAuthenticationMode.none,
-        authentication_creds: tuple[str, str] = None,
-        **invocation_kwargs,
+            self,
+            model: str,
+            NGC_API_KEY: str,
+            project_name: str,
+            image_name: Optional[str],
+            node_selection: Optional[Dict] = None,
+            skip_deploy: Optional[bool] = True,
+            ignore_secret_creation_errors: Optional[bool] = True,
+            authentication_mode: mlrun.common.schemas.APIGatewayAuthenticationMode = mlrun.common.schemas.APIGatewayAuthenticationMode.none,
+            authentication_creds: tuple[str, str] = None,
+            **invocation_kwargs,
     ):
-        self.api_gateway = None
         self.model = model
         self.image_name = image_name or f"nvcr.io/nim/{model}:latest"
         self._NGC_API_KEY = NGC_API_KEY
@@ -68,7 +67,7 @@ class NIM:
         self.create_secrets()
         self.deploy_application()
         if with_api_gateway:
-            self.api_gateway = self.create_api_gateway(
+            self.create_api_gateway(
                 name=self.api_gateway_name,
                 direct_port_access=True,
                 authentication_mode=self.authentication_mode,
@@ -85,8 +84,8 @@ class NIM:
             {
                 "name": "LD_LIBRARY_PATH",
                 "value": "/usr/local/lib/python3.10/dist-packages/tensorrt_llm/libs:"
-                "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:"
-                "/usr/local/lib/python3.10/dist-packages/tensorrt_libs",
+                         "/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib:"
+                         "/usr/local/lib/python3.10/dist-packages/tensorrt_libs",
             }
         )
         application.set_image_pull_configuration(
@@ -101,14 +100,14 @@ class NIM:
         return self.application is not None
 
     def create_api_gateway(
-        self,
-        name: str = None,
-        path: str = None,
-        direct_port_access: bool = False,
-        authentication_mode: mlrun.common.schemas.APIGatewayAuthenticationMode = None,
-        authentication_creds: tuple[str, str] = None,
-        ssl_redirect: bool = None,
-        set_as_default: bool = False,
+            self,
+            name: str = None,
+            path: str = None,
+            direct_port_access: bool = False,
+            authentication_mode: mlrun.common.schemas.APIGatewayAuthenticationMode = None,
+            authentication_creds: tuple[str, str] = None,
+            ssl_redirect: bool = None,
+            set_as_default: bool = False,
     ):
         """
         Create the application API gateway. Once the application is deployed, the API gateway can be created.
@@ -127,15 +126,22 @@ class NIM:
         if not self.is_deployed():
             raise "API gateway can not be created - Application not deployed"
 
+        if not name:
+            name = self.api_gateway_name
+
         self.application.create_api_gateway(
             name=name,
             path=path,
-            default_port_access=direct_port_access,
+            direct_port_access=direct_port_access,
             authentication_mode=authentication_mode,
             authentication_creds=authentication_creds,
             ssl_redirect=ssl_redirect,
             set_as_default=set_as_default,
         )
+
+        self.application._sync_api_gateway()
+        api_gateway = self.project.get_api_gateway(name)
+        self.application.api_gateway = api_gateway
 
     def create_secrets(self):
         self._create_docker_creds_secret()
@@ -181,7 +187,7 @@ class NIM:
                 logger.error(error)
 
     def invoke(
-        self, messages: Union[str, Dict[str, Any], List[Dict[str, Any]]], **kwargs
+            self, messages: Union[str, Dict[str, Any], List[Dict[str, Any]]], **kwargs
     ):
         # Normalize messages to a list of dictionaries
         if isinstance(messages, str):
