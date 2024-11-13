@@ -17,6 +17,8 @@ from dateutil import parser
 import mlrun.common.runtimes.constants
 from mlrun.utils import get_in
 
+import re
+
 from framework.db.sqldb.models import Base
 
 max_str_length = 255
@@ -85,6 +87,19 @@ def generate_query_predicate_for_name(column, query_string):
         return column.ilike(f"%{query_string[1:]}%")
     else:
         return column.__eq__(query_string)
+
+
+def generate_query_for_name_with_wildcard(column, query_string):
+    if query_string.startswith("~"):
+        return column.ilike(translate_wildcard_to_sql(query_string[1:]))
+    else:
+        column.__eq__(query_string)
+
+
+def translate_wildcard_to_sql(query_string: str) -> str:
+    # Sanitize the query to allow only alphanumeric, space, *, ., -, and _
+    sanitized_query = re.sub(r"[^\w\s*.\-_]", "", query)
+    return sanitized_query.replace('*', '%')
 
 
 def ensure_max_length(string: str):

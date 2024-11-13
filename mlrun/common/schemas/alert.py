@@ -200,3 +200,25 @@ class AlertTemplate(
             or self.reset_policy != other.reset_policy
             or self.criteria != other.criteria
         )
+
+
+class AlertActivations(pydantic.BaseModel):
+    activations: list[AlertActivation]
+
+
+class AlertActivation(pydantic.BaseModel):
+    name: str
+    project: str
+    severity: AlertSeverity
+    activation_time: datetime
+    entity_id: str
+    entity_kind: EventEntityKind
+    criteria: Optional[AlertCriteria]
+    event_kind: EventKind
+    number_of_events: int
+    notifications: list[NotificationState]
+
+
+class NotificationState(pydantic.BaseModel):
+    kind: str
+    status: Optional[str]

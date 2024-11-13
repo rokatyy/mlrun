@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from .alert import (
+    AlertActivation,
+    AlertActivations,
     AlertActiveState,
     AlertConfig,
     AlertNotification,

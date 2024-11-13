@@ -94,6 +94,7 @@ from framework.db.sqldb.models import (
     AlertConfig,
     AlertState,
     AlertTemplate,
+    AlertActivation,
     Artifact,
     ArtifactV2,
     BackgroundTask,
@@ -5690,6 +5691,46 @@ class SQLDB(DBInterface):
 
         # No commit needed here, as DDL commands in MySQL cause an implicit commit
         session.execute(text(alter_table_template))
+
+    def list_alert_activations(
+        self,
+        session: Session,
+        project: typing.Optional[str] = None,
+        name: Optional[str] = None,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        entity: Optional[str] = None,
+        severity: Optional[list[str]] = None,
+        page: int = Query(None, gt=0),
+        page_size: int = Query(None, alias="page-size", gt=0),
+    ) -> list[mlrun.common.schemas.AlertActivation]:
+
+        query = self._query(session, AlertActivation)
+
+        if project and project != "*":
+            query = query.filter(AlertActivation.project == project)
+
+        if name:
+            query = query.filter(generate_query_predicate_for_name(AlertActivation.name, name))
+
+        if start or end:
+            start = start or datetime.min
+            end = end or datetime.max
+            query = query.filter(
+                and_(AlertActivation.activation_time >= start, AlertActivation.activation_time <= end)
+            )
+        if entity:
+            query = query.filter(generate_query_for_name_with_wildcard(AlertActivation.enitity_id, entity))
+
+        query = query.filter(AlertActivation.severity.in_(severity))
+
+        query = self._paginate_query(query, page, page_size)
+
+        alert_activations = list(
+            map(self._transform_alert_activation_record_to_scheme, query.all())
+        )
+
+        return alert_activations
 
     @staticmethod
     def drop_partitions(
