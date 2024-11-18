@@ -68,7 +68,7 @@ async def list_alert_activations(
         token=page_token,
         page=page,
         page_size=page_size,
-        project=allowed_projects_with_creation_time,
+        project_with_creation_time=allowed_projects_with_creation_time,
         name=name,
         since=mlrun.utils.datetime_from_iso(since),
         until=mlrun.utils.datetime_from_iso(until),

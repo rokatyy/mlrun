@@ -5939,7 +5939,7 @@ class SQLDB(DBInterface):
     def list_alert_activations(
         self,
         session: Session,
-        projects_with_creation_time: list[tuple[str, datetime]],
+        project_with_creation_time: list[tuple[str, datetime]],
         name: typing.Optional[str] = None,
         since: typing.Optional[str] = None,
         until: typing.Optional[str] = None,
@@ -5951,7 +5951,7 @@ class SQLDB(DBInterface):
         query = self._query(session, AlertActivation)
 
         conditions = []
-        for project, created in projects_with_creation_time:
+        for project, created in project_with_creation_time:
             conditions.append(
                 and_(
                     AlertActivation.project == project,
