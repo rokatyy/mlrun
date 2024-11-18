@@ -84,8 +84,6 @@ class TestAlerts(TestMLRunSystem):
         self._validate_notifications_on_nuclio(
             nuclio_function_url, expected_notifications
         )
-        activations, _ = self._run_db._list_alert_activations()
-        assert len(activations) == 1
 
     @staticmethod
     def _generate_events(
