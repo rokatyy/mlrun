@@ -108,6 +108,17 @@ class RunDBInterface(ABC):
         pass
 
     @abstractmethod
+    def paginated_list_alert_activations(
+        self,
+        *args,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
+        page_token: Optional[str] = None,
+        **kwargs,
+    ):
+        pass
+
+    @abstractmethod
     def del_run(self, uid, project="", iter=0):
         pass
 
@@ -832,6 +843,18 @@ class RunDBInterface(ABC):
 
     @abstractmethod
     def list_alert_templates(self):
+        pass
+
+    @abstractmethod
+    def list_alert_activations(
+        self,
+        project: Optional[str] = None,
+        name: Optional[str] = None,
+        since: Optional[datetime.datetime] = None,
+        until: Optional[datetime.datetime] = None,
+        entity: Optional[str] = None,
+        severity: Optional[list[str]] = None,
+    ):
         pass
 
     @abstractmethod

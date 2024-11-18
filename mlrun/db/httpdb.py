@@ -4649,7 +4649,7 @@ class HTTPRunDB(RunDBInterface):
             severity=severity,
             return_all=True,
         )
-        return runs
+        return alert_activations
 
     def paginated_list_alert_activations(
         self,

@@ -5944,8 +5944,8 @@ class SQLDB(DBInterface):
         end: Optional[str] = None,
         entity: Optional[str] = None,
         severity: Optional[list[str]] = None,
-        page: int = Query(None, gt=0),
-        page_size: int = Query(None, alias="page-size", gt=0),
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
     ) -> list[mlrun.common.schemas.AlertActivation]:
         query = self._query(session, AlertActivation)
         query = self._filter_query_by_resource_project(query, AlertActivation, project)

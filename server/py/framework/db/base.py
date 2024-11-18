@@ -977,8 +977,8 @@ class DBInterface(ABC):
         end: Optional[str] = None,
         entity: Optional[str] = None,
         severity: Optional[list[str]] = None,
-        page: int = Query(None, gt=0),
-        page_size: int = Query(None, alias="page-size", gt=0),
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
     ) -> list[mlrun.common.schemas.AlertActivation]:
         pass
 

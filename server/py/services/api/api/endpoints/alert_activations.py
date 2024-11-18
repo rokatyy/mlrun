@@ -14,12 +14,12 @@
 #
 
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 import mlrun.common.schemas
-
-from typing import Optional
 
 import framework.utils.auth.verifier
 import framework.utils.clients.chief
