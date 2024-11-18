@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import re
+
 from dateutil import parser
 
 import mlrun.common.runtimes.constants
 from mlrun.utils import get_in
-
-import re
 
 from framework.db.sqldb.models import Base
 
@@ -99,7 +99,7 @@ def generate_query_for_name_with_wildcard(column, query_string):
 def translate_wildcard_to_sql(query_string: str) -> str:
     # Sanitize the query to allow only alphanumeric, space, *, ., -, and _
     sanitized_query = re.sub(r"[^\w\s*.\-_]", "", query)
-    return sanitized_query.replace('*', '%')
+    return sanitized_query.replace("*", "%")
 
 
 def ensure_max_length(string: str):

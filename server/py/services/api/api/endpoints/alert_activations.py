@@ -15,10 +15,11 @@
 
 
 from fastapi import APIRouter, Depends
-from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 import mlrun.common.schemas
+
+from typing import Optional
 
 import framework.utils.auth.verifier
 import framework.utils.clients.chief
@@ -29,8 +30,10 @@ from framework.api import deps
 router = APIRouter(prefix="/projects/{project}/alerts")
 
 
-@router.get("/activations",)
-async def list_api_gateways(
+@router.get(
+    "/activations",
+)
+async def list_alert_activations(
     project: str,
     name: Optional[str] = None,
     start: Optional[str] = None,
@@ -43,13 +46,11 @@ async def list_api_gateways(
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
 ):
-    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
-    await auth_verifier.query_project_permissions(
-        project_name=project,
-        action=mlrun.common.schemas.AuthorizationAction.read,
-        auth_info=auth_info,
+    allowed_project_names = (
+        await services.api.crud.Projects().list_allowed_project_names(
+            db_session, auth_info, project=project
+        )
     )
-
     paginator = services.api.utils.pagination.Paginator()
 
     async def _filter_alert_activations_by_permissions(_alert_activations):
@@ -71,7 +72,7 @@ async def list_api_gateways(
         token=page_token,
         page=page,
         page_size=page_size,
-        project=project,
+        project=allowed_project_names,
         name=name,
         start=mlrun.utils.datetime_from_iso(start),
         end=mlrun.utils.datetime_from_iso(end),

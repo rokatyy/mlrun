@@ -13,12 +13,12 @@
 # limitations under the License.
 #
 import collections
+import datetime
+from typing import Optional
 
 import sqlalchemy.orm
 
 import mlrun.common.schemas.alert
-import datetime
-
 import mlrun.utils.singleton
 
 import framework.utils.singletons.db
@@ -100,17 +100,17 @@ class AlertActivation(
     def list_alert_activations(
         self,
         session: sqlalchemy.orm.Session,
-        project: Optional[str],
+        project: Optional[Union[str, list[str]]] = None,
         name: Optional[str] = None,
         start: Optional[datetime.datetime] = None,
         end: Optional[datetime.datetime] = None,
         entity: Optional[str] = None,
         severity: Optional[list[str]] = None,
-        page=page,
-        page_size=page_size,
+        page: int = Query(None, gt=0),
+        page_size: int = Query(None, alias="page-size", gt=0),
     ) -> list[mlrun.common.schemas.AlertActivation]:
         project = project or mlrun.mlconf.default_project
-        return framework.utils.singletons.db.get_db().list_alerts_activations(
+        return framework.utils.singletons.db.get_db().list_alert_activations(
             session=session,
             project=project,
             name=name,
