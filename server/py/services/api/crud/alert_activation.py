@@ -14,7 +14,7 @@
 #
 import collections
 import datetime
-from typing import Optional, Union
+from typing import Optional
 
 import sqlalchemy.orm
 
@@ -100,7 +100,7 @@ class AlertActivation(
     def list_alert_activations(
         self,
         session: sqlalchemy.orm.Session,
-        project: Optional[Union[str, list[str]]] = None,
+        project_with_creation_time: list[tuple[str, datetime.datetime]],
         name: Optional[str] = None,
         since: Optional[datetime.datetime] = None,
         until: Optional[datetime.datetime] = None,
@@ -109,10 +109,9 @@ class AlertActivation(
         page: Optional[int] = None,
         page_size: Optional[int] = None,
     ) -> list[mlrun.common.schemas.AlertActivation]:
-        project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().list_alert_activations(
             session=session,
-            project=project,
+            project_with_creation_time=project_with_creation_time,
             name=name,
             since=since,
             until=until,

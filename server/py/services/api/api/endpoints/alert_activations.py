@@ -32,22 +32,20 @@ router = APIRouter()
 
 @router.get("/projects/{project}/alert-activations")
 async def list_alert_activations(
-        project: str,
-        name: Optional[str] = None,
-        since: Optional[str] = None,
-        until: Optional[str] = None,
-        entity: Optional[str] = None,
-        severity: Optional[list[str]] = None,
-        page: int = Query(None, gt=0),
-        page_size: int = Query(None, alias="page-size", gt=0),
-        page_token: str = Query(None, alias="page-token"),
-        auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
-        db_session: Session = Depends(deps.get_db_session),
+    project: str,
+    name: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    entity: Optional[str] = None,
+    severity: Optional[list[str]] = None,
+    page: int = Query(None, gt=0),
+    page_size: int = Query(None, alias="page-size", gt=0),
+    page_token: str = Query(None, alias="page-token"),
+    auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
+    db_session: Session = Depends(deps.get_db_session),
 ):
-    allowed_project_names = (
-        await services.api.crud.Projects().list_allowed_project_names(
-            db_session, auth_info, project=project
-        )
+    allowed_projects_with_creation_time = await services.api.crud.Projects().list_allowed_project_names_with_creation_time(
+        db_session, auth_info, project=project
     )
     paginator = services.api.utils.pagination.Paginator()
 
@@ -70,7 +68,7 @@ async def list_alert_activations(
         token=page_token,
         page=page,
         page_size=page_size,
-        project=allowed_project_names,
+        project=allowed_projects_with_creation_time,
         name=name,
         since=mlrun.utils.datetime_from_iso(since),
         until=mlrun.utils.datetime_from_iso(until),

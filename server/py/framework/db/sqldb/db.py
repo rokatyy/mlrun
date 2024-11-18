@@ -5939,7 +5939,7 @@ class SQLDB(DBInterface):
     def list_alert_activations(
         self,
         session: Session,
-        project: typing.Optional[typing.Union[str, list[str]]] = None,
+        projects_with_creation_time: list[tuple[str, datetime]],
         name: typing.Optional[str] = None,
         since: typing.Optional[str] = None,
         until: typing.Optional[str] = None,
@@ -5949,7 +5949,17 @@ class SQLDB(DBInterface):
         page_size: typing.Optional[int] = None,
     ) -> list[mlrun.common.schemas.AlertActivation]:
         query = self._query(session, AlertActivation)
-        query = self._filter_query_by_resource_project(query, AlertActivation, project)
+
+        conditions = []
+        for project, created in projects_with_creation_time:
+            conditions.append(
+                and_(
+                    AlertActivation.project == project,
+                    AlertActivation.activation_time > created,
+                )
+            )
+
+        query = query.filter(or_(*conditions))
 
         if name:
             query = query.filter(
@@ -5971,8 +5981,8 @@ class SQLDB(DBInterface):
                     AlertActivation.enitity_id, entity
                 )
             )
-
-        query = query.filter(AlertActivation.severity.in_(severity))
+        if severity:
+            query = query.filter(AlertActivation.severity.in_(severity))
 
         query = self._paginate_query(query, page, page_size)
 
