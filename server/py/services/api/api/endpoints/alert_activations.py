@@ -27,24 +27,22 @@ import framework.utils.singletons.project_member
 import services.api.crud
 from framework.api import deps
 
-router = APIRouter(prefix="/projects/{project}/alerts")
+router = APIRouter()
 
 
-@router.get(
-    "/activations",
-)
+@router.get("/projects/{project}/alert-activations")
 async def list_alert_activations(
-    project: str,
-    name: Optional[str] = None,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-    entity: Optional[str] = None,
-    severity: Optional[list[str]] = None,
-    page: int = Query(None, gt=0),
-    page_size: int = Query(None, alias="page-size", gt=0),
-    page_token: str = Query(None, alias="page-token"),
-    auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
-    db_session: Session = Depends(deps.get_db_session),
+        project: str,
+        name: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        entity: Optional[str] = None,
+        severity: Optional[list[str]] = None,
+        page: int = Query(None, gt=0),
+        page_size: int = Query(None, alias="page-size", gt=0),
+        page_token: str = Query(None, alias="page-token"),
+        auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
+        db_session: Session = Depends(deps.get_db_session),
 ):
     allowed_project_names = (
         await services.api.crud.Projects().list_allowed_project_names(

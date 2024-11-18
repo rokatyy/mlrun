@@ -4942,7 +4942,7 @@ class HTTPRunDB(RunDBInterface):
             "page-token": page_token,
         }
         error = "list alert activations"
-        path = f"projects/{project}/alerts/activations"
+        path = f"projects/{project}/alert-activations"
 
         # Fetch the responses, either one page or all based on `return_all`
         responses = self.paginated_api_call(
