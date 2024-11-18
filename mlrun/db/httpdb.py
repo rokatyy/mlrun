@@ -4934,7 +4934,7 @@ class HTTPRunDB(RunDBInterface):
         params = {
             "name": name,
             "since": datetime_to_iso(since),
-            "end": datetime_to_iso(until),
+            "until": datetime_to_iso(until),
             "entity": entity,
             "severity": severity,
             "page": page,
@@ -4942,7 +4942,7 @@ class HTTPRunDB(RunDBInterface):
             "page-token": page_token,
         }
         error = "list alert activations"
-        path = f"/projects/{project}/alerts/activations"
+        path = f"projects/{project}/alerts/activations"
 
         # Fetch the responses, either one page or all based on `return_all`
         responses = self.paginated_api_call(

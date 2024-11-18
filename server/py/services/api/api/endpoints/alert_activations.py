@@ -16,7 +16,7 @@
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 import mlrun.common.schemas
@@ -36,8 +36,8 @@ router = APIRouter(prefix="/projects/{project}/alerts")
 async def list_alert_activations(
     project: str,
     name: Optional[str] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
     entity: Optional[str] = None,
     severity: Optional[list[str]] = None,
     page: int = Query(None, gt=0),
@@ -74,8 +74,8 @@ async def list_alert_activations(
         page_size=page_size,
         project=allowed_project_names,
         name=name,
-        start=mlrun.utils.datetime_from_iso(start),
-        end=mlrun.utils.datetime_from_iso(end),
+        since=mlrun.utils.datetime_from_iso(since),
+        until=mlrun.utils.datetime_from_iso(until),
         entity=entity,
         severity=severity,
     )

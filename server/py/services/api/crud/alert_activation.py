@@ -14,7 +14,7 @@
 #
 import collections
 import datetime
-from typing import Optional
+from typing import Optional, Union
 
 import sqlalchemy.orm
 
@@ -102,20 +102,20 @@ class AlertActivation(
         session: sqlalchemy.orm.Session,
         project: Optional[Union[str, list[str]]] = None,
         name: Optional[str] = None,
-        start: Optional[datetime.datetime] = None,
-        end: Optional[datetime.datetime] = None,
+        since: Optional[datetime.datetime] = None,
+        until: Optional[datetime.datetime] = None,
         entity: Optional[str] = None,
         severity: Optional[list[str]] = None,
-        page: typing.Optional[int] = None,
-        page_size: typing.Optional[int] = None,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
     ) -> list[mlrun.common.schemas.AlertActivation]:
         project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().list_alert_activations(
             session=session,
             project=project,
             name=name,
-            start=start,
-            end=end,
+            since=since,
+            until=until,
             entity=entity,
             severity=severity,
             page=page,

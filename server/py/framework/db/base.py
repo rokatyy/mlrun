@@ -970,11 +970,11 @@ class DBInterface(ABC):
     @abstractmethod
     def list_alert_activations(
         self,
-        session: Session,
+        session,
         project: Optional[Union[str, list[str]]] = None,
         name: Optional[str] = None,
-        start: Optional[str] = None,
-        end: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
         entity: Optional[str] = None,
         severity: Optional[list[str]] = None,
         page: typing.Optional[int] = None,

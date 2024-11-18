@@ -98,7 +98,7 @@ def generate_query_for_name_with_wildcard(column, query_string):
 
 def translate_wildcard_to_sql(query_string: str) -> str:
     # Sanitize the query to allow only alphanumeric, space, *, ., -, and _
-    sanitized_query = re.sub(r"[^\w\s*.\-_]", "", query)
+    sanitized_query = re.sub(r"[^\w\s*.\-_]", "", query_string)
     return sanitized_query.replace("*", "%")
 
 

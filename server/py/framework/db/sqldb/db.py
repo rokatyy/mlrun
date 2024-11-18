@@ -84,6 +84,7 @@ import framework.utils.helpers
 from framework.db.base import DBInterface
 from framework.db.sqldb.helpers import (
     MemoizationCache,
+    generate_query_for_name_with_wildcard,
     generate_query_predicate_for_name,
     label_set,
     run_labels,
@@ -5938,12 +5939,12 @@ class SQLDB(DBInterface):
     def list_alert_activations(
         self,
         session: Session,
-        project: Optional[Union[str, list[str]]] = None,
-        name: Optional[str] = None,
-        start: Optional[str] = None,
-        end: Optional[str] = None,
-        entity: Optional[str] = None,
-        severity: Optional[list[str]] = None,
+        project: typing.Optional[typing.Union[str, list[str]]] = None,
+        name: typing.Optional[str] = None,
+        since: typing.Optional[str] = None,
+        until: typing.Optional[str] = None,
+        entity: typing.Optional[str] = None,
+        severity: typing.Optional[list[str]] = None,
         page: typing.Optional[int] = None,
         page_size: typing.Optional[int] = None,
     ) -> list[mlrun.common.schemas.AlertActivation]:
@@ -5955,13 +5956,13 @@ class SQLDB(DBInterface):
                 generate_query_predicate_for_name(AlertActivation.name, name)
             )
 
-        if start or end:
-            start = start or datetime.min
-            end = end or datetime.max
+        if since or until:
+            since = since or datetime.min
+            until = until or datetime.max
             query = query.filter(
                 and_(
-                    AlertActivation.activation_time >= start,
-                    AlertActivation.activation_time <= end,
+                    AlertActivation.activation_time >= since,
+                    AlertActivation.activation_time <= until,
                 )
             )
         if entity:
