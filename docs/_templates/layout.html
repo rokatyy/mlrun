@@ -10,14 +10,79 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 })(window,document,'script','dataLayer','GTM-MV26G85');</script>
 <!-- End Google Tag Manager -->
 
-<!-- Google site verifiction -->
+<!-- Google site verification -->
 <meta name="google-site-verification" content="uAuAgnxkItJCigMhVfvWLJglVNnNpyxpjC5vcWQqjpo" />
-<!-- end Google site verifiction -->
+<!-- end Google site verification -->
 
+<!-- Edition Switcher -->
+<script>
+  // Function to determine the current edition from the URL
+  function getEditionFromPath() {
+    const path = window.location.pathname;
+    if (path.includes('/community/')) {
+      return 'community';
+    } else if (path.includes('/enterprise/')) {
+      return 'enterprise';
+    }
+    return null; // Default to null if no edition is found
+  }
 
+  // Function to switch editions by updating the URL
+  function switchEdition(edition) {
+    const currentPath = window.location.pathname;
+    const newPath = currentPath.replace(/\/(community|enterprise)\//, '/' + edition + '/');
+    if (currentPath !== newPath) {
+      window.location.href = newPath;
+    }
+  }
+
+  // Set the button text and action based on the current edition
+  window.onload = function() {
+    const edition = getEditionFromPath(); // Detect the current edition from the path
+    const switchButton = document.getElementById('switchButton');
+
+    if (edition === 'community') {
+      switchButton.textContent = 'Switch to Enterprise';
+      switchButton.onclick = function() { switchEdition('enterprise'); };
+    } else if (edition === 'enterprise') {
+      switchButton.textContent = 'Switch to Community';
+      switchButton.onclick = function() { switchEdition('community'); };
+    }
+  };
+</script>
+
+<style>
+    /* Position the edition switcher in the bottom-right corner */
+    #edition-switcher {
+        position: fixed; /* Fixed position on the screen */
+        bottom: 20px; /* Distance from the bottom */
+        right: 20px; /* Distance from the right */
+        display: flex; /* Align buttons horizontally */
+        gap: 10px; /* Space between buttons */
+        z-index: 1000; /* Make sure it's on top of other content */
+    }
+
+    #edition-switcher button {
+        background-color: #007BFF; /* Blue background */
+        color: white; /* White text */
+        border: none; /* No border */
+        padding: 10px 20px; /* Space around text */
+        font-size: 16px; /* Larger text */
+        border-radius: 5px; /* Rounded corners */
+        cursor: pointer; /* Pointer cursor on hover */
+        transition: background-color 0.3s ease; /* Smooth background transition */
+    }
+
+    #edition-switcher button:hover {
+        background-color: #0056b3; /* Darker blue on hover */
+    }
+</style>
+
+<div id="edition-switcher">
+  <button id="switchButton"></button>
+</div>
 
 {% endblock %}
-
 
  {% block document %}
  <!-- Google Tag Manager (noscript) -->

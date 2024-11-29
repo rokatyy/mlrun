@@ -63,11 +63,3 @@ Table of Contents
    :caption: Change log
 
    change-log/index
-
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Enterprise only features
-
-   ee/index
-

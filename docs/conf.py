@@ -14,6 +14,9 @@
 import re
 import sys
 from os import path
+import os
+import subprocess
+import sys
 
 sys.path.insert(0, "..")
 
@@ -35,7 +38,17 @@ project = "mlrun"
 copyright = "2023, Iguazio"
 author = "Iguazio"
 
+
+edition = "community"
+if "enterprise" in tags.tags:
+    edition = "enterprise"
+print(f"Building documentation for {edition} edition")
+
+
 master_doc = "contents"
+
+script_path = os.path.join(os.path.dirname(__file__), 'combine_contents.py')
+subprocess.run([sys.executable, script_path, '--edition', edition])
 
 # The full version, including alpha/beta/rc tags
 release = current_version()
@@ -82,6 +95,11 @@ language = "en"
 exclude_patterns = [
     "_build",
     "CONTRIBUTING.md",
+
+    # these files are used to build a single `contents.rst` file
+    "community_contents.rst",
+    "shared_contents.rst",
+    "enterprise_contents.rst",
 ]
 
 source_suffix = {

@@ -348,3 +348,10 @@ MLRun includes the following major components:
 architecture
 ecosystem
 ```
+
+```{only} community
+This content is specific to the Community edition.
+```
+
+```{only} enterprise
+This content is specific to the Enterprise edition.
