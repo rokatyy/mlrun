@@ -422,7 +422,9 @@ class Alerts(
             )
             activation_time = alert_state.get("last_updated")
             # or {} is needed of the case if full_object is None
-            activation_id = (alert_state.get("full_object") or {}).get("last_activation_id")
+            activation_id = (alert_state.get("full_object") or {}).get(
+                "last_activation_id"
+            )
             if activation_time and activation_id:
                 framework.utils.singletons.db.get_db().update_alert_activation(
                     session,
