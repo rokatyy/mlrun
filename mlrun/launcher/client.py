@@ -150,6 +150,6 @@ class ClientBaseLauncher(launcher.BaseLauncher, abc.ABC):
             mlrun.utils.logger.info(
                 "To track results use the CLI", info_cmd=info_cmd, logs_cmd=logs_cmd
             )
-            ui_url = mlrun.utils.get_ui_url(project, uid)
+            ui_url = mlrun.utils.get_ui_url(project, uid, job_name=run.metadata.name)
             if ui_url:
                 mlrun.utils.logger.info("Or click for UI", ui_url=ui_url)

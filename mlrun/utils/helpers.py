@@ -1040,12 +1040,12 @@ async def retry_until_successful_async(
     ).run()
 
 
-def get_ui_url(project, uid=None):
+def get_ui_url(project, uid=None, job_name=None):
     url = ""
     if mlrun.mlconf.resolve_ui_url():
         url = f"{mlrun.mlconf.resolve_ui_url()}/{mlrun.mlconf.ui.projects_prefix}/{project}/jobs"
         if uid:
-            url += f"/monitor/{uid}/overview"
+            url += f"/monitor-jobs/{job_name}/{uid}/overview" if job_name else f"/monitor-jobs/{uid}/overview"
     return url
 
 
