@@ -338,7 +338,7 @@ class Logs(
         return log_file.stat().st_size
 
     @staticmethod
-    def log_file_exists_for_run_uid(project: str, uid: str) -> (bool, pathlib.Path):
+    def log_file_exists_for_run_uid(project: str, uid: str) -> typing.Tuple[bool, pathlib.Path]:
         """
         Checks if the log file exists for the given project and uid
         A Run's log file path is: /mlrun/logs/{project}/{uid}

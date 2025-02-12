@@ -453,7 +453,7 @@ class Artifact(ModelObj):
 
     def resolve_body_target_hash_path(
         self, body: typing.Union[bytes, str], artifact_path: str
-    ) -> (str, str):
+    ) -> typing.Tuple[str, str]:
         """
         constructs the target path by calculating the artifact body hash
         :param body: artifact body to calculate hash on
@@ -468,7 +468,7 @@ class Artifact(ModelObj):
 
     def resolve_file_target_hash_path(
         self, source_path: str, artifact_path: str
-    ) -> (str, str):
+    ) -> typing.Tuple[str, str]:
         """
         constructs the target path by calculating the artifact source hash
         :param source_path: artifact file source path to calculate hash on
@@ -486,7 +486,7 @@ class Artifact(ModelObj):
         artifact_source: typing.Union[bytes, str],
         artifact_path: str,
         hash_method: typing.Callable,
-    ) -> (str, str):
+    ) -> typing.Tuple[str, str]:
         """
         constructs the target path by calculating the artifact source hash
         :param artifact_source: artifact to calculate hash on. May be path to source (str) or content (bytes)

@@ -55,7 +55,8 @@ jobs:
         pip install -r dev-requirements.txt
     - name: Lint
       run: make lint
-
+    - name: Run mypy
+      run: make mypy
     # perform copyright check here, to avoid spinning up another runner needlessly
     - uses: denoland/setup-deno@v2
       with:

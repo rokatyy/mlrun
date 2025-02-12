@@ -430,7 +430,7 @@ class K8sHelper(mlsecrets.SecretProviderInterface):
 
     def store_project_secrets(
         self, project, secrets, namespace=""
-    ) -> (str, typing.Optional[mlrun.common.schemas.SecretEventActions]):
+    ) -> typing.Tuple[str, mlrun.common.schemas.SecretEventActions]:
         secret_name = self.get_project_secret_name(project)
         action = self.store_secrets_with_retry(secret_name, secrets, namespace)
         return secret_name, action
@@ -473,7 +473,7 @@ class K8sHelper(mlsecrets.SecretProviderInterface):
 
     def store_auth_secret(
         self, username: str, access_key: str, namespace=""
-    ) -> (str, typing.Optional[mlrun.common.schemas.SecretEventActions]):
+    ) -> typing.Tuple[str, mlrun.common.schemas.SecretEventActions]:
         """
         Store the given access key as a secret in the cluster. The secret name is generated from the access key
         :return: returns the secret name and the action taken against the secret
@@ -662,7 +662,7 @@ class K8sHelper(mlsecrets.SecretProviderInterface):
 
     def delete_project_secrets(
         self, project, secrets, namespace=""
-    ) -> (str, typing.Optional[mlrun.common.schemas.SecretEventActions]):
+    ) -> typing.Tuple[str, typing.Optional[mlrun.common.schemas.SecretEventActions]]:
         """
         Delete secrets from a kubernetes secret object
         :return: returns the secret name and the action taken against the secret

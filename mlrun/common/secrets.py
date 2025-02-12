@@ -14,7 +14,7 @@
 #
 
 from abc import ABC, abstractmethod
-
+import typing
 import mlrun.common.schemas
 
 
@@ -22,7 +22,7 @@ class SecretProviderInterface(ABC):
     @abstractmethod
     def store_auth_secret(
         self, username: str, access_key: str, namespace=""
-    ) -> (str, mlrun.common.schemas.SecretEventActions):
+    ) -> typing.Tuple[str, mlrun.common.schemas.SecretEventActions]:
         pass
 
     @abstractmethod
@@ -36,7 +36,7 @@ class SecretProviderInterface(ABC):
     @abstractmethod
     def store_project_secrets(
         self, project, secrets, namespace=""
-    ) -> (str, mlrun.common.schemas.SecretEventActions):
+    ) -> typing.Tuple[str, mlrun.common.schemas.SecretEventActions]:
         pass
 
     @abstractmethod
@@ -67,7 +67,7 @@ class InMemorySecretProvider(SecretProviderInterface):
 
     def store_auth_secret(
         self, username: str, access_key: str, namespace=""
-    ) -> (str, mlrun.common.schemas.SecretEventActions):
+    ) -> typing.Tuple[str, mlrun.common.schemas.SecretEventActions]:
         secret_ref = self.resolve_auth_secret_name(username, access_key)
         self.auth_secrets_map.setdefault(secret_ref, {}).update(
             self._generate_auth_secret_data(username, access_key)
@@ -96,7 +96,7 @@ class InMemorySecretProvider(SecretProviderInterface):
 
     def store_project_secrets(
         self, project, secrets, namespace=""
-    ) -> (str, mlrun.common.schemas.SecretEventActions):
+    ) -> typing.Tuple[str, mlrun.common.schemas.SecretEventActions]:
         self.project_secrets_map.setdefault(project, {}).update(secrets)
         secret_name = project
         return secret_name, mlrun.common.schemas.SecretEventActions.created

@@ -457,6 +457,7 @@ class DBInterface(ABC):
         kind: mlrun.common.schemas.ScheduleKinds = None,
         next_run_time_since: Optional[datetime.datetime] = None,
         next_run_time_until: Optional[datetime.datetime] = None,
+        as_records: bool = False,
         limit: typing.Optional[int] = None,
     ) -> list[mlrun.common.schemas.ScheduleRecord]:
         pass
@@ -517,7 +518,7 @@ class DBInterface(ABC):
     @abstractmethod
     async def get_project_resources_counters(
         self,
-        projects_with_creation_time: list[tuple[str, datetime]],
+        projects_with_creation_time: list[tuple[str, datetime.datetime]],
     ) -> tuple[
         dict[str, int],
         dict[str, int],

@@ -157,3 +157,35 @@ ignore_imports = [
     "server.py.framework.tests.unit.common_fixtures -> services",
     "server.py.framework.tests.unit.db.common_fixtures -> services",
 ]
+
+[tool.mypy]
+ignore_missing_imports = true
+disallow_untyped_defs = false
+disable_error_code = [
+    "union-attr",
+    "attr-defined",
+    "return-value",
+    "method-assign",
+    "import-untyped",
+    "assignment",
+    "arg-type",
+    "var-annotated",
+    "empty-body",
+    "override",
+    "no-redef",
+    "index",
+    "operator",
+    "dict-item",
+    "list-item",
+    "misc",
+    "abstract",
+    "valid-type",
+    "return",
+    "has-type",
+    "call-overload",
+    "name-defined",
+    "truthy-function",
+]
+exclude = ".*test_.*\\.py"
+
+

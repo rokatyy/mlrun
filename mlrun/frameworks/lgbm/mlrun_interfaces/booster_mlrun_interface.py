@@ -25,8 +25,8 @@ class LGBMBoosterMLRunInterface(MLRunInterface, ABC):
     Interface for adding MLRun features for LightGBM models (Booster API).
     """
 
-    _PROPERTIES = {
-        "model_handler": None,  # type: MLModelHandler
+    _PROPERTIES: MLModelHandler = {
+        "model_handler": None,
     }
 
     @classmethod

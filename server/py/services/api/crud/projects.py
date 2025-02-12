@@ -514,11 +514,11 @@ class Projects(
 
     async def _calculate_pipelines_counters(
         self,
-    ) -> (
+    ) -> typing.Tuple[
         dict[str, typing.Union[int, None]],
         dict[str, typing.Union[int, None]],
         dict[str, typing.Union[int, None]],
-    ):
+    ]:
         # creating defaultdict instead of a regular dict, because it possible that not all projects have pipelines
         # and we want to return 0 for those projects, or None if we failed to get the information
         project_to_running_pipelines_count = collections.defaultdict(lambda: 0)

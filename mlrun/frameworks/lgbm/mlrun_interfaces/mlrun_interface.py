@@ -14,7 +14,7 @@
 #
 from abc import ABC
 from types import ModuleType
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Union, List
 
 import lightgbm as lgb
 
@@ -26,6 +26,7 @@ from ..callbacks import Callback, MLRunLoggingCallback
 from ..model_handler import LGBMModelHandler
 from ..utils import LGBMTypes, LGBMUtils
 from .booster_mlrun_interface import LGBMBoosterMLRunInterface
+import mlrun.frameworks.lgbm.callbacks.callback
 
 
 class LGBMMLRunInterface(MLRunInterface, ABC):

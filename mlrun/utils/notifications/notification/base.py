@@ -129,7 +129,7 @@ class NotificationBase:
         self,
         alert: mlrun.common.schemas.AlertConfig,
         event_data: mlrun.common.schemas.Event,
-    ) -> (str, str):
+    ) -> typing.Tuple[str, str]:
         if (
             event_data.entity.kind == mlrun.common.schemas.alert.EventEntityKind.JOB
         ):  # JOB entity

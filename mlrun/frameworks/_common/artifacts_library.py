@@ -112,7 +112,7 @@ class ArtifactsLibrary(ABC):
 
         :return: The library's plans.
         """
-        return {  # type: Dict[str, Type[Plan]]
+        return {
             plan_name: plan_class
             for plan_name, plan_class in cls.__dict__.items()
             if isinstance(plan_class, type) and not plan_name.startswith("_")

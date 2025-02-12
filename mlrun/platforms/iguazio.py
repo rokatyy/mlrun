@@ -14,6 +14,7 @@
 
 import json
 import os
+import typing
 import urllib
 from typing import Optional
 from urllib.parse import urlparse
@@ -337,7 +338,7 @@ def is_iguazio_session_cookie(session_cookie: str) -> bool:
 # (requests should be sent with username:control_session/access_key as auth header)
 def add_or_refresh_credentials(
     api_url: str, username: str = "", password: str = "", token: str = ""
-) -> (str, str, str):
+) -> typing.Tuple[str, str, str]:
     if is_iguazio_session(password):
         return username, password, token
 

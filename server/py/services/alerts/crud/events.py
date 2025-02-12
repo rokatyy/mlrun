@@ -30,7 +30,7 @@ class Events(
     # we cache alert names based on project and event name as key
     # (project, name, entity_id) -> set[alert_id]
     # TODO: Rethink the cache structure once a single alert supports more than a single id
-    _cache: dict[(str, str, str), set[int]] = {}
+    _cache: dict[tuple[str, str, str], set[int]] = {}
     cache_initialized = False
 
     @staticmethod

@@ -732,6 +732,10 @@ vale-docs: ## Run vale check for docs and sorts ignore.txt file
 linkcheck:
 	make -C docs/ linkcheck
 
+.PHONY: mypy
+mypy:
+	@mypy --show-traceback mlrun/ server/
+
 .PHONY: release
 release: ## Release a version
 ifndef MLRUN_VERSION

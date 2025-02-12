@@ -855,7 +855,7 @@ def resolve_image_target(
 
 def _generate_builder_env(
     project: str, builder_env: dict
-) -> (list[client.V1EnvVar], list[client.V1EnvVar]):
+) -> typing.Tuple[list[client.V1EnvVar], list[client.V1EnvVar]]:
     k8s = framework.utils.singletons.k8s.get_k8s_helper(silent=False)
     secret_name = k8s.get_project_secret_name(project)
     existing_secret_keys = k8s.get_project_secret_keys(project, filter_internal=True)

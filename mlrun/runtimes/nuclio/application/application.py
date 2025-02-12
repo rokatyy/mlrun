@@ -420,7 +420,7 @@ class ApplicationRuntime(RemoteRuntime):
         )
 
     @staticmethod
-    def get_filename_and_handler() -> (str, str):
+    def get_filename_and_handler() -> typing.Tuple[str, str]:
         reverse_proxy_file_path = pathlib.Path(__file__).parent / "reverse_proxy.go"
         return str(reverse_proxy_file_path), "Handler"
 

@@ -96,7 +96,7 @@ class LogCollectorClient(
         best_effort: bool = False,
         verbose: bool = False,
         raise_on_error: bool = True,
-    ) -> (bool, str):
+    ) -> typing.Tuple[bool, str]:
         """
         Start logs streaming from the log collector service
         :param run_uid: The run uid

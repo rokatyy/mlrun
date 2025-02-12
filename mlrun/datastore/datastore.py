@@ -212,7 +212,7 @@ class StoreManager:
 
     def get_or_create_store(
         self, url, secrets: Optional[dict] = None, project_name=""
-    ) -> (DataStore, str, str):
+    ) -> typing.Tuple[DataStore, str, str]:
         schema, endpoint, parsed_url = parse_url(url)
         subpath = parsed_url.path
         store_key = f"{schema}://{endpoint}" if endpoint else f"{schema}://"

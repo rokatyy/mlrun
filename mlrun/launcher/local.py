@@ -257,7 +257,7 @@ class ClientLocalLauncher(launcher.ClientBaseLauncher):
         return fn
 
     @staticmethod
-    def _resolve_local_code_path(local_code_path: str) -> (str, list[str]):
+    def _resolve_local_code_path(local_code_path: str) -> typing.Tuple[str, list[str]]:
         command = None
         args = []
         if local_code_path:
