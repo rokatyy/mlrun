@@ -899,7 +899,6 @@ class HTTPRunDB(RunDBInterface):
         ] = None,  # Backward compatibility
         states: typing.Optional[list[mlrun.common.runtimes.constants.RunStates]] = None,
         sort: bool = True,
-        last: int = 0,
         iter: bool = False,
         start_time_from: Optional[datetime] = None,
         start_time_to: Optional[datetime] = None,
@@ -946,7 +945,6 @@ class HTTPRunDB(RunDBInterface):
         :param states: List only runs whose state is one of the provided states.
         :param sort: Whether to sort the result according to their start time. Otherwise, results will be
             returned by their internal order in the DB (order will not be guaranteed).
-        :param last: Deprecated - currently not used (will be removed in 1.8.0).
         :param iter: If ``True`` return runs from all iterations. Otherwise, return only runs whose ``iter`` is 0.
         :param start_time_from: Filter by run start time in ``[start_time_from, start_time_to]``.
         :param start_time_to: Filter by run start time in ``[start_time_from, start_time_to]``.
@@ -974,7 +972,6 @@ class HTTPRunDB(RunDBInterface):
             state=state,
             states=states,
             sort=sort,
-            last=last,
             iter=iter,
             start_time_from=start_time_from,
             start_time_to=start_time_to,
@@ -1035,6 +1032,7 @@ class HTTPRunDB(RunDBInterface):
 
         :param page: The page number to retrieve. If not provided, the next page will be retrieved.
         :param page_size: The number of items per page to retrieve. Up to `page_size` responses are expected.
+            Defaults to `mlrun.mlconf.httpdb.pagination.default_page_size` if not provided.
         :param page_token: A pagination token used to retrieve the next page of results. Should not be provided
             for the first request.
 
@@ -1093,8 +1091,6 @@ class HTTPRunDB(RunDBInterface):
         self,
         key,
         artifact,
-        # TODO: deprecated, remove in 1.8.0
-        uid=None,
         iter=None,
         tag=None,
         project="",
@@ -1104,8 +1100,6 @@ class HTTPRunDB(RunDBInterface):
 
         :param key: Identifying key of the artifact.
         :param artifact: The :py:class:`~mlrun.artifacts.Artifact` to store.
-        :param uid: A unique ID for this specific version of the artifact
-                    (deprecated, artifact uid is generated in the backend use `tree` instead)
         :param iter: The task iteration which generated this artifact. If ``iter`` is not ``None`` the iteration will
             be added to the key provided to generate a unique key for the artifact of the specific iteration.
         :param tag: Tag of the artifact.
@@ -1113,15 +1107,6 @@ class HTTPRunDB(RunDBInterface):
         :param tree: The tree (producer id) which generated this artifact.
         :returns: The stored artifact dictionary.
         """
-        if uid:
-            warnings.warn(
-                "'uid' is deprecated in 1.6.0 and will be removed in 1.8.0, use 'tree' instead.",
-                # TODO: Remove this in 1.8.0
-                FutureWarning,
-            )
-
-        # we do this because previously the 'uid' name was used for the 'tree' parameter
-        tree = tree or uid
         project = project or mlrun.mlconf.default_project
         endpoint_path = f"projects/{project}/artifacts/{key}"
 
@@ -1370,6 +1355,7 @@ class HTTPRunDB(RunDBInterface):
 
         :param page: The page number to retrieve. If not provided, the next page will be retrieved.
         :param page_size: The number of items per page to retrieve. Up to `page_size` responses are expected.
+            Defaults to `mlrun.mlconf.httpdb.pagination.default_page_size` if not provided.
         :param page_token: A pagination token used to retrieve the next page of results. Should not be provided
             for the first request.
 
@@ -1599,6 +1585,7 @@ class HTTPRunDB(RunDBInterface):
 
         :param page: The page number to retrieve. If not provided, the next page will be retrieved.
         :param page_size: The number of items per page to retrieve. Up to `page_size` responses are expected.
+            Defaults to `mlrun.mlconf.httpdb.pagination.default_page_size` if not provided.
         :param page_token: A pagination token used to retrieve the next page of results. Should not be provided
             for the first request.
 
@@ -3765,7 +3752,7 @@ class HTTPRunDB(RunDBInterface):
     def list_model_endpoints(
         self,
         project: str,
-        name: Optional[str] = None,
+        names: Optional[Union[str, list[str]]] = None,
         function_name: Optional[str] = None,
         function_tag: Optional[str] = None,
         model_name: Optional[str] = None,
@@ -3782,7 +3769,7 @@ class HTTPRunDB(RunDBInterface):
         List model endpoints with optional filtering by name, function name, model name, labels, and time range.
 
         :param project:         The name of the project
-        :param name:            The name of the model endpoint
+        :param names:            The name of the model endpoint, or list of names of the model endpoints
         :param function_name:   The name of the function
         :param function_tag:    The tag of the function
         :param model_name:      The name of the model
@@ -3798,12 +3785,13 @@ class HTTPRunDB(RunDBInterface):
         """
         path = f"projects/{project}/model-endpoints"
         labels = self._parse_labels(labels)
-
+        if names and isinstance(names, str):
+            names = [names]
         response = self.api_call(
             method=mlrun.common.types.HTTPMethod.GET,
             path=path,
             params={
-                "name": name,
+                "name": names,
                 "model_name": model_name,
                 "model_tag": model_tag,
                 "function_name": function_name,
@@ -4984,6 +4972,7 @@ class HTTPRunDB(RunDBInterface):
 
         :param page: The page number to retrieve. If not provided, the next page will be retrieved.
         :param page_size: The number of items per page to retrieve. Up to `page_size` responses are expected.
+            Defaults to `mlrun.mlconf.httpdb.pagination.default_page_size` if not provided.
         :param page_token: A pagination token used to retrieve the next page of results. Should not be provided
             for the first request.
 
@@ -5197,7 +5186,6 @@ class HTTPRunDB(RunDBInterface):
         ] = None,  # Backward compatibility
         states: typing.Optional[list[mlrun.common.runtimes.constants.RunStates]] = None,
         sort: bool = True,
-        last: int = 0,
         iter: bool = False,
         start_time_from: Optional[datetime] = None,
         start_time_to: Optional[datetime] = None,
@@ -5229,13 +5217,6 @@ class HTTPRunDB(RunDBInterface):
                 "using the `with_notifications` flag."
             )
 
-        if last:
-            # TODO: Remove this in 1.8.0
-            warnings.warn(
-                "'last' is deprecated and will be removed in 1.8.0.",
-                FutureWarning,
-            )
-
         if state:
             # TODO: Remove this in 1.9.0
             warnings.warn(
@@ -5251,7 +5232,6 @@ class HTTPRunDB(RunDBInterface):
             and not labels
             and not state
             and not states
-            and not last
             and not start_time_from
             and not start_time_to
             and not last_update_time_from
