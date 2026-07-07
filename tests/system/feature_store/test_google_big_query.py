@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import os
 import pathlib
-import typing
 
 import pandas as pd
 import pytest
@@ -30,7 +29,7 @@ CREDENTIALS_JSON_DEFAULT_PATH = (
 )
 
 
-def resolve_google_credentials_json_path() -> typing.Optional[pathlib.Path]:
+def resolve_google_credentials_json_path() -> pathlib.Path | None:
     default_path = pathlib.Path(CREDENTIALS_JSON_DEFAULT_PATH)
     if os.getenv(CREDENTIALS_ENV):
         return pathlib.Path(os.getenv(CREDENTIALS_ENV))

@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import unittest
 import unittest.mock
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
-from datetime import timezone
+from datetime import UTC
 
 import fastapi.concurrency
 import pytest
@@ -30,13 +30,6 @@ import services.alerts.crud
 import services.alerts.tests.unit.crud.utils
 from framework.tests.unit.common_fixtures import K8sSecretsMock
 from services.alerts.tests.unit.conftest import TestAlertsBase
-
-
-@pytest.fixture
-def reset_alert_caches():
-    yield
-    services.alerts.crud.Alerts()._alert_cache.cache_clear()
-    services.alerts.crud.Alerts()._alert_state_cache.cache_clear()
 
 
 class TestAlerts(TestAlertsBase):
@@ -57,6 +50,7 @@ class TestAlerts(TestAlertsBase):
         mocked_store_alert_activation,
         db: sqlalchemy.orm.Session,
         k8s_secrets_mock: K8sSecretsMock,
+        reset_alert_caches,
     ):
         project = "project-name"
         alert_name = "my-alert"
@@ -109,8 +103,8 @@ class TestAlerts(TestAlertsBase):
             ("name with spaces", pytest.raises(mlrun.errors.MLRunBadRequestError)),
             ("invalid/name", pytest.raises(mlrun.errors.MLRunBadRequestError)),
             ("invalid@name", pytest.raises(mlrun.errors.MLRunBadRequestError)),
-            ("invalid_name", pytest.raises(mlrun.errors.MLRunBadRequestError)),
-            ("$indalid_name", pytest.raises(mlrun.errors.MLRunBadRequestError)),
+            ("invalid_name", does_not_raise()),
+            ("$invalid_name", pytest.raises(mlrun.errors.MLRunBadRequestError)),
             ("valid-name", does_not_raise()),
             ("valid-name-123", does_not_raise()),
         ],
@@ -425,7 +419,7 @@ class TestAlerts(TestAlertsBase):
             name=alert_name,
         )
         assert alert.updated is not None
-        assert alert.updated > alert.created.replace(tzinfo=timezone.utc)
+        assert alert.updated > alert.created.replace(tzinfo=UTC)
 
     @pytest.mark.asyncio
     @unittest.mock.patch.object(
@@ -483,3 +477,64 @@ class TestAlerts(TestAlertsBase):
             session=db, project=project, name=alert_name, exclude_updated=True
         )
         assert alert.updated is None
+
+    @unittest.mock.patch.object(
+        framework.utils.singletons.db.SQLDB,
+        "update_alert_activation",
+        return_value=None,
+    )
+    @unittest.mock.patch.object(
+        services.alerts.crud.AlertActivation,
+        "store_alert_activation",
+        return_value=None,
+    )
+    def test_delete_alerts(
+        self,
+        mocked_update_alert_activation,
+        mocked_store_alert_activation,
+        db: sqlalchemy.orm.Session,
+        k8s_secrets_mock: K8sSecretsMock,
+    ):
+        project = "project-name"
+        for i in range(10):
+            alert_name = f"my-alert-{i}"
+
+            alert_data = services.alerts.tests.unit.crud.utils.generate_alert_data(
+                project=project,
+                name=alert_name,
+                entity=services.alerts.tests.unit.crud.utils.generate_alert_entity(
+                    project=project
+                ),
+            )
+
+            services.alerts.crud.Alerts().store_alert(
+                session=db,
+                project=project,
+                name=alert_name,
+                alert_data=alert_data,
+            )
+        alerts = services.alerts.crud.Alerts().list_alerts(
+            session=db,
+            project=project,
+        )
+        assert len(alerts) == 10
+
+        mlrun.mlconf.alerts.chunk_size_during_project_deletion = 2
+
+        services.alerts.crud.Alerts().populate_caches(session=db)
+        services.alerts.crud.Alerts().delete_alerts(db, project)
+
+        alerts_after_deletion = services.alerts.crud.Alerts().list_alerts(
+            session=db,
+            project=project,
+        )
+        assert len(alerts_after_deletion) == 0
+        for alert in alerts:
+            assert (
+                services.alerts.crud.Alerts()._get_alert_by_id_cached()(db, alert.id)
+                is None
+            )
+            with pytest.raises(mlrun.errors.MLRunNotFoundError):
+                assert services.alerts.crud.Alerts()._get_alert_state_cached()(
+                    db, alert.id
+                )

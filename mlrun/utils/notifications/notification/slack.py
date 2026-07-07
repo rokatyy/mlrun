@@ -14,13 +14,12 @@
 
 import typing
 
-import aiohttp
-
+import mlrun.common.runtimes.constants as runtimes_constants
 import mlrun.common.schemas
 import mlrun.lists
 import mlrun.utils.helpers
 
-from .base import NotificationBase
+from .base import NotificationBase, TimedHTTPClient
 
 
 class SlackNotification(NotificationBase):
@@ -46,13 +45,12 @@ class SlackNotification(NotificationBase):
     async def push(
         self,
         message: str,
-        severity: typing.Optional[
-            typing.Union[mlrun.common.schemas.NotificationSeverity, str]
-        ] = mlrun.common.schemas.NotificationSeverity.INFO,
-        runs: typing.Optional[typing.Union[mlrun.lists.RunList, list]] = None,
-        custom_html: typing.Optional[typing.Optional[str]] = None,
-        alert: typing.Optional[mlrun.common.schemas.AlertConfig] = None,
-        event_data: typing.Optional[mlrun.common.schemas.Event] = None,
+        severity: typing.Union[mlrun.common.schemas.NotificationSeverity, str]
+        | None = mlrun.common.schemas.NotificationSeverity.INFO,
+        runs: typing.Union[mlrun.lists.RunList, list] | None = None,
+        custom_html: str | None = None,
+        alert: mlrun.common.schemas.AlertConfig | None = None,
+        event_data: mlrun.common.schemas.Event | None = None,
     ):
         webhook = self.params.get("webhook", None) or mlrun.get_secret_or_env(
             "SLACK_WEBHOOK"
@@ -66,7 +64,7 @@ class SlackNotification(NotificationBase):
 
         data = self._generate_slack_data(message, severity, runs, alert, event_data)
 
-        async with aiohttp.ClientSession() as session:
+        async with TimedHTTPClient().session() as session:
             async with session.post(webhook, json=data) as response:
                 response.raise_for_status()
 
@@ -177,13 +175,16 @@ class SlackNotification(NotificationBase):
         # Only show the URL if the run is not a function (serving or mlrun function)
         kind = run.get("step_kind")
         state = run["status"].get("state", "")
-        if state != "skipped" and (url and not kind or kind == "run"):
-            line = f'<{url}|*{meta.get("name")}*>'
+
+        if state != runtimes_constants.RunStates.skipped and (
+            url and not kind or kind == "run"
+        ):
+            line = f"<{url}|*{meta.get('name')}*>"
         else:
             line = meta.get("name")
         if kind:
-            line = f'{line} *({run.get("step_kind", run.get("kind", ""))})*'
-        line = f'{self.emojis.get(state, ":question:")}  {line}'
+            line = f"{line} *({run.get('step_kind', run.get('kind', ''))})*"
+        line = f"{self.emojis.get(state, ':question:')}  {line}"
         return self._get_slack_row(line)
 
     def _get_run_result(self, run: dict) -> dict:

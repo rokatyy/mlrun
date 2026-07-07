@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import re
 from collections import ChainMap
 from os import environ
@@ -93,7 +92,7 @@ def args_from_env(env):
 )
 @pytest.mark.parametrize("notebook", iterate_notebooks())
 def test_notebook(notebook):
-    path = f'./examples/{notebook["notebook_name"]}'
+    path = f"./examples/{notebook['notebook_name']}"
     args, args_cmd = args_from_env(notebook["env"])
     deps = []
     for dep in notebook.get("pip", []):

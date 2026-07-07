@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
+import datetime
+
 import pytest
 
 import mlrun
+import mlrun.common.runtimes.constants
 import tests.system.base
 
 
@@ -33,6 +36,19 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
                 with_notifications=True,
             )
             assert len(runs) == 1
+            assert runs[0]["status"]["end_time"]
+            assert runs[0]["status"]["last_update"]
+            end_time = datetime.datetime.fromisoformat(runs[0]["status"]["end_time"])
+            last_updated_time = datetime.datetime.fromisoformat(
+                runs[0]["status"]["last_update"]
+            )
+            # Allow for small timing differences (up to 10ms) due to clock precision
+            time_diff = (last_updated_time - end_time).total_seconds()
+            assert time_diff >= -0.01, (
+                f"last_update ({last_updated_time}) should be >= end_time ({end_time}), "
+                f"but differs by {time_diff:.6f} seconds"
+            )
+
             assert len(runs[0]["status"]["notifications"]) == 2
             for notification_name, notification in runs[0]["status"][
                 "notifications"
@@ -64,7 +80,7 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
             "function-from-module",
             kind="job",
             project=self.project_name,
-            image="mlrun/mlrun",
+            image=mlrun.mlconf.function_defaults.image_by_kind.job,
         )
         run = function.run(
             handler="json.dumps",
@@ -181,6 +197,79 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
             _assert_notification_in_schedule,
         )
 
+    def test_run_notifications_with_retries(self):
+        notification_name = "retry-final-failure-notification"
+        notification_kind = "slack"
+
+        # Notification sent when run fails after all retries
+        notification = self._create_notification(
+            name=notification_name,
+            kind=notification_kind,
+            when=[mlrun.common.runtimes.constants.RunStates.error],
+            message="Run failed after retries",
+            secret_params={
+                # dummy slack test url should return 200
+                "webhook": "https://slack.com/api/api.test",
+            },
+        )
+
+        code_path = str(self.assets_path / "raise_func.py")
+        function = self.project.set_function(
+            code_path,
+            name="test-func",
+            kind="job",
+            handler="handler",
+        )
+
+        retry_count = 2
+        retry = mlrun.model.Retry(
+            count=retry_count,
+        )
+
+        # Run the function with retry logic
+        with pytest.raises(mlrun.runtimes.utils.RunError):
+            function.run(
+                verbose=True,
+                retry=retry,
+                notifications=[notification],
+            )
+
+        # Validate that the run in pending retry state
+        runs = self._run_db.list_runs(project=self.project_name)
+        assert len(runs) == 1
+        run = mlrun.RunObject.from_dict(runs[0])
+        assert run.status.retry_count is None
+        assert (
+            run.status.state == mlrun.common.runtimes.constants.RunStates.pending_retry
+        )
+
+        def _assert_notification_received():
+            runs = self._run_db.list_runs(
+                project=self.project_name,
+                with_notifications=True,
+            )
+            assert len(runs) == 1
+            run = mlrun.RunObject.from_dict(runs[0])
+            assert run.status.state == mlrun.common.runtimes.constants.RunStates.error
+
+            notifications = run.status.notifications
+            assert len(notifications) == 1, (
+                f"Expected one notification, got: {len(notifications)}"
+            )
+
+            # Validate final failure notification
+            notification = notifications[notification_name]
+            assert notification["status"] == "sent"
+
+        # Wait until retry attempts are exhausted and notification is processed
+        mlrun.utils.retry_until_successful(
+            1,
+            250,
+            self._logger,
+            True,
+            _assert_notification_received,
+        )
+
     @staticmethod
     def _create_notification(
         kind=None,
@@ -203,64 +292,6 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
             params=params or {},
         )
 
-    @pytest.mark.parametrize(
-        "verify_ssl,expected_run_status,url",
-        [
-            (True, "error", "https://self-signed.badssl.com/"),
-            (False, "sent", "https://self-signed.badssl.com/"),
-            (None, "sent", "http://httpstat.us/200"),
-            (False, "sent", "http://httpstat.us/200"),
-        ],
-    )
-    def test_webhook_notification_ssl(self, verify_ssl, expected_run_status, url):
-        notification_name = "ssl-notification"
-
-        def _assert_notifications():
-            runs = self._run_db.list_runs(
-                project=self.project_name,
-                with_notifications=True,
-            )
-            assert len(runs) == 1
-            run_notifications = runs[0]["status"]["notifications"]
-            assert len(run_notifications) == 1
-            assert run_notifications[notification_name]["status"] == expected_run_status
-
-        notification = self._create_notification(
-            kind="webhook",
-            when=["completed", "error"],
-            name=notification_name,
-            message="completed",
-            severity="info",
-            secret_params={
-                "url": url,
-                "method": "GET",
-                "verify_ssl": verify_ssl,
-            },
-        )
-
-        function = mlrun.new_function(
-            "function-from-module",
-            kind="job",
-            project=self.project_name,
-            image="mlrun/mlrun",
-        )
-
-        run = function.run(
-            handler="json.dumps",
-            params={"obj": {"x": 99}},
-            notifications=[notification],
-        )
-        assert run.output("return") == '{"x": 99}'
-
-        # the notifications are sent asynchronously, so we need to wait for them
-        mlrun.utils.retry_until_successful(
-            1,
-            40,
-            self._logger,
-            True,
-            _assert_notifications,
-        )
-
     def _create_sleep_func_in_project(self):
         code_path = str(self.assets_path / "sleep.py")
 
@@ -269,7 +300,7 @@ class TestNotifications(tests.system.base.TestMLRunSystem):
             kind="job",
             project=self.project_name,
             filename=code_path,
-            image="mlrun/mlrun",
+            image=mlrun.mlconf.function_defaults.image_by_kind.job,
         )
         self.project.set_function(sleep_func)
         self.project.sync_functions(save=True)

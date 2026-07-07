@@ -13,7 +13,6 @@
 # limitations under the License.
 import re
 from subprocess import run
-from typing import Optional
 
 import kubernetes.client
 
@@ -57,8 +56,13 @@ class RemoteSparkSpec(KubeResourceSpec):
         tolerations=None,
         preemption_mode=None,
         security_context=None,
-        clone_target_dir=None,
         state_thresholds=None,
+        serving_spec=None,
+        graph=None,
+        parameters=None,
+        track_models=None,
+        env_from=None,
+        mount_otlp_secret: bool = False,
     ):
         super().__init__(
             command=command,
@@ -68,6 +72,7 @@ class RemoteSparkSpec(KubeResourceSpec):
             volumes=volumes,
             volume_mounts=volume_mounts,
             env=env,
+            env_from=env_from,
             resources=resources,
             default_handler=default_handler,
             entry_points=entry_points,
@@ -87,8 +92,12 @@ class RemoteSparkSpec(KubeResourceSpec):
             tolerations=tolerations,
             preemption_mode=preemption_mode,
             security_context=security_context,
-            clone_target_dir=clone_target_dir,
             state_thresholds=state_thresholds,
+            serving_spec=serving_spec,
+            graph=graph,
+            parameters=parameters,
+            track_models=track_models,
+            mount_otlp_secret=mount_otlp_secret,
         )
         self.provider = provider
 
@@ -103,6 +112,12 @@ class RemoteSparkRuntime(KubejobRuntime):
 
     @classmethod
     def deploy_default_image(cls):
+        if not mlrun.get_current_project(silent=True):
+            raise mlrun.errors.MLRunMissingProjectError(
+                "An active project is required to run deploy_default_image(). "
+                "This can be set by calling get_or_create_project(), load_project(), or new_project()."
+            )
+
         sj = mlrun.new_function(
             kind="remote-spark", name="remote-spark-default-image-deploy-temp"
         )
@@ -180,7 +195,7 @@ class RemoteSparkRuntime(KubejobRuntime):
         skip_deployed=False,
         is_kfp=False,
         mlrun_version_specifier=None,
-        builder_env: Optional[dict] = None,
+        builder_env: dict | None = None,
         show_on_failure: bool = False,
         force_build: bool = False,
     ):

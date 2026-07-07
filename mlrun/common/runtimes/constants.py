@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import enum
-import typing
+
 
 import mlrun.common.constants as mlrun_constants
 import mlrun_pipelines.common.models
+from mlrun.common.types import StrEnum
 
 
 class PodPhases:
@@ -78,7 +77,7 @@ class ThresholdStates:
         ]
 
     @staticmethod
-    def from_pod_phase(pod_phase: str, pod: dict) -> typing.Optional[str]:
+    def from_pod_phase(pod_phase: str, pod: dict) -> str | None:
         if pod_phase == PodPhases.pending:
             if ThresholdStates.is_pod_in_image_pull_backoff(pod):
                 return ThresholdStates.image_pull_backoff
@@ -140,6 +139,7 @@ class RunStates:
     aborted = "aborted"
     aborting = "aborting"
     skipped = "skipped"
+    pending_retry = "pendingRetry"
 
     @staticmethod
     def all():
@@ -153,6 +153,7 @@ class RunStates:
             RunStates.aborted,
             RunStates.aborting,
             RunStates.skipped,
+            RunStates.pending_retry,
         ]
 
     @staticmethod
@@ -169,6 +170,7 @@ class RunStates:
         return [
             RunStates.error,
             RunStates.aborted,
+            RunStates.pending_retry,
         ]
 
     @staticmethod
@@ -187,12 +189,22 @@ class RunStates:
         return list(set(RunStates.all()) - set(RunStates.terminal_states()))
 
     @staticmethod
+    def terminal_or_error_states():
+        return list(
+            set(RunStates.terminal_states())
+            | set(RunStates.error_and_abortion_states())
+        )
+
+    @staticmethod
     def not_allowed_for_deletion_states():
         return [
             RunStates.running,
             RunStates.pending,
-            # TODO: add aborting state once we have it
         ]
+
+    @staticmethod
+    def notification_states():
+        return RunStates.terminal_states() + [RunStates.running]
 
     @staticmethod
     def run_state_to_pipeline_run_status(run_state: str):
@@ -231,19 +243,6 @@ class RunStates:
             mlrun_pipelines.common.models.RunStatuses.paused: RunStates.unknown,
             mlrun_pipelines.common.models.RunStatuses.unknown: RunStates.unknown,
         }[pipeline_run_status]
-
-
-# TODO: remove this class in 1.9.0 - use only MlrunInternalLabels
-class RunLabels(enum.Enum):
-    owner = mlrun_constants.MLRunInternalLabels.owner
-    v3io_user = mlrun_constants.MLRunInternalLabels.v3io_user
-
-    @staticmethod
-    def all():
-        return [
-            RunLabels.owner,
-            RunLabels.v3io_user,
-        ]
 
 
 class SparkApplicationStates:
@@ -366,3 +365,37 @@ class NuclioIngressAddTemplatedIngressModes:
 class FunctionEnvironmentVariables:
     _env_prefix = "MLRUN_"
     auth_session = f"{_env_prefix}AUTH_SESSION"
+
+
+# Kubernetes probe types
+class ProbeType(StrEnum):
+    READINESS = "readiness"
+    LIVENESS = "liveness"
+    STARTUP = "startup"
+
+    @property
+    def key(self):
+        return f"{self.value}Probe"
+
+    @classmethod
+    def is_valid(cls, value: str, raise_on_error: bool = False) -> bool:
+        valid_value = value in cls._value2member_map_
+        if not valid_value and raise_on_error:
+            raise ValueError(
+                f"Invalid probe type: {value}. Must be one of: {[p.value for p in ProbeType]}"
+            )
+        return valid_value
+
+    @classmethod
+    def all(cls) -> list[str]:
+        return [pt.key for pt in cls]
+
+
+HEALTH_CHECK_KEYS = ["httpGet", "exec", "tcpSocket", "grpc"]
+
+
+class ProbeTimeConfig(StrEnum):
+    INITIAL_DELAY_SECONDS = "initialDelaySeconds"
+    PERIOD_SECONDS = "periodSeconds"
+    TIMEOUT_SECONDS = "timeoutSeconds"
+    FAILURE_THRESHOLD = "failureThreshold"

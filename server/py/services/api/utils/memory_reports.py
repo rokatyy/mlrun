@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import gc
 import io
@@ -36,7 +35,7 @@ class MemoryUsageReport(metaclass=mlrun.utils.singleton.AbstractSingleton):
         self,
         object_type: str,
         sample_size: int = 1,
-        start_index: typing.Optional[int] = None,
+        start_index: int | None = None,
         create_graph: bool = False,
         max_depth: int = 3,
     ) -> list[dict[str, typing.Any]]:

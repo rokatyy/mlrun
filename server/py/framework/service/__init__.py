@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import concurrent.futures
 import contextlib
 import http
 import traceback
 import typing
 from abc import ABC, abstractmethod
 
+import anyio
+import anyio.lowlevel
+import anyio.to_thread
 import fastapi
-import fastapi.concurrency
 import fastapi.exception_handlers
 import semver
 from dependency_injector import containers, providers
@@ -32,12 +33,13 @@ import mlrun.utils.version
 from mlrun import mlconf
 
 import framework.api.utils
+import framework.db.session
 import framework.middlewares
 import framework.utils.clients.chief
 import framework.utils.clients.messaging
 import framework.utils.pagination
 import framework.utils.periodic
-from framework.utils.singletons.db import initialize_db
+import framework.utils.singletons.db
 
 
 class Service(ABC):
@@ -46,13 +48,13 @@ class Service(ABC):
         self.service_prefix = f"/{self.service_name}"
         self.base_versioned_service_prefix = f"{self.service_prefix}/v1"
         self.v2_service_prefix = f"{self.service_prefix}/v2"
-        self.app: typing.Optional[fastapi.FastAPI] = None
+        self.app: fastapi.FastAPI | None = None
         self._logger = mlrun.utils.logger.get_child(self.service_name)
         self._mounted_services: list[Service] = []
         self._messaging_client = framework.utils.clients.messaging.Client()
         self._paginated_methods: list[tuple[typing.Callable, str]] = []
 
-    def initialize(self, mounts: typing.Optional[list] = None):
+    def initialize(self, mounts: list | None = None):
         self._logger.info("Initializing service", service_name=self.service_name)
         self._initialize_app()
         self._register_routes()
@@ -63,15 +65,19 @@ class Service(ABC):
 
     async def move_service_to_online(self):
         self._logger.info("Moving service to online", service_name=self.service_name)
+        await framework.db.session.run_async_function_with_new_db_session(
+            self._sync_system_metadata
+        )
         await self._move_service_to_online()
 
     # https://fastapi.tiangolo.com/advanced/events/
     @contextlib.asynccontextmanager
     async def lifespan(self, app_: fastapi.FastAPI):
-        setup_tasks = [self._setup_service()] + [
-            service._setup_service(mounted=True) for service in self._mounted_services
-        ]
-        await asyncio.gather(*setup_tasks)
+        # set up the top-level service only then the mounted services
+        await self._setup_service()
+        await asyncio.gather(
+            *[service._setup_mounted_service() for service in self._mounted_services]
+        )
 
         # Let the service run
         yield
@@ -117,7 +123,7 @@ class Service(ABC):
     async def _move_service_to_online(self):
         pass
 
-    def _mount_services(self, mounts: typing.Optional[list] = None):
+    def _mount_services(self, mounts: list | None = None):
         if not mounts:
             return
 
@@ -153,42 +159,93 @@ class Service(ABC):
             mlrun_service_name=self.service_name,
             mlrun_service=self,
         )
+        self._add_swagger_authorization()
 
-    async def _setup_service(self, mounted: bool = False):
+    def _add_swagger_authorization(self):
+        """
+        Add authorization header support to Swagger UI.
+        This allows users to add a custom authorization header in the Swagger UI.
+        """
+
+        def custom_openapi():
+            if self.app.openapi_schema:
+                return self.app.openapi_schema
+            from fastapi.openapi.utils import get_openapi
+
+            openapi_schema = get_openapi(
+                title=self.app.title,
+                version=self.app.version,
+                description=self.app.description,
+                routes=self.app.routes,
+            )
+            openapi_schema.setdefault("components", {})
+
+            # Add security scheme for authorization header
+            # This makes the "Authorize" button appear in Swagger UI
+            openapi_schema["components"].setdefault("securitySchemes", {})
+            openapi_schema["components"]["securitySchemes"]["Authorization"] = {
+                "type": "apiKey",
+                "in": "header",
+                "name": "Authorization",
+                "description": "Enter your authorization header token. Example: Bearer <token>",
+            }
+            # Add security requirement at root level to make it available globally
+            # Empty array [] means the security is optional (not required)
+            # This allows Swagger UI to attach the header to requests when user authorizes,
+            # but won't interfere with cookie-based authentication when user doesn't authorize
+            openapi_schema.setdefault("security", [])
+            auth_security = {"Authorization": []}
+            if auth_security not in openapi_schema["security"]:
+                openapi_schema["security"].append(auth_security)
+            self.app.openapi_schema = openapi_schema
+            return self.app.openapi_schema
+
+        self.app.openapi = custom_openapi
+
+    async def _setup_service(self):
         """
         This method is called when the service is starting up.
-        :param mounted: True if the service is mounted as a sub-service of another service, False otherwise
         """
-        if not mounted:
-            self._logger.info(
-                "On startup event handler called",
-                config=mlconf.dump_yaml(),
-                version=mlrun.utils.version.Version().get(),
-                service_name=self.service_name,
-            )
-            loop = asyncio.get_running_loop()
-            loop.set_default_executor(
-                concurrent.futures.ThreadPoolExecutor(
-                    max_workers=int(mlconf.httpdb.max_workers)
-                )
-            )
+        self._logger.info(
+            "Setting up service",
+            config=mlconf.dump_yaml(),
+            version=mlrun.utils.version.Version().get(),
+            service_name=self.service_name,
+        )
 
-            initialize_db()
+        # Set the default thread limiter to the max workers config according to:
+        # https://github.com/fastapi/fastapi/issues/4221
+        anyio.lowlevel.RunVar("_default_thread_limiter").set(
+            anyio.CapacityLimiter(int(mlconf.httpdb.max_workers))
+        )
+        self._logger.info(
+            "Service default thread limiter set",
+            max_workers=anyio.to_thread.current_default_thread_limiter().total_tokens,
+        )
+
+        await mlrun.utils.run_in_threadpool(framework.utils.singletons.db.initialize_db)
         await self._custom_setup_service()
 
-        self._initialize_data()
         if (
             mlconf.httpdb.clusterization.worker.sync_with_chief.mode
             == mlrun.common.schemas.WaitForChiefToReachOnlineStateFeatureFlag.enabled
             and mlconf.httpdb.clusterization.role
             == mlrun.common.schemas.ClusterizationRole.worker
-            and not mounted
         ):
             # in the background, wait for chief to reach online state
             self._start_chief_clusterization_spec_sync_loop()
 
-        if mlconf.httpdb.state == mlrun.common.schemas.APIStates.online and not mounted:
+        # below logic must be relevant for chief only
+        # as at this point the worker is not yet online (the condition below is for chief only)
+        # and this means not all data / schemas are ready yet on worker level.
+
+        # relevant for chief only. workers will not reach this point as they
+        # are waiting for chief to reach online state.
+        if mlconf.httpdb.state == mlrun.common.schemas.APIStates.online:
             await self.move_service_to_online()
+
+    async def _setup_mounted_service(self):
+        await self._custom_setup_service()
 
     async def _custom_setup_service(self):
         pass
@@ -275,9 +332,6 @@ class Service(ABC):
             request_url=request.url,
         )
 
-    def _initialize_data(self):
-        pass
-
     async def _start_periodic_functions(self):
         pass
 
@@ -337,7 +391,14 @@ class Service(ABC):
         chief_version = semver.version.Version.parse(clusterization_spec.chief_version)
         unstable_chief = chief_version.build == "unstable"
         unstable_worker = worker_version.build == "unstable"
-        if not (unstable_chief or unstable_worker) and worker_version != chief_version:
+        chief_worker_mismatch_version = (
+            not (unstable_chief or unstable_worker) and worker_version != chief_version
+        )
+
+        if (
+            chief_worker_mismatch_version
+            and not mlconf.httpdb.clusterization.worker.sync_with_chief.allow_version_mismatch
+        ):
             self._logger.warning(
                 "Chief version is different than worker version, denying response",
                 chief_version=chief_version,
@@ -399,6 +460,23 @@ class Service(ABC):
         for mounted_service in self._mounted_services:
             for cls, method in mounted_service._paginated_methods:
                 yield cls, method
+
+    def _sync_system_metadata(self, db_session):
+        """
+        Sync system metadata values from the database to the config.
+        Currently, it synchronizes only the system ID but can be extended for other new metadata values in the future.
+
+        :param db_session: The database session to use for the synchronization.
+        """
+
+        db = framework.db.sqldb.db.SQLDB()
+        system_id = db.get_system_id(db_session)
+        if system_id is not None:
+            self._logger.debug(
+                "Existing system ID found in the database",
+                system_id=system_id,
+            )
+            mlrun.mlconf.system_id = system_id
 
 
 class Daemon(ABC):

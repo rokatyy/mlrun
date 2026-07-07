@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import io
 import logging
 import os.path
 import platform
@@ -44,18 +45,18 @@ class Constants:
     log_format = "> %(asctime)s [%(levelname)s] %(message)s"
 
 
-class ExcecutionParams:
+class ExecutionParams:
     def __init__(
         self,
         registry_url: str,
-        registry_secret_name: typing.Optional[str] = None,
-        chart_name: typing.Optional[str] = None,
-        chart_version: typing.Optional[str] = None,
-        mlrun_version: typing.Optional[str] = None,
-        override_mlrun_api_image: typing.Optional[str] = None,
-        override_mlrun_log_collector_image: typing.Optional[str] = None,
-        override_mlrun_ui_image: typing.Optional[str] = None,
-        override_jupyter_image: typing.Optional[str] = None,
+        registry_secret_name: str | None = None,
+        chart_name: str | None = None,
+        chart_version: str | None = None,
+        mlrun_version: str | None = None,
+        override_mlrun_api_image: str | None = None,
+        override_mlrun_log_collector_image: str | None = None,
+        override_mlrun_ui_image: str | None = None,
+        override_jupyter_image: str | None = None,
         disable_pipelines: bool = False,
         force_enable_pipelines: bool = False,
         disable_prometheus_stack: bool = False,
@@ -63,9 +64,10 @@ class ExcecutionParams:
         disable_log_collector: bool = False,
         devel: bool = False,
         minikube: bool = False,
-        sqlite: typing.Optional[str] = None,
+        sqlite: str | None = None,
         upgrade: bool = False,
-        custom_values: typing.Optional[list[str]] = None,
+        custom_values: list[str] | None = None,
+        helm_timeout: str | None = None,
     ):
         self.registry_url = registry_url
         self.registry_secret_name = registry_secret_name
@@ -86,6 +88,7 @@ class ExcecutionParams:
         self.sqlite = sqlite
         self.upgrade = upgrade
         self.custom_values = custom_values
+        self.helm_timeout = helm_timeout
 
 
 class CommunityEditionDeployer:
@@ -97,14 +100,14 @@ class CommunityEditionDeployer:
         self,
         namespace: str,
         log_level: str = "info",
-        log_file: typing.Optional[str] = None,
-        remote: typing.Optional[str] = None,
-        remote_ssh_username: typing.Optional[str] = None,
-        remote_ssh_password: typing.Optional[str] = None,
-        chart_name: typing.Optional[str] = None,
+        log_file: str | None = None,
+        remote: str | None = None,
+        remote_ssh_username: str | None = None,
+        remote_ssh_password: str | None = None,
+        chart_name: str | None = None,
     ) -> None:
         self._debug = log_level == "debug"
-        self._log_file_handler = None
+        self._log_file_handler: typing.IO | None = None
         logging.basicConfig(format="> %(asctime)s [%(levelname)s] %(message)s")
         self._logger = logging.getLogger("automation")
         self._logger.setLevel(log_level.upper())
@@ -133,7 +136,7 @@ class CommunityEditionDeployer:
     def connect_to_remote(self):
         self._log("info", "Connecting to remote machine", remote=self._remote)
         self._ssh_client = paramiko.SSHClient()
-        self._ssh_client.set_missing_host_key_policy(paramiko.WarningPolicy)
+        self._ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy)
         self._ssh_client.connect(
             self._remote,
             username=self._remote_ssh_username,
@@ -143,16 +146,16 @@ class CommunityEditionDeployer:
     def deploy(
         self,
         registry_url: str,
-        registry_username: typing.Optional[str] = None,
-        registry_password: typing.Optional[str] = None,
-        registry_secret_name: typing.Optional[str] = None,
-        chart_name: typing.Optional[str] = None,
-        chart_version: typing.Optional[str] = None,
-        mlrun_version: typing.Optional[str] = None,
-        override_mlrun_api_image: typing.Optional[str] = None,
-        override_mlrun_log_collector_image: typing.Optional[str] = None,
-        override_mlrun_ui_image: typing.Optional[str] = None,
-        override_jupyter_image: typing.Optional[str] = None,
+        registry_username: str | None = None,
+        registry_password: str | None = None,
+        registry_secret_name: str | None = None,
+        chart_name: str | None = None,
+        chart_version: str | None = None,
+        mlrun_version: str | None = None,
+        override_mlrun_api_image: str | None = None,
+        override_mlrun_log_collector_image: str | None = None,
+        override_mlrun_ui_image: str | None = None,
+        override_jupyter_image: str | None = None,
         disable_pipelines: bool = False,
         force_enable_pipelines: bool = False,
         disable_prometheus_stack: bool = False,
@@ -161,9 +164,10 @@ class CommunityEditionDeployer:
         skip_registry_validation: bool = False,
         devel: bool = False,
         minikube: bool = False,
-        sqlite: typing.Optional[str] = None,
+        sqlite: str | None = None,
         upgrade: bool = False,
-        custom_values: typing.Optional[list[str]] = None,
+        custom_values: list[str] | None = None,
+        helm_timeout: str | None = None,
     ) -> None:
         """
         Deploy MLRun CE stack.
@@ -189,6 +193,7 @@ class CommunityEditionDeployer:
         :param sqlite:      Path to sqlite file to use as the mlrun database. If not supplied, will use MySQL deployment
         :param upgrade:         Upgrade an existing MLRun CE deployment
         :param custom_values:   List of custom values to pass to the helm chart
+        :param helm_timeout:    Helm timeout (e.g. "15m0s"). Overrides the default 5-minute helm timeout.
         """
         self._prepare_prerequisites(
             registry_url,
@@ -199,26 +204,27 @@ class CommunityEditionDeployer:
             minikube,
         )
 
-        ep = ExcecutionParams(
-            registry_url,
-            registry_secret_name,
-            chart_name,
-            chart_version,
-            mlrun_version,
-            override_mlrun_api_image,
-            override_mlrun_log_collector_image,
-            override_mlrun_ui_image,
-            override_jupyter_image,
-            disable_pipelines,
-            force_enable_pipelines,
-            disable_prometheus_stack,
-            disable_spark_operator,
-            disable_log_collector,
-            devel,
-            minikube,
-            sqlite,
-            upgrade,
-            custom_values,
+        ep = ExecutionParams(
+            registry_url=registry_url,
+            registry_secret_name=registry_secret_name,
+            chart_name=chart_name,
+            chart_version=chart_version,
+            mlrun_version=mlrun_version,
+            override_mlrun_api_image=override_mlrun_api_image,
+            override_mlrun_log_collector_image=override_mlrun_log_collector_image,
+            override_mlrun_ui_image=override_mlrun_ui_image,
+            override_jupyter_image=override_jupyter_image,
+            disable_pipelines=disable_pipelines,
+            force_enable_pipelines=force_enable_pipelines,
+            disable_prometheus_stack=disable_prometheus_stack,
+            disable_spark_operator=disable_spark_operator,
+            disable_log_collector=disable_log_collector,
+            devel=devel,
+            minikube=minikube,
+            sqlite=sqlite,
+            upgrade=upgrade,
+            custom_values=custom_values,
+            helm_timeout=helm_timeout,
         )
 
         helm_arguments = self._generate_helm_install_arguments(ep)
@@ -243,7 +249,7 @@ class CommunityEditionDeployer:
     def delete(
         self,
         skip_uninstall: bool = False,
-        sqlite: typing.Optional[str] = None,
+        sqlite: str | None = None,
         cleanup_registry_secret: bool = True,
         cleanup_volumes: bool = False,
         cleanup_namespace: bool = False,
@@ -317,9 +323,9 @@ class CommunityEditionDeployer:
 
     def patch_minikube_images(
         self,
-        mlrun_api_image: typing.Optional[str] = None,
-        mlrun_ui_image: typing.Optional[str] = None,
-        jupyter_image: typing.Optional[str] = None,
+        mlrun_api_image: str | None = None,
+        mlrun_ui_image: str | None = None,
+        jupyter_image: str | None = None,
     ) -> None:
         """
         Patch the MLRun CE stack images in minikube.
@@ -344,9 +350,9 @@ class CommunityEditionDeployer:
     def _prepare_prerequisites(
         self,
         registry_url: str,
-        registry_username: typing.Optional[str] = None,
-        registry_password: typing.Optional[str] = None,
-        registry_secret_name: typing.Optional[str] = None,
+        registry_username: str | None = None,
+        registry_password: str | None = None,
+        registry_secret_name: str | None = None,
         skip_registry_validation: bool = False,
         minikube: bool = False,
     ) -> None:
@@ -395,7 +401,7 @@ class CommunityEditionDeployer:
 
     def _generate_helm_install_arguments(
         self,
-        ep: ExcecutionParams,
+        ep: ExecutionParams,
     ) -> list[str]:
         """
         Generate the helm install arguments.
@@ -409,9 +415,6 @@ class CommunityEditionDeployer:
             Constants.helm_release_name,
             self._chart_name,
             "--install",
-            "--wait",
-            "--timeout",
-            "960s",
         ]
 
         if self._debug:
@@ -453,11 +456,14 @@ class CommunityEditionDeployer:
             self._log("warning", "Installing development chart version")
             helm_arguments.append("--devel")
 
+        if ep.helm_timeout:
+            helm_arguments.extend(["--timeout", ep.helm_timeout])
+
         return helm_arguments
 
     def _generate_helm_values(
         self,
-        ep: ExcecutionParams,
+        ep: ExecutionParams,
     ) -> dict[str, str]:
         """
         Generate the helm values.
@@ -467,19 +473,24 @@ class CommunityEditionDeployer:
         if not ep.registry_url and ep.minikube:
             ep.registry_url = f"{host_ip}:{Constants.minikube_registry_port}"
 
+        registry_secret_name = (
+            ep.registry_secret_name
+            if ep.registry_secret_name is not None
+            else Constants.default_registry_secret_name
+        )
+
         helm_values = {
             "global.registry.url": ep.registry_url,
-            "global.registry.secretName": f'"{ep.registry_secret_name}"'  # adding quotes in case of empty string
-            if ep.registry_secret_name is not None
-            else Constants.default_registry_secret_name,
             "global.externalHostAddress": host_ip,
             "nuclio.dashboard.externalIPAddresses[0]": host_ip,
         }
+        if registry_secret_name:
+            helm_values["global.registry.secretName"] = registry_secret_name
 
         if ep.mlrun_version:
             self._set_mlrun_version_in_helm_values(helm_values, ep.mlrun_version)
 
-        for value, overriden_image in zip(
+        for value, overridden_image in zip(
             Constants.mlrun_image_values,
             [
                 ep.override_mlrun_api_image,
@@ -488,8 +499,10 @@ class CommunityEditionDeployer:
                 ep.override_mlrun_log_collector_image,
             ],
         ):
-            if overriden_image:
-                self._override_image_in_helm_values(helm_values, value, overriden_image)
+            if overridden_image:
+                self._override_image_in_helm_values(
+                    helm_values, value, overridden_image
+                )
 
         for component, disabled in zip(
             Constants.disableable_components,
@@ -553,7 +566,7 @@ class CommunityEditionDeployer:
         registry_url: str,
         registry_username: str,
         registry_password: str,
-        registry_secret_name: typing.Optional[str] = None,
+        registry_secret_name: str | None = None,
     ) -> None:
         """
         Create a registry credentials secret.
@@ -677,26 +690,26 @@ class CommunityEditionDeployer:
         self,
         helm_values: dict[str, str],
         image_helm_value: str,
-        overriden_image: str,
+        overridden_image: str,
     ) -> None:
         """
         Override an image in the helm values.
         :param helm_values: Helm values to update
         :param image_helm_value: Helm value of the image to override
-        :param overriden_image: Image with which to override
+        :param overridden_image: Image with which to override
         """
         (
-            overriden_image_repo,
-            overriden_image_tag,
-        ) = overriden_image.split(":")
+            overridden_image_repo,
+            overridden_image_tag,
+        ) = overridden_image.split(":")
         self._log(
             "warning",
             "Overriding image",
             image=image_helm_value,
-            overriden_image=overriden_image,
+            overriden_image=overridden_image,
         )
-        helm_values[f"{image_helm_value}.image.repository"] = overriden_image_repo
-        helm_values[f"{image_helm_value}.image.tag"] = overriden_image_tag
+        helm_values[f"{image_helm_value}.image.repository"] = overridden_image_repo
+        helm_values[f"{image_helm_value}.image.tag"] = overridden_image_tag
 
     def _toggle_component_in_helm_values(
         self, helm_values: dict[str, str], component: str, disable: bool
@@ -714,9 +727,9 @@ class CommunityEditionDeployer:
     def _run_command(
         self,
         command: str,
-        args: typing.Optional[list] = None,
-        workdir: typing.Optional[str] = None,
-        stdin: typing.Optional[str] = None,
+        args: list | None = None,
+        workdir: str | None = None,
+        stdin: str | None = None,
         live: bool = True,
     ) -> (str, str, int):
         if self._remote:
@@ -746,44 +759,47 @@ class CommunityEditionDeployer:
 
 def run_command(
     command: str,
-    args: typing.Optional[list] = None,
-    workdir: typing.Optional[str] = None,
-    stdin: typing.Optional[str] = None,
+    args: list | None = None,
+    workdir: str | None = None,
+    stdin: str | None = None,
     live: bool = True,
-    log_file_handler: typing.Optional[typing.IO[str]] = None,
+    log_file_handler: typing.IO[str] | None = None,
 ) -> (str, str, int):
-    if workdir:
-        command = f"cd {workdir}; " + command
+    # ensure the command is only a single word
+    command = command.split()[0]
     if args:
-        command += " " + " ".join(args)
+        command = [command] + args
+    else:
+        command = command
 
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE,
-        shell=True,
-    )
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            cwd=workdir,
+            input=stdin,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        return exc.stdout, exc.stderr, exc.returncode
 
-    if stdin:
-        process.stdin.write(bytes(stdin, "ascii"))
-        process.stdin.close()
+    stdout_buffer = io.BytesIO()
+    stdout_buffer.write(process.stdout)
+    stdout_buffer.seek(0)
 
-    stdout = _handle_command_stdout(process.stdout, log_file_handler, live)
-    stderr = process.stderr.read()
-    exit_status = process.wait()
+    stdout = _handle_command_stdout(stdout_buffer, log_file_handler, live)
 
-    return stdout, stderr, exit_status
+    return stdout, process.stderr, process.returncode
 
 
 def run_command_remotely(
     ssh_client: paramiko.SSHClient,
     command: str,
-    args: typing.Optional[list] = None,
-    workdir: typing.Optional[str] = None,
-    stdin: typing.Optional[str] = None,
+    args: list | None = None,
+    workdir: str | None = None,
+    stdin: str | None = None,
     live: bool = True,
-    log_file_handler: typing.Optional[typing.IO[str]] = None,
+    log_file_handler: typing.IO[str] | None = None,
 ) -> (str, str, int):
     if workdir:
         command = f"cd {workdir}; " + command
@@ -805,7 +821,7 @@ def run_command_remotely(
 
 def _handle_command_stdout(
     stdout_stream: typing.Union[typing.IO[bytes], paramiko.channel.ChannelFile],
-    log_file_handler: typing.Optional[typing.IO[str]] = None,
+    log_file_handler: typing.IO[str] | None = None,
     live: bool = True,
     remote: bool = False,
 ) -> str:

@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import os
 import pathlib
 import shutil
+import time
 import unittest.mock
 
 import pandas
@@ -39,9 +40,22 @@ class TestArtifacts(tests.integration.sdk_api.base.TestMLRunIntegration):
         artifact = mlrun.artifacts.Artifact(key, body, target_path="/a.txt")
 
         db.store_artifact(key, artifact, tree=tree, project=prj)
+        # to ensure order on updated_at field
+        time.sleep(0.01)
         db.store_artifact(key, artifact, tree=tree, project=prj, iter=42)
         artifacts = db.list_artifacts(project=prj, tag="*", tree=tree)
         assert len(artifacts) == 2, "bad number of artifacts"
+
+        # validate ordering by checking that list of returned artifacts is sorted
+        # by updated time in descending order
+        artifacts = db.list_artifacts(project=prj)
+        assert len(artifacts) == 2, "bad number of artifacts"
+        for i in range(1, len(artifacts)):
+            assert (
+                artifacts[i]["metadata"]["updated"]
+                <= artifacts[i - 1]["metadata"]["updated"]
+            ), "bad ordering"
+
         assert artifacts.to_objects()[0].key == key, "not a valid artifact object"
         assert artifacts.dataitems()[0].url, "not a valid artifact dataitem"
 
@@ -155,14 +169,15 @@ class TestArtifacts(tests.integration.sdk_api.base.TestMLRunIntegration):
         # verify that the temp path was deleted after the import
         assert not os.path.exists(temp_local_path)
 
-    def test_retrieve_an_artifact_with_no_tag(self):
+    def test_artifact_retrieval_and_deletion_without_tag(self):
         """
-        Test artifact retrieval when no tag is explicitly set.
+        Test artifact retrieval and deletion when logging models without explicitly setting a tag.
         Verifies:
         1. The first artifact has no tag.
         2. The second artifact is tagged as 'latest'.
         3. Attempting to retrieve the untagged artifact using its URI without the UID raises an error.
         4. The artifact with no tag can be retrieved successfully using its full URI.
+        5. Deleting the untagged artifact removes it while the tagged one remains.
         """
         project = mlrun.new_project("log-mod")
 
@@ -185,13 +200,22 @@ class TestArtifacts(tests.integration.sdk_api.base.TestMLRunIntegration):
         artifacts = project.list_artifacts().to_objects()
         assert len(artifacts) == 2, f"Expected 2 artifacts, found {len(artifacts)}"
 
-        assert artifacts[1].tag == "latest"
-        assert artifacts[0].tag is None
+        assert artifacts[0].tag == "latest"
+        assert artifacts[1].tag is None
 
         # Assert attempting to retrieve an artifact with a URI missing the UID raises the expected error
-        uri_without_uid = artifacts[0].uri.split("^")[0]
+        uri_without_uid = artifacts[1].uri.split("^")[0]
         with pytest.raises(mlrun.errors.MLRunNotFoundError):
             project.get_store_resource(uri_without_uid)
 
         # Ensure we can retrieve the untagged artifact by its URI
-        assert project.get_store_resource(artifacts[0].uri)
+        assert project.get_store_resource(artifacts[1].uri)
+
+        # Delete the untagged artifact
+        uid0 = artifacts[0].metadata.uid
+        project.delete_artifact(artifacts[1])
+
+        # Only the tagged artifact should remain
+        artifacts = project.list_artifacts().to_objects()
+        assert len(artifacts) == 1, f"Expected 1 artifacts, found {len(artifacts)}"
+        assert artifacts[0].metadata.uid == uid0

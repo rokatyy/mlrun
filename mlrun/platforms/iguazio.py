@@ -15,7 +15,6 @@
 import json
 import os
 import urllib
-from typing import Optional
 from urllib.parse import urlparse
 
 import requests
@@ -96,7 +95,11 @@ class OutputStream:
         if access_key:
             v3io_client_kwargs["access_key"] = access_key
 
-        self._v3io_client = v3io.dataplane.Client(**v3io_client_kwargs)
+        if not mock:
+            self._v3io_client = v3io.dataplane.Client(**v3io_client_kwargs)
+        else:
+            self._v3io_client = None
+
         self._container, self._stream_path = split_path(stream_path)
         self._shards = shards
         self._retention_in_hours = retention_in_hours
@@ -105,7 +108,7 @@ class OutputStream:
         self._mock = mock
         self._mock_queue = []
 
-    def create_stream(self):
+    def create_stream(self) -> None:
         # this import creates an import loop via the utils module, so putting it in execution path
         from mlrun.utils.helpers import logger
 
@@ -136,7 +139,7 @@ class OutputStream:
         self._lazy_init()
 
         def dump_record(rec):
-            if not isinstance(rec, (str, bytes)):
+            if not isinstance(rec, str | bytes):
                 return dict_to_json(rec)
             return str(rec)
 
@@ -210,7 +213,7 @@ class KafkaOutputStream:
         self._initialized = False
 
     def _lazy_init(self):
-        if self._initialized:
+        if self._initialized or self._mock:
             return
 
         import kafka
@@ -252,14 +255,14 @@ class KafkaOutputStream:
 
 class V3ioStreamClient:
     def __init__(
-        self, url: str, shard_id: int = 0, seek_to: Optional[str] = None, **kwargs
+        self, url: str, shard_id: int = 0, seek_to: str | None = None, **kwargs
     ):
         endpoint, stream_path = parse_path(url)
         seek_options = ["EARLIEST", "LATEST", "TIME", "SEQUENCE"]
         seek_to = seek_to or "LATEST"
         seek_to = seek_to.upper()
         if seek_to not in seek_options:
-            raise ValueError(f'seek_to must be one of {", ".join(seek_options)}')
+            raise ValueError(f"seek_to must be one of {', '.join(seek_options)}")
 
         self._url = url
         self._container, self._stream_path = split_path(stream_path)
@@ -313,6 +316,9 @@ def is_iguazio_endpoint(endpoint_url: str) -> bool:
 
 
 def is_iguazio_session(value: str) -> bool:
+    # JWS-style JWTs are bearer tokens, not Iguazio sessions.
+    if value.count(".") == 2 and value.startswith("eyJ"):
+        return False
     # TODO: find a better heuristic
     return len(value) > 20 and "-" in value
 

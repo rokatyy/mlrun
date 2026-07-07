@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextvars
 import datetime
 import logging
 import os
@@ -21,13 +22,15 @@ from enum import Enum
 from functools import cached_property
 from sys import stdout
 from traceback import format_exception
-from typing import IO, Optional, Union
+from typing import IO, Union
 
 import orjson
 import pydantic.v1
 
 from mlrun import errors
 from mlrun.config import config
+
+context_id_var = contextvars.ContextVar("context_id", default=None)
 
 
 class _BaseFormatter(logging.Formatter):
@@ -58,12 +61,19 @@ class _BaseFormatter(logging.Formatter):
             default=default,
         ).decode()
 
-
-class JSONFormatter(_BaseFormatter):
-    def format(self, record) -> str:
+    def _record_with(self, record):
         record_with = getattr(record, "with", {})
         if record.exc_info:
             record_with.update(exc_info=format_exception(*record.exc_info))
+        if "ctx" not in record_with:
+            if (ctx_id := context_id_var.get()) is not None:
+                record_with["ctx"] = ctx_id
+        return record_with
+
+
+class JSONFormatter(_BaseFormatter):
+    def format(self, record) -> str:
+        record_with = self._record_with(record)
         record_fields = {
             "datetime": self.formatTime(record, self.datefmt),
             "level": record.levelname.lower(),
@@ -89,12 +99,6 @@ class HumanReadableFormatter(_BaseFormatter):
         record_with_encoded = self._json_dump(record_with) if record_with else ""
         more = f": {record_with_encoded}" if record_with_encoded else ""
         return more
-
-    def _record_with(self, record):
-        record_with = getattr(record, "with", {})
-        if record.exc_info:
-            record_with.update(exc_info=format_exception(*record.exc_info))
-        return record_with
 
 
 class CustomFormatter(HumanReadableFormatter):
@@ -138,9 +142,9 @@ class CustomFormatter(HumanReadableFormatter):
                     and not CustomFormatter.fail_on_missing_default_keys_key
                 ):
                     print(
-                        f'> {formatted_time} [warning] Custom loggers must '
-                        f'include those keys within the logger format, {", ".join(default_keys)} '
-                        f'your format is missing: {", ".join(missing_default_flags)}',
+                        f"> {formatted_time} [warning] Custom loggers must "
+                        f"include those keys within the logger format, {', '.join(default_keys)} "
+                        f"your format is missing: {', '.join(missing_default_flags)}",
                         file=sys.stderr,
                     )
                     CustomFormatter.fail_on_missing_default_keys_key = True
@@ -154,7 +158,7 @@ class CustomFormatter(HumanReadableFormatter):
                     if not CustomFormatter.fail_on_format_configuration:
                         print(
                             f"> {formatted_time} [warning] Failed to create custom logger due "
-                            f'to missing format key in the log record: {", ".join(missing_format_configuraiton_keys)}',
+                            f"to missing format key in the log record: {', '.join(missing_format_configuraiton_keys)}",
                             file=sys.stderr,
                         )
                         CustomFormatter.fail_on_format_configuration = True
@@ -256,7 +260,7 @@ class Logger:
         level,
         name="mlrun",
         propagate=True,
-        logger: Optional[logging.Logger] = None,
+        logger: logging.Logger | None = None,
     ):
         self._logger = logger or logging.getLogger(name)
         self._logger.propagate = propagate
@@ -354,7 +358,6 @@ class Logger:
         self, level, message, *args, exc_info=None, **kw_args
     ):
         kw_args.update(self._bound_variables)
-
         if kw_args:
             self._logger.log(
                 level, message, *args, exc_info=exc_info, extra={"with": kw_args}
@@ -390,16 +393,18 @@ def resolve_formatter_by_kind(
 
 
 def create_test_logger(name: str = "mlrun", stream: IO[str] = stdout) -> Logger:
-    return create_logger(
+    logger = create_logger(
         level="debug",
         formatter_kind=FormatterKinds.HUMAN_EXTENDED.name,
         name=name,
         stream=stream,
     )
+    logger._logger.propagate = True  # pass records up to pytest’s handler
+    return logger
 
 
 def create_logger(
-    level: Optional[str] = None,
+    level: str | None = None,
     formatter_kind: str = FormatterKinds.HUMAN.name,
     name: str = "mlrun",
     stream: IO[str] = stdout,

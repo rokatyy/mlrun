@@ -11,23 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import json
 import os
-import warnings
+from base64 import b64decode
 from copy import deepcopy
-from typing import TYPE_CHECKING, Optional, Union
+from typing import Union
 
 import nuclio
 from nuclio import KafkaTrigger
+from nuclio.triggers import NuclioTrigger
 
 import mlrun
 import mlrun.common.schemas as schemas
+import mlrun.common.secrets
+import mlrun.datastore.datastore_profile as ds_profile
+import mlrun.runtimes.kubejob as kubejob_runtime
+import mlrun.runtimes.nuclio.function as nuclio_function
+import mlrun.runtimes.pod as pod_runtime
+import mlrun.serving.openai_mappings
 from mlrun.datastore import get_kafka_brokers_from_dict, parse_kafka_url
 from mlrun.model import ObjectList
 from mlrun.runtimes.function_reference import FunctionReference
 from mlrun.secrets import SecretsStore
-from mlrun.serving.server import GraphServer, create_graph_server
+from mlrun.serving.endpoint_mapping import (
+    APIHandlerConfig,
+)
+from mlrun.serving.server import (
+    GraphServer,
+    add_system_steps_to_graph,
+    create_graph_server,
+)
 from mlrun.serving.states import (
     RootFlowStep,
     RouterStep,
@@ -37,21 +50,15 @@ from mlrun.serving.states import (
     new_remote_endpoint,
     params_to_step,
 )
-from mlrun.utils import get_caller_globals, logger, set_paths
-
-from .function import NuclioSpec, RemoteRuntime, min_nuclio_versions
+from mlrun.utils import get_caller_globals, logger, merge_requirements, set_paths
 
 serving_subkind = "serving_v2"
-
-if TYPE_CHECKING:
-    # remove this block in 1.9.0
-    from mlrun.model_monitoring import TrackingPolicy
 
 
 def new_v2_model_server(
     name,
     model_class: str,
-    models: Optional[dict] = None,
+    models: dict | None = None,
     filename="",
     protocol="",
     image="",
@@ -82,8 +89,8 @@ def new_v2_model_server(
     return f
 
 
-class ServingSpec(NuclioSpec):
-    _dict_fields = NuclioSpec._dict_fields + [
+class ServingSpec(nuclio_function.NuclioSpec):
+    _dict_fields = nuclio_function.NuclioSpec._dict_fields + [
         "graph",
         "load_mode",
         "graph_initializer",
@@ -95,7 +102,8 @@ class ServingSpec(NuclioSpec):
         "default_class",
         "secret_sources",
         "track_models",
-        "tracking_policy",
+        "streaming",
+        "api_handler_config",
     ]
 
     def __init__(
@@ -132,7 +140,6 @@ class ServingSpec(NuclioSpec):
         graph_initializer=None,
         error_stream=None,
         track_models=None,
-        tracking_policy=None,
         secret_sources=None,
         default_content_type=None,
         node_name=None,
@@ -149,10 +156,17 @@ class ServingSpec(NuclioSpec):
         security_context=None,
         service_type=None,
         add_templated_ingress_host_mode=None,
-        clone_target_dir=None,
         state_thresholds=None,
         disable_default_http_trigger=None,
+        custom_scaling_metric_specs=None,
         model_endpoint_creation_task_name=None,
+        model_endpoints_instructions=None,
+        serving_spec=None,
+        auth=None,
+        streaming: bool | None = None,
+        api_handler_config: APIHandlerConfig | None = None,
+        env_from=None,
+        mount_otlp_secret: bool = False,
     ):
         super().__init__(
             command=command,
@@ -167,6 +181,7 @@ class ServingSpec(NuclioSpec):
             volumes=volumes,
             volume_mounts=volume_mounts,
             env=env,
+            env_from=env_from,
             resources=resources,
             config=config,
             base_spec=base_spec,
@@ -192,8 +207,12 @@ class ServingSpec(NuclioSpec):
             security_context=security_context,
             service_type=service_type,
             add_templated_ingress_host_mode=add_templated_ingress_host_mode,
-            clone_target_dir=clone_target_dir,
             disable_default_http_trigger=disable_default_http_trigger,
+            custom_scaling_metric_specs=custom_scaling_metric_specs,
+            model_endpoints_instructions=model_endpoints_instructions,
+            serving_spec=serving_spec,
+            auth=auth,
+            mount_otlp_secret=mount_otlp_secret,
         )
 
         self.models = models or {}
@@ -207,10 +226,15 @@ class ServingSpec(NuclioSpec):
         self.graph_initializer = graph_initializer
         self.error_stream = error_stream
         self.track_models = track_models
-        self.tracking_policy = tracking_policy
         self.secret_sources = secret_sources or []
         self.default_content_type = default_content_type
         self.model_endpoint_creation_task_name = model_endpoint_creation_task_name
+        self.streaming = streaming
+        self.api_handler_config = (
+            api_handler_config.to_dict()
+            if isinstance(api_handler_config, APIHandlerConfig)
+            else api_handler_config
+        )
 
     @property
     def graph(self) -> Union[RouterStep, RootFlowStep]:
@@ -231,7 +255,7 @@ class ServingSpec(NuclioSpec):
         self._function_refs = ObjectList.from_list(FunctionReference, function_refs)
 
 
-class ServingRuntime(RemoteRuntime):
+class ServingRuntime(nuclio_function.RemoteRuntime):
     """MLRun Serving Runtime"""
 
     kind = "serving"
@@ -250,6 +274,8 @@ class ServingRuntime(RemoteRuntime):
         class_name=None,
         engine=None,
         exist_ok=False,
+        allow_cyclic: bool = False,
+        max_iterations: int | None = None,
         **class_args,
     ) -> Union[RootFlowStep, RouterStep]:
         """set the serving graph topology (router/flow) and root class or params
@@ -271,22 +297,29 @@ class ServingRuntime(RemoteRuntime):
                    can specify special router class and router arguments
 
           flow   - workflow (DAG) with a chain of states
-                   flow support "sync" and "async" engines, branches are not allowed in sync mode
+                   flow supports both "sync" and "async" engines, with "async" being the default.
+                   Branches are not allowed in sync mode.
                    when using async mode calling state.respond() will mark the state as the
                    one which generates the (REST) call response
 
         :param topology:     - graph topology, router or flow
         :param class_name:   - optional for router, router class name/path or router object
-        :param engine:       - optional for flow, sync or async engine (default to async)
+        :param engine:       - optional for flow, sync or async engine
         :param exist_ok:     - allow overriding existing topology
+        :param allow_cyclic: - allow cyclic graphs (only for async flow)
+        :param max_iterations: - optional, max iterations for cyclic graphs (only for async flow), default 100
         :param class_args:   - optional, router/flow class init args
 
-        :return graph object (fn.spec.graph)
+        :return: graph object (fn.spec.graph)
         """
         topology = topology or StepKinds.router
         if self.spec.graph and not exist_ok:
             raise mlrun.errors.MLRunInvalidArgumentError(
-                "graph topology is already set, cannot be overwritten"
+                "graph topology is already set, graph was initialized, use exist_ok=True to override"
+            )
+        if allow_cyclic and topology == StepKinds.router:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "cyclic graphs are only supported in flow topology with async engine"
             )
 
         if topology == StepKinds.router:
@@ -300,20 +333,33 @@ class ServingRuntime(RemoteRuntime):
                 step = RouterStep(class_name=class_name, class_args=class_args)
             self.spec.graph = step
         elif topology == StepKinds.flow:
-            self.spec.graph = RootFlowStep(engine=engine)
+            self.spec.graph = RootFlowStep(
+                engine=engine or "async",
+                allow_cyclic=allow_cyclic,
+                max_iterations=max_iterations,
+            )
+            self.spec.graph.track_models = self.spec.track_models
         else:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"unsupported topology {topology}, use 'router' or 'flow'"
             )
         return self.spec.graph
 
+    def setup_model_monitoring(
+        self,
+        general_model_endpoint_instructions=None,
+        extra_model_endpoint_instructions=None,
+    ):
+        raise NotImplementedError(
+            "setup_model_monitoring is not supported for serving functions. "
+            "Use set_tracking() to enable model monitoring for serving."
+        )
+
     def set_tracking(
         self,
-        stream_path: Optional[str] = None,
-        batch: Optional[int] = None,
+        stream_path: str | None = None,
         sampling_percentage: float = 100,
-        stream_args: Optional[dict] = None,
-        tracking_policy: Optional[Union["TrackingPolicy", dict]] = None,
+        stream_args: dict | None = None,
         enable_tracking: bool = True,
     ) -> None:
         """Apply on your serving function to monitor a deployed model, including real-time dashboards to detect drift
@@ -321,7 +367,6 @@ class ServingRuntime(RemoteRuntime):
 
         :param stream_path:                Path/url of the tracking stream e.g. v3io:///users/mike/mystream
                                            you can use the "dummy://" path for test/simulation.
-        :param batch:                      Deprecated. Micro batch size (send micro batches of N records at a time).
         :param sampling_percentage:        Down sampling events that will be pushed to the monitoring stream based on
                                            a specified percentage. e.g. 50 for 50%. By default, all events are pushed.
         :param stream_args:                Stream initialization parameters, e.g. shards, retention_in_hours, ..
@@ -330,13 +375,38 @@ class ServingRuntime(RemoteRuntime):
         Example::
 
             # initialize a new serving function
-            serving_fn = mlrun.import_function("hub://v2-model-server", new_name="serving")
+            serving_fn = mlrun.import_function(
+                "hub://v2-model-server", new_name="serving"
+            )
             # apply model monitoring
             serving_fn.set_tracking()
 
         """
         # Applying model monitoring configurations
         self.spec.track_models = enable_tracking
+        if self.spec.graph and isinstance(self.spec.graph, RootFlowStep):
+            self.spec.graph.track_models = enable_tracking
+        if self._spec and self._spec.function_refs:
+            logger.debug(
+                "Set tracking for children references", enable_tracking=enable_tracking
+            )
+            for name in self._spec.function_refs.keys():
+                self._spec.function_refs[name].track_models = enable_tracking
+                # Check if function_refs _function is filled if so update track_models field:
+                if self._spec.function_refs[name]._function:
+                    self._spec.function_refs[
+                        name
+                    ]._function.spec.track_models = enable_tracking
+
+                    if self._spec.function_refs[
+                        name
+                    ]._function.spec.graph and isinstance(
+                        self._spec.function_refs[name]._function.spec.graph,
+                        RootFlowStep,
+                    ):
+                        self._spec.function_refs[
+                            name
+                        ]._function.spec.graph.track_models = enable_tracking
 
         if not 0 < sampling_percentage <= 100:
             raise mlrun.errors.MLRunInvalidArgumentError(
@@ -346,39 +416,80 @@ class ServingRuntime(RemoteRuntime):
 
         if stream_path:
             self.spec.parameters["log_stream"] = stream_path
-        if batch:
-            warnings.warn(
-                "The `batch` size parameter was deprecated in version 1.8.0 and is no longer used. "
-                "It will be removed in 1.10.",
-                # TODO: Remove this in 1.10
-                FutureWarning,
-            )
         if stream_args:
             self.spec.parameters["stream_args"] = stream_args
-        if tracking_policy is not None:
-            warnings.warn(
-                "The `tracking_policy` argument is deprecated from version 1.7.0 "
-                "and has no effect. It will be removed in 1.9.0.\n"
-                "To set the desired model monitoring time window and schedule, use "
-                "the `base_period` argument in `project.enable_model_monitoring()`.",
-                FutureWarning,
-            )
+
+    def set_streaming(self, enabled: bool = True) -> None:
+        """Enable or disable streaming mode for the serving function.
+
+        When streaming is enabled, the function handler yields results as they
+        arrive from streaming steps in the graph, allowing for real-time
+        streaming responses (e.g., for LLM token streaming).
+
+        Streaming is only supported with HTTP triggers. When streaming is enabled,
+        non-HTTP triggers cannot be added to the function.
+
+        :param enabled: Enable or disable streaming mode. Default is True.
+
+        Example::
+
+            # Create a serving function with streaming enabled
+            serving_fn = mlrun.code_to_function(kind="serving")
+            serving_fn.set_topology("flow", engine="async")
+            serving_fn.set_streaming(enabled=True)
+
+        """
+        # Validate that only HTTP triggers are configured when enabling streaming
+        if enabled:
+            for key, trigger_spec in self.spec.config.items():
+                if key.startswith("spec.triggers."):
+                    trigger_name = key.split(".")[-1]
+                    trigger_kind = trigger_spec.get("kind", "http")
+                    if trigger_kind != "http":
+                        raise mlrun.errors.MLRunInvalidArgumentError(
+                            f"Streaming is only supported with HTTP triggers. "
+                            f"Found non-HTTP trigger '{trigger_name}' of kind '{trigger_kind}'. "
+                            f"Remove non-HTTP triggers before enabling streaming."
+                        )
+
+        self.spec.streaming = enabled
+
+    def add_trigger(self, name: str, spec: NuclioTrigger | dict):
+        """Add a nuclio trigger object/dict.
+
+        Overrides parent to validate streaming compatibility.
+
+        :param name: trigger name
+        :param spec: trigger object or dict
+        """
+        # Validate streaming compatibility
+        if self.spec.streaming:
+            trigger_spec = spec.to_dict() if hasattr(spec, "to_dict") else spec
+            trigger_kind = trigger_spec.get("kind", "http")
+            if trigger_kind != "http":
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    f"Cannot add non-HTTP trigger '{name}' (kind='{trigger_kind}') "
+                    f"when streaming is enabled. Streaming only supports HTTP triggers. "
+                    f"Either disable streaming with set_streaming(False) or use HTTP triggers only."
+                )
+
+        return super().add_trigger(name, spec)
 
     def add_model(
         self,
         key: str,
-        model_path: Optional[str] = None,
-        class_name: Optional[str] = None,
-        model_url: Optional[str] = None,
-        handler: Optional[str] = None,
-        router_step: Optional[str] = None,
-        child_function: Optional[str] = None,
-        creation_strategy: Optional[
-            schemas.ModelEndpointCreationStrategy
-        ] = schemas.ModelEndpointCreationStrategy.INPLACE,
+        model_path: str | None = None,
+        class_name: str | None = None,
+        model_url: str | None = None,
+        handler: str | None = None,
+        router_step: str | None = None,
+        child_function: str | None = None,
+        creation_strategy: schemas.ModelEndpointCreationStrategy
+        | None = schemas.ModelEndpointCreationStrategy.INPLACE,
+        outputs: list[str] | None = None,
         **class_args,
     ):
-        """add ml model and/or route to the function.
+        """Add ml model and/or route to the function.
 
         Example, create a function (from the notebook), add a model class, and deploy::
 
@@ -386,7 +497,7 @@ class ServingRuntime(RemoteRuntime):
             fn.add_model("boost", model_path, model_class="MyClass", my_arg=5)
             fn.deploy()
 
-        only works with router topology, for nested topologies (model under router under flow)
+        Only works with router topology. For nested topologies (model under router under flow)
         need to add router to flow and use router.add_route()
 
         :param key:         model api key (or name:version), will determine the relative url/path
@@ -399,15 +510,19 @@ class ServingRuntime(RemoteRuntime):
                             with multiple router steps)
         :param child_function: child function name, when the model runs in a child function
         :param creation_strategy: Strategy for creating or updating the model endpoint:
-            * **overwrite**:
-            1. If model endpoints with the same name exist, delete the `latest` one.
-            2. Create a new model endpoint entry and set it as `latest`.
-            * **inplace** (default):
-            1. If model endpoints with the same name exist, update the `latest` entry.
-            2. Otherwise, create a new entry.
-            * **archive**:
-            1. If model endpoints with the same name exist, preserve them.
-            2. Create a new model endpoint with the same name and set it to `latest`.
+
+                          * **overwrite**: If model endpoints with the same name exist, delete the `latest`
+                            one. Create a new model endpoint entry and set it as `latest`.
+
+                          * **inplace** (default): If model endpoints with the same name exist, update the
+                            `latest` entry. Otherwise, create a new entry.
+
+                          * **archive**: If model endpoints with the same name exist, preserve them.
+                            Create a new model endpoint with the same name and set it to `latest`.
+
+        :param outputs: list of the model outputs (e.g. labels), if provided will override the outputs that were
+                        configured in the model artifact. Note that those outputs need to be equal to the
+                        model serving function outputs (length, and order).
         :param class_args:  extra kwargs to pass to the model serving class __init__
                             (can be read in the model using .get_param(key) method)
         """
@@ -443,6 +558,8 @@ class ServingRuntime(RemoteRuntime):
         if class_name and hasattr(class_name, "to_dict"):
             if model_path:
                 class_name.model_path = model_path
+            if outputs:
+                class_name.outputs = outputs
             key, state = params_to_step(
                 class_name,
                 key,
@@ -470,9 +587,11 @@ class ServingRuntime(RemoteRuntime):
             else:
                 class_args = deepcopy(class_args)
                 class_args["model_path"] = model_path
+                class_args["outputs"] = outputs
                 state = TaskStep(
                     class_name,
                     class_args,
+                    name=key,
                     handler=handler,
                     function=child_function,
                     model_endpoint_creation_strategy=creation_strategy,
@@ -496,10 +615,14 @@ class ServingRuntime(RemoteRuntime):
         :param requirements: py package requirements file path OR list of packages
         :param kind:   mlrun function/runtime kind
 
-        :return function object
+        :return: function object
         """
         function_reference = FunctionReference(
-            url, image, requirements=requirements, kind=kind or "serving"
+            url,
+            image,
+            requirements=requirements,
+            kind=kind or "serving",
+            track_models=self.spec.track_models,
         )
         self._spec.function_refs.update(function_reference, name)
         func = function_reference.to_function(self.kind)
@@ -546,7 +669,7 @@ class ServingRuntime(RemoteRuntime):
                         stream.path, group=group, shards=stream.shards, **trigger_args
                     )
 
-    def _deploy_function_refs(self, builder_env: Optional[dict] = None):
+    def _deploy_function_refs(self, builder_env: dict | None = None):
         """set metadata and deploy child functions"""
         for function_ref in self._spec.function_refs.values():
             logger.info(f"deploy child function {function_ref.name} ...")
@@ -607,33 +730,42 @@ class ServingRuntime(RemoteRuntime):
 
         :returns: The Runtime (function) object
         """
-
+        if kind == "azure_vault" and isinstance(source, dict):
+            candidate_secret_name = (source.get("k8s_secret") or "").strip()
+            if candidate_secret_name:
+                mlrun.common.secrets.validate_not_forbidden_secret(
+                    candidate_secret_name
+                )
         if kind == "vault" and isinstance(source, list):
             source = {"project": self.metadata.project, "secrets": source}
 
         self.spec.secret_sources.append({"kind": kind, "source": source})
         return self
 
-    @min_nuclio_versions("1.12.10")
+    @nuclio_function.min_nuclio_versions("1.12.10")
     def deploy(
         self,
         project="",
         tag="",
         verbose=False,
-        auth_info: schemas.AuthInfo = None,
-        builder_env: Optional[dict] = None,
+        builder_env: dict | None = None,
         force_build: bool = False,
+        wait: bool = True,
+        timeout: int | None = None,
     ):
         """deploy model serving function to a local/remote cluster
 
         :param project:   optional, override function specified project name
         :param tag:       specify unique function tag (a different function service is created for every tag)
         :param verbose:   verbose logging
-        :param auth_info: The auth info to use to communicate with the Nuclio dashboard, required only when providing
-                          dashboard
         :param builder_env: env vars dict for source archive config/credentials e.g. builder_env={"GIT_TOKEN": token}
         :param force_build: set True for force building the image
+        :param wait:      when True (default), block until ready and return the invocation command (``str``).
+            When ``False``, submit and return ``self`` so the caller can poll. See ``RemoteRuntime.deploy``.
+        :param timeout:   optional deadline in seconds for the readiness wait when ``wait=True``;
+            forwarded to ``RemoteRuntime.deploy``. ``None`` waits indefinitely. Ignored when ``wait=False``.
         """
+
         load_mode = self.spec.load_mode
         if load_mode and load_mode not in ["sync", "async"]:
             raise ValueError(f"illegal model loading mode {load_mode}")
@@ -654,6 +786,21 @@ class ServingRuntime(RemoteRuntime):
                         f"function {function} is used in steps and is not defined, "
                         "use the .add_child_function() to specify child function attributes"
                     )
+        if (
+            isinstance(self.spec.graph, RootFlowStep)
+            and any(
+                isinstance(step_type, mlrun.serving.states.ModelRunnerStep)
+                for step_type in self.spec.graph.steps.values()
+            )
+            and self.spec.build.functionSourceCode
+        ):
+            # Add import for LLModel
+            decoded_code = b64decode(self.spec.build.functionSourceCode).decode("utf-8")
+            import_llmodel_code = "\nfrom mlrun.serving.states import LLModel\n"
+            if import_llmodel_code not in decoded_code:
+                decoded_code += import_llmodel_code
+            encoded_code = mlrun.utils.helpers.encode_user_code(decoded_code)
+            self.spec.build.functionSourceCode = encoded_code
 
         # Handle secret processing before handling child functions, since secrets are transferred to them
         if self.spec.secret_sources:
@@ -671,13 +818,16 @@ class ServingRuntime(RemoteRuntime):
             self._deploy_function_refs()
             logger.info(f"deploy root function {self.metadata.name} ...")
 
+        self._add_steps_requirements()
+
         return super().deploy(
             project,
             tag,
             verbose,
-            auth_info,
             builder_env=builder_env,
             force_build=force_build,
+            wait=wait,
+            timeout=timeout,
         )
 
     def _get_serving_spec(self):
@@ -696,10 +846,16 @@ class ServingRuntime(RemoteRuntime):
             "graph_initializer": self.spec.graph_initializer,
             "error_stream": self.spec.error_stream,
             "track_models": self.spec.track_models,
-            "tracking_policy": None,
             "default_content_type": self.spec.default_content_type,
             "model_endpoint_creation_task_name": self.spec.model_endpoint_creation_task_name,
+            "streaming": self.spec.streaming,
+            # TODO: find another way to pass this (needed for local run)
+            "filename": getattr(self.spec, "filename", None),
         }
+
+        # Include API handler config if present
+        if self.spec.api_handler_config:
+            serving_spec["api_handler_config"] = self.spec.api_handler_config
 
         if self.spec.secret_sources:
             self._secrets = SecretsStore.from_list(self.spec.secret_sources)
@@ -707,12 +863,17 @@ class ServingRuntime(RemoteRuntime):
 
         return json.dumps(serving_spec)
 
+    @property
+    def serving_spec(self):
+        return self._get_serving_spec()
+
     def to_mock_server(
         self,
         namespace=None,
         current_function="*",
         track_models=False,
         workdir=None,
+        stream_profile: ds_profile.DatastoreProfile | None = None,
         **kwargs,
     ) -> GraphServer:
         """create mock server object for local testing/emulation
@@ -721,6 +882,7 @@ class ServingRuntime(RemoteRuntime):
         :param current_function: specify if you want to simulate a child function, * for all functions
         :param track_models: allow model tracking (disabled by default in the mock server)
         :param workdir:   working directory to locate the source code (if not the current one)
+        :param stream_profile:   stream profile to use for the mock server output stream.
         """
 
         # set the namespaces/modules to look for the steps code in
@@ -752,15 +914,29 @@ class ServingRuntime(RemoteRuntime):
             function_name=self.metadata.name,
             function_tag=self.metadata.tag,
             project=self.metadata.project,
+            api_handler_config=self.spec.api_handler_config,
             **kwargs,
         )
+        server.streaming = self.spec.streaming
         server.init_states(
             context=None,
             namespace=namespace,
             logger=logger,
             is_mock=True,
             monitoring_mock=self.spec.track_models,
+            stream_profile=stream_profile,
         )
+
+        server.graph = add_system_steps_to_graph(
+            server.project,
+            deepcopy(server.graph),
+            self.spec.track_models,
+            server.context,
+            self.spec,
+        )
+
+        # Update context.root to point to the new graph
+        server.context.root = server.graph
 
         if workdir:
             os.chdir(old_workdir)
@@ -773,11 +949,13 @@ class ServingRuntime(RemoteRuntime):
 
         example::
 
-            serving_fn = mlrun.new_function("serving", image="mlrun/mlrun", kind="serving")
+            serving_fn = mlrun.new_function(
+                "serving", image="mlrun/mlrun", kind="serving"
+            )
             serving_fn.add_model(
                 "my-classifier",
                 model_path=model_path,
-                class_name="mlrun.frameworks.sklearn.SklearnModelServer",
+                class_name="mlrun.frameworks.sklearn.SKLearnModelServer",
             )
             serving_fn.plot(rankdir="LR")
 
@@ -799,3 +977,233 @@ class ServingRuntime(RemoteRuntime):
             "Turn off the mock (mock=False) and make sure Nuclio is installed for real deployment to Nuclio"
         )
         self._mock_server = self.to_mock_server()
+
+    def to_job(self, func_name: str | None = None) -> "kubejob_runtime.KubejobRuntime":
+        """Convert this ServingRuntime to a KubejobRuntime, so that the graph can be run as a standalone job.
+
+        :param func_name: Optional custom name for the job function. If not provided, automatically
+                         appends '-batch' suffix to the serving function name to prevent database collision.
+        :return: KubejobRuntime configured to execute the serving graph as a batch job.
+
+        Note:
+            The job will have a different name than the serving function to prevent database collision.
+            The original serving function remains unchanged and can still be invoked after running the job.
+        """
+        if self.spec.function_refs:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"Cannot convert function '{self.metadata.name}' to a job because it has child functions"
+            )
+
+        if self.spec.streaming:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"Cannot convert function '{self.metadata.name}' to a job because streaming "
+                f"is enabled. Streaming functions return real-time HTTP responses and cannot "
+                f"run as batch jobs. Please disable streaming with set_streaming(False) first."
+            )
+
+        self._add_steps_requirements()
+
+        spec = pod_runtime.KubeResourceSpec(
+            image=self.spec.image,
+            mode=self.spec.mode,
+            volumes=self.spec.volumes,
+            volume_mounts=self.spec.volume_mounts,
+            env=self.spec.env,
+            resources=self.spec.resources,
+            default_handler="mlrun.serving.server.execute_graph",
+            pythonpath=self.spec.pythonpath,
+            entry_points=self.spec.entry_points,
+            description=self.spec.description,
+            workdir=self.spec.workdir,
+            image_pull_secret=self.spec.image_pull_secret,
+            build=self.spec.build,
+            node_name=self.spec.node_name,
+            node_selector=self.spec.node_selector,
+            affinity=self.spec.affinity,
+            disable_auto_mount=self.spec.disable_auto_mount,
+            priority_class_name=self.spec.priority_class_name,
+            tolerations=self.spec.tolerations,
+            preemption_mode=self.spec.preemption_mode,
+            security_context=self.spec.security_context,
+            state_thresholds=self.spec.state_thresholds,
+            serving_spec=self._get_serving_spec(),
+            track_models=self.spec.track_models,
+            parameters=self.spec.parameters,
+            graph=self.spec.graph,
+        )
+
+        job_metadata = deepcopy(self.metadata)
+        original_name = job_metadata.name
+
+        if func_name:
+            # User provided explicit job name
+            job_metadata.name = func_name
+            logger.debug(
+                "Creating job from serving function with custom name",
+                new_name=func_name,
+            )
+        else:
+            job_metadata.name, was_renamed, suffix = (
+                mlrun.utils.helpers.ensure_batch_job_suffix(job_metadata.name)
+            )
+
+            # Check if the resulting name exceeds Kubernetes length limit
+            if (
+                len(job_metadata.name)
+                > mlrun.common.constants.K8S_DNS_1123_LABEL_MAX_LENGTH
+            ):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    f"Cannot convert serving function '{original_name}' to batch job: "
+                    f"the resulting name '{job_metadata.name}' ({len(job_metadata.name)} characters) "
+                    f"exceeds Kubernetes limit of {mlrun.common.constants.K8S_DNS_1123_LABEL_MAX_LENGTH} characters. "
+                    f"Please provide a custom name via the func_name parameter, "
+                    f"with at most {mlrun.common.constants.K8S_DNS_1123_LABEL_MAX_LENGTH} characters."
+                )
+
+            if was_renamed:
+                logger.info(
+                    "Creating job from serving function (auto-appended suffix to prevent collision)",
+                    new_name=job_metadata.name,
+                    suffix=suffix,
+                )
+            else:
+                logger.debug(
+                    "Creating job from serving function (name already has suffix)",
+                    name=original_name,
+                    suffix=suffix,
+                )
+
+        job = kubejob_runtime.KubejobRuntime(
+            spec=spec,
+            metadata=job_metadata,
+        )
+        return job
+
+    def _add_steps_requirements(self) -> None:
+        # extract child function name from self.metadata.name if parent label exists
+        full_name = self.metadata.name
+        parent_label = (
+            self.metadata.labels.get("mlrun/parent-function")
+            if self.metadata.labels
+            else None
+        )
+        current_function = None  # only set if current function is a child
+        if parent_label and full_name.startswith(parent_label + "-"):
+            current_function = full_name[len(parent_label) + 1 :]
+
+        steps = getattr(getattr(self.spec, "graph", {}), "steps", {})
+        for step in steps.values():
+            # only add requirements to the function if this step is local to it
+            if step_requirements := getattr(step, "requirements", []):
+                if not step._is_local_function(
+                    context=None, current_function=current_function
+                ):
+                    continue
+                build_reqs = getattr(
+                    getattr(self.spec, "build", {}), "requirements", []
+                )
+                reqs_union = merge_requirements(
+                    reqs_priority=build_reqs,
+                    reqs_secondary=step_requirements,
+                )
+                self.with_requirements(requirements=reqs_union, overwrite=True)
+
+    def set_api_handler_config(self, config: Union[APIHandlerConfig, dict]) -> None:
+        """Set the API handler configuration for the serving function.
+
+        :param config: :py:class:`~mlrun.runtimes.nuclio.serving.APIHandlerConfig` object or dictionary containing
+                      the configuration for handling different API endpoints and their actions.
+
+        Example::
+
+            # Using APIHandlerConfig object
+            from mlrun.serving.endpoint_mapping import APIHandlerConfig
+            from mlrun.common.schemas.serving import APIHandlerAction
+            from http import HTTPMethod
+
+            api_config = APIHandlerConfig()
+            api_config.add_endpoint_handler(
+                "/v1/models", HTTPMethod.GET, APIHandlerAction.ALLOW
+            )
+            serving_fn.set_api_handler_config(api_config)
+
+            # Using dictionary
+            serving_fn.set_api_handler_config(
+                {"endpoints": {("GET", "/v1/models"): {"action": "allow"}}}
+            )
+        """
+        if isinstance(config, APIHandlerConfig):
+            config = config.to_dict()
+        elif isinstance(config, dict):
+            # Validate the dict by converting it to APIHandlerConfig and back
+            # This ensures it has the correct format
+            try:
+                validated_config = APIHandlerConfig.from_dict(config)
+                config = validated_config.to_dict()
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid API handler config dict format: {exc}"
+                ) from exc
+        else:
+            raise ValueError(
+                f"config must be `APIHandlerConfig` or a `dict`, got {type(config)}"
+            )
+
+        # Store the configuration in the spec for serialization
+        self.spec.api_handler_config = config
+
+    def set_openai_frontend(
+        self,
+        endpoints: list[mlrun.serving.openai_mappings.OpenAIEndpoint] | None = None,
+        prefix: str | None = None,
+    ) -> None:
+        """Wire up OpenAI-compatible API handler endpoints in one call.
+
+        Registers pre-built input and output body mappings for each selected OpenAI
+        operation group. If ``endpoints`` is ``None``, all supported groups are registered.
+
+        **Validation scope — top-level only.** Mandatory field validation applies only to
+        the top-level keys of the request/response body. Full structural validation is
+        delegated to the OpenAI Python SDK, which deserializes responses into typed objects
+        and raises a ``ValidationError`` on any structural mismatch.
+
+        :param endpoints: Optional list of :class:`~mlrun.serving.openai_mappings.OpenAIEndpoint`
+            values selecting which operation groups to enable. Defaults to all groups.
+        :param prefix: Optional path prefix to prepend to every registered endpoint path.
+            Use this when clients send requests with a path prefix (e.g. ``prefix="/v1"``
+            registers ``/v1/chat/completions`` instead of ``/chat/completions``).
+            Defaults to ``None`` (no prefix).
+
+        Example::
+
+            from mlrun.serving.openai_mappings import OpenAIEndpoint
+
+            fn.set_openai_frontend()  # all groups, no prefix
+            fn.set_openai_frontend(prefix="/v1")  # all groups, /v1/ prefix
+            fn.set_openai_frontend([OpenAIEndpoint.RESPONSES], prefix="/v1")
+        """
+
+        if prefix is not None and not prefix.startswith("/"):
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"OpenAI API prefix must start with '/': {prefix!r}"
+            )
+
+        existing = self.spec.api_handler_config
+        config = (
+            APIHandlerConfig.from_dict(existing) if existing else APIHandlerConfig()
+        )
+
+        groups = (
+            endpoints
+            if endpoints is not None
+            else list(mlrun.serving.openai_mappings.OpenAIEndpoint)
+        )
+        for ep_group in groups:
+            for ep in mlrun.serving.openai_mappings.ENDPOINT_CLASSES[
+                ep_group
+            ].endpoints():
+                if prefix:
+                    ep.path = prefix + ep.path
+                config.add_endpoint_config(ep)
+
+        self.set_api_handler_config(config)

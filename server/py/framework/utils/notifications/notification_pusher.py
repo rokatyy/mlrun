@@ -15,13 +15,16 @@
 import asyncio
 import collections
 import datetime
+import functools
 import traceback
 import typing
 
+import sqlalchemy.orm
 from kubernetes.client import ApiException
 
 import mlrun.common.schemas
 import mlrun.errors
+import mlrun.lists
 import mlrun.model
 import mlrun.utils.helpers
 import mlrun.utils.notifications.notification as notification_module
@@ -117,8 +120,8 @@ class AlertNotificationPusher(_NotificationPusherBase):
         self,
         alert: mlrun.common.schemas.AlertConfig,
         event_data: mlrun.common.schemas.Event,
-        activation_id: typing.Optional[int] = None,
-        activation_time: typing.Optional[datetime.datetime] = None,
+        activation_id: int | None = None,
+        activation_time: datetime.datetime | None = None,
     ):
         """
         Asynchronously push notification.
@@ -208,7 +211,9 @@ class AlertNotificationPusher(_NotificationPusherBase):
         notification_object: mlrun.common.schemas.Notification,
         event_data: mlrun.common.schemas.Event,
     ):
-        message, severity = self._prepare_notification_args(alert, notification_object)
+        message, severity = self._prepare_notification_args(
+            alert, notification_object, event_data
+        )
         logger.debug(
             "Pushing async notification",
             notification=notification_object,
@@ -229,7 +234,7 @@ class AlertNotificationPusher(_NotificationPusherBase):
                 alert.project,
                 notification_object,
                 status=mlrun.common.schemas.NotificationStatus.SENT,
-                sent_time=datetime.datetime.now(tz=datetime.timezone.utc),
+                sent_time=datetime.datetime.now(tz=datetime.UTC),
             )
         except Exception as exc:
             logger.warning(
@@ -252,11 +257,12 @@ class AlertNotificationPusher(_NotificationPusherBase):
     def _prepare_notification_args(
         alert: mlrun.common.schemas.AlertConfig,
         notification_object: mlrun.common.schemas.Notification,
+        event_data: mlrun.common.schemas.Event,
     ):
         message = (
             f": {notification_object.message}"
             if notification_object.message
-            else alert.summary
+            else mlrun.utils.helpers.format_alert_summary(alert, event_data)
         )
 
         severity = alert.severity
@@ -335,9 +341,9 @@ class AlertNotificationPusher(_NotificationPusherBase):
         alert_id: int,
         project: str,
         notification: mlrun.common.schemas.Notification,
-        status: typing.Optional[str] = None,
-        sent_time: typing.Optional[datetime.datetime] = None,
-        reason: typing.Optional[str] = None,
+        status: str | None = None,
+        sent_time: datetime.datetime | None = None,
+        reason: str | None = None,
     ):
         db = mlrun.get_run_db()
         notification.status = status or notification.status
@@ -365,12 +371,19 @@ class AlertNotificationPusher(_NotificationPusherBase):
 class KFPNotificationPusher(NotificationPusher):
     def __init__(
         self,
+        db_session: sqlalchemy.orm.Session,
         project: str,
         workflow_id: str,
         notifications: list[mlrun.common.schemas.Notification],
-        default_params: typing.Optional[dict] = None,
+        default_params: dict | None = None,
     ):
         self._project = project
+
+        # NOTE: do not access this parameter from event loop / many threads.
+        # this instance is not thread safe
+        self._run_db_instance = framework.api.utils.get_run_db_instance(db_session)
+        # eof NOTE
+
         self._default_params = default_params or {}
         self._workflow_id = workflow_id
         self._notifications = notifications
@@ -398,12 +411,15 @@ class KFPNotificationPusher(NotificationPusher):
                 )
 
     def push(self, sync_push_callback=None, async_push_callback=None):
-        def sync_push():
+        def sync_push(
+            runs_: typing.Union[mlrun.lists.RunList, list] | None = None,
+        ):
             for notification_data in self._sync_notifications:
                 try:
                     self._push_workflow_notification_sync(
                         notification_data[0],
                         notification_data[1],
+                        runs_,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -411,13 +427,16 @@ class KFPNotificationPusher(NotificationPusher):
                         error=mlrun.errors.err_to_str(exc),
                     )
 
-        async def async_push():
+        async def async_push(
+            runs_: typing.Union[mlrun.lists.RunList, list] | None = None,
+        ):
             tasks = []
             for notification_data in self._async_notifications:
                 tasks.append(
                     self._push_workflow_notification_async(
                         notification_data[0],
                         notification_data[1],
+                        runs_,
                     )
                 )
 
@@ -435,14 +454,22 @@ class KFPNotificationPusher(NotificationPusher):
                         ),
                     )
 
-        super().push(sync_push, async_push)
+        runs = Workflow.get_workflow_steps(
+            self._run_db_instance,
+            self._workflow_id,
+            self._project,
+        )
+        super().push(
+            functools.partial(sync_push, runs), functools.partial(async_push, runs)
+        )
 
     def _push_workflow_notification_sync(
         self,
         notification: base.NotificationBase,
         notification_object: mlrun.common.schemas.Notification,
+        runs: typing.Union[mlrun.lists.RunList, list] | None = None,
     ):
-        message, severity, runs = self._prepare_workflow_notification_args(
+        message, severity = self._prepare_workflow_notification_args(
             notification_object
         )
 
@@ -450,6 +477,7 @@ class KFPNotificationPusher(NotificationPusher):
             "Pushing sync notification",
             notification=sanitize_notification(notification_object.dict()),
             workflow_id=self._workflow_id,
+            runs_len=len(runs),
         )
         try:
             notification.push(message, severity, runs)
@@ -472,8 +500,9 @@ class KFPNotificationPusher(NotificationPusher):
         self,
         notification: base.NotificationBase,
         notification_object: mlrun.common.schemas.Notification,
+        runs: typing.Union[mlrun.lists.RunList, list] | None = None,
     ):
-        message, severity, runs = self._prepare_workflow_notification_args(
+        message, severity = self._prepare_workflow_notification_args(
             notification_object
         )
 
@@ -481,6 +510,7 @@ class KFPNotificationPusher(NotificationPusher):
             "Pushing async notification",
             notification=sanitize_notification(notification_object.dict()),
             workflow_id=self._workflow_id,
+            runs_len=len(runs),
         )
         try:
             await notification.push(message, severity, runs)
@@ -507,12 +537,9 @@ class KFPNotificationPusher(NotificationPusher):
         custom_message = (
             f": {notification_object.message}" if notification_object.message else ""
         )
-
         message = f" (workflow: {self._workflow_id}){custom_message}"
-        runs = Workflow.get_workflow_steps(self._workflow_id, self._project)
-
         severity = (
             notification_object.severity
             or mlrun.common.schemas.NotificationSeverity.INFO
         )
-        return message, severity, runs
+        return message, severity

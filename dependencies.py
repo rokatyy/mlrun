@@ -12,15 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Optional
 
 
 def base_requirements() -> list[str]:
     return list(_load_dependencies_from_file("requirements.txt"))
-
-
-def dev_requirements() -> list[str]:
-    return list(_load_dependencies_from_file("dev-requirements.txt"))
 
 
 def extra_requirements() -> dict[str, list[str]]:
@@ -33,18 +28,18 @@ def extra_requirements() -> dict[str, list[str]]:
         "s3": [
             "boto3>=1.28.0,<1.36",
             "aiobotocore>=2.5.0,<2.16",
-            "s3fs>=2023.9.2, <2024.7",
+            "s3fs>=2025.5.1, <=2025.7.0",
         ],
         "azure-blob-storage": [
             "msrest~=0.6.21",
             "azure-core~=1.24",
-            "adlfs==2023.9.0",
-            "pyopenssl>=23",
+            "adlfs==2024.12.0",
+            "pyopenssl>=25",
         ],
         "azure-key-vault": [
             "azure-identity~=1.5",
             "azure-keyvault-secrets~=4.2",
-            "pyopenssl>=23",
+            "pyopenssl>=25",
         ],
         "plotly": ["plotly~=5.23"],
         # used to generate visualization nuclio/serving graph steps
@@ -57,28 +52,30 @@ def extra_requirements() -> dict[str, list[str]]:
             # (https://github.com/pypa/setuptools/issues/4476) with setuptools (ML-7273)
             "google-cloud-bigquery-storage~=2.17",
             "google-cloud==0.34",
-            "gcsfs>=2023.9.2, <2024.7",
+            "gcsfs>=2025.5.1, <=2025.7.0",
         ],
         "kafka": [
-            "kafka-python~=2.0",
+            "kafka-python~=2.1.0",
             # because confluent kafka supports avro format by default
             "avro~=1.11",
         ],
+        "rabbitmq": ["pika~=1.3"],
         "redis": ["redis~=4.3"],
-        "mlflow": ["mlflow~=2.16"],
         "databricks-sdk": ["databricks-sdk~=0.20.0"],
-        "sqlalchemy": ["sqlalchemy~=1.4"],
+        "sqlalchemy": ["sqlalchemy~=2.0"],
         "dask": [
-            # dask 2023 does not work on python 3.11
-            # dask 2024 requires dependencies that current mlrun with 3.9 cannot support
-            'dask~=2024.12.1; python_version >= "3.11"',
-            'distributed~=2024.12.1; python_version >= "3.11"',
-            'dask~=2023.12.1; python_version < "3.11"',
-            'distributed~=2023.12.1; python_version < "3.11"',
+            # Use ~= instead of >= to avoid installing newer versions of dask and distributed,
+            # which can cause incompatibilities between the client and the Dask scheduler/worker.
+            # (both must be the same version)
+            # Reference: https://blog.dask.org/2023/04/14/scheduler-environment-requirements
+            "dask==2024.8",
+            "distributed==2024.8",
         ],
-        "alibaba-oss": ["ossfs==2023.12.0", "oss2==2.18.1"],
-        "tdengine": ["taos-ws-py==0.3.2", "taoswswrap~=0.3.0"],
-        "snowflake": ["snowflake-connector-python~=3.7"],
+        "alibaba-oss": ["ossfs==2025.5.0", "oss2==2.18.4"],
+        "timescaledb": ["psycopg[binary,pool]~=3.2"],
+        "opentelemetry": ["storey[otel]"],
+        "snowflake": ["snowflake-connector-python~=4.6"],
+        "v3io-frames": ["v3io-frames~=0.13.11"],
     }
 
     api_deps = list(
@@ -86,9 +83,12 @@ def extra_requirements() -> dict[str, list[str]]:
     )
     extras_require.update(
         {
-            "kfp18": ["mlrun_pipelines_kfp_v1_8[kfp]>=0.3.2; python_version < '3.11'"],
+            "dev-postgres": ["pytest-mock-resources[postgres]~=2.12"],
+            "kfp18": ["mlrun_pipelines_kfp_v1_8[kfp]~=0.7.0"],
+            "mlflow": ["mlflow~=3.0"],
+            "ig4": ["iguazio~=0.0.1"],
             # TODO uncomment when KFP 1.8 support is removed
-            # "kfp2": ["mlrun_pipelines_kfp_v2[kfp]>=0.3.2 ; python_version >= '3.11'"],
+            # "kfp2": ["mlrun_pipelines_kfp_v2[kfp]>=0.5.0 ; python_version >= '3.11'"],
             "api": api_deps,
             "all": _get_extra_dependencies(extras_require=extras_require),
             "complete": _get_extra_dependencies(
@@ -116,9 +116,7 @@ def _extract_package_from_egg(line: str) -> str:
     return line
 
 
-def _load_dependencies_from_file(
-    path: str, parent_dir: Optional[str] = None
-) -> list[str]:
+def _load_dependencies_from_file(path: str, parent_dir: str | None = None) -> list[str]:
     """Load dependencies from requirements file"""
     parent_dir = parent_dir or os.path.dirname(__file__)
     with open(f"{parent_dir}/{path}") as fp:
@@ -130,10 +128,10 @@ def _load_dependencies_from_file(
 
 
 def _get_extra_dependencies(
-    include: Optional[list[str]] = None,
-    exclude: Optional[list[str]] = None,
-    base_deps: Optional[list[str]] = None,
-    extras_require: Optional[dict[str, list[str]]] = None,
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
+    base_deps: list[str] | None = None,
+    extras_require: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Get list of dependencies for given extras categories
 

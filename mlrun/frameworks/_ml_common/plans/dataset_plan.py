@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from enum import Enum
-from typing import Optional, Union
+from typing import Union
 
 import mlrun.errors
 from mlrun.artifacts import Artifact, DatasetArtifact
@@ -49,8 +49,8 @@ class DatasetPlan(MLPlan):
     def __init__(
         self,
         purpose: Union[Purposes, str] = Purposes.OTHER,
-        name: Optional[str] = None,
-        preview: Optional[int] = None,
+        name: str | None = None,
+        preview: int | None = None,
         stats: bool = False,
         fmt: str = "parquet",
     ):

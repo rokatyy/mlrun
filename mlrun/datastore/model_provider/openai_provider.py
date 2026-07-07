@@ -1,0 +1,618 @@
+# Copyright 2025 Iguazio
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import asyncio
+import concurrent.futures
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Union
+
+import mlrun
+from mlrun.datastore.model_provider.model_provider import (
+    InvokeResponseFormat,
+    ModelProvider,
+    UsageResponseKeys,
+)
+from mlrun.datastore.utils import accepts_param
+
+if TYPE_CHECKING:
+    from openai._models import BaseModel  # noqa
+    from openai.types.chat.chat_completion import ChatCompletion
+
+# Type aliases for response types
+InvokeResponse = Union["ChatCompletion", str, dict[str, Any]]
+
+
+class OpenAIProvider(ModelProvider):
+    """
+    OpenAIProvider is a wrapper around the OpenAI SDK that provides an interface
+    for interacting with OpenAI's generative AI services.
+
+    It supports both synchronous and asynchronous operations, allowing flexible
+    integration into various workflows.
+
+    This class extends the ModelProvider base class and implements OpenAI-specific
+    functionality, including client initialization, model invocation, and custom
+    operations tailored to the OpenAI API.
+    """
+
+    support_async = True
+    supports_streaming = True
+
+    def __init__(
+        self,
+        parent,
+        schema,
+        name,
+        endpoint="",
+        secrets: dict | None = None,
+        default_invoke_kwargs: dict | None = None,
+    ):
+        endpoint = endpoint or mlrun.mlconf.model_providers.openai_default_model
+        if schema != "openai":
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "OpenAIProvider supports only 'openai' as the provider kind."
+            )
+        super().__init__(
+            parent=parent,
+            kind=schema,
+            name=name,
+            endpoint=endpoint,
+            secrets=secrets,
+            default_invoke_kwargs=default_invoke_kwargs,
+        )
+        self.options = self.get_client_options()
+
+        # Async concurrency limit per batch
+        self._max_concurrent_per_batch = int(
+            self._get_secret_or_env("OPENAI_BATCH_MAX_CONCURRENT")
+            or mlrun.mlconf.model_providers.openai_batch_max_concurrent
+        )
+
+    @staticmethod
+    def _extract_string_output(response: "ChatCompletion") -> str:
+        """
+        Extracts the text content of the first choice from an OpenAI ChatCompletion response.
+        Only supports responses with a single choice. Raises an error if multiple choices exist.
+
+        :param response: The ChatCompletion response from OpenAI.
+        :return: The text content of the first message in the response.
+        :raises MLRunInvalidArgumentError: If the response contains more than one choice.
+        """
+        if len(response.choices) != 1:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "OpenAIProvider: extracting string from response is only supported for single-response outputs"
+            )
+        return response.choices[0].message.content
+
+    @classmethod
+    def parse_endpoint_and_path(cls, endpoint, subpath) -> tuple[str, str]:
+        if endpoint and subpath:
+            endpoint = endpoint + subpath
+            #  in openai there is no usage of subpath variable. if the model contains "/", it is part of the model name.
+            subpath = ""
+        return endpoint, subpath
+
+    @property
+    def client(self) -> Any:
+        """
+        Lazily return the synchronous OpenAI client.
+
+        If the client has not been initialized yet, it will be created
+        by calling `load_client`.
+        """
+        self.load_client()
+        return self._client
+
+    def load_client(self) -> None:
+        """
+        Lazily initialize the synchronous OpenAI client.
+
+        The client is created only if it does not already exist.
+        Raises ImportError if the openai package is not installed.
+        """
+        if self._client:
+            return
+        try:
+            from openai import OpenAI  # noqa
+
+            self._client = OpenAI(**self.options)
+        except ImportError as exc:
+            raise ImportError("openai package is not installed") from exc
+
+    def load_async_client(self) -> None:
+        """
+        Lazily initialize the asynchronous OpenAI client.
+
+        The client is created only if it does not already exist.
+        Raises ImportError if the openai package is not installed.
+        """
+        if not self._async_client:
+            try:
+                from openai import AsyncOpenAI  # noqa
+
+                self._async_client = AsyncOpenAI(**self.options)
+            except ImportError as exc:
+                raise ImportError("openai package is not installed") from exc
+
+    @property
+    def async_client(self) -> Any:
+        """
+        Return the asynchronous OpenAI client, creating it on first access.
+
+        The client is lazily initialized via `load_async_client`.
+        """
+        self.load_async_client()
+        return self._async_client
+
+    def get_client_options(self) -> dict:
+        res = dict(
+            api_key=self._get_secret_or_env("OPENAI_API_KEY"),
+            organization=self._get_secret_or_env("OPENAI_ORG_ID"),
+            project=self._get_secret_or_env("OPENAI_PROJECT_ID"),
+            base_url=self._get_secret_or_env("OPENAI_BASE_URL"),
+            timeout=self._get_secret_or_env("OPENAI_TIMEOUT"),
+            max_retries=self._get_secret_or_env("OPENAI_MAX_RETRIES"),
+        )
+        return self._sanitize_options(res)
+
+    def custom_invoke(
+        self, operation: Callable | None = None, **invoke_kwargs
+    ) -> Union["ChatCompletion", "BaseModel"]:
+        """
+        Invokes a model operation from the OpenAI client with the given keyword arguments.
+
+        This method provides flexibility to either:
+        - Call a specific OpenAI client operation (e.g., `client.images.generate`).
+        - Default to `chat.completions.create` when no operation is provided.
+
+        The operation must be a callable that accepts keyword arguments. If the callable
+        does not accept a `model` parameter, it will be omitted from the call.
+
+        Example:
+            ```python
+            result = openai_model_provider.custom_invoke(
+                openai_model_provider.client.images.generate,
+                prompt="A futuristic cityscape at sunset",
+                n=1,
+                size="1024x1024",
+            )
+            ```
+
+        :param operation:       A callable representing the OpenAI operation to invoke.
+                                If not provided, defaults to `client.chat.completions.create`.
+
+        :param invoke_kwargs:   Additional keyword arguments to pass to the operation.
+                                These are merged with `default_invoke_kwargs` and may
+                                include parameters such as `temperature`, `max_tokens`,
+                                or `messages`.
+
+        :return:                The full response returned by the operation, typically
+                                an OpenAI `ChatCompletion` or other OpenAI SDK model.
+        """
+
+        invoke_kwargs = self.get_invoke_kwargs(invoke_kwargs)
+        model_kwargs = {"model": invoke_kwargs.pop("model", None) or self.model}
+
+        if operation:
+            if not callable(operation):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "OpenAI custom_invoke operation must be a callable"
+                )
+            if not accepts_param(operation, "model"):
+                model_kwargs = {}
+            return operation(**invoke_kwargs, **model_kwargs)
+        else:
+            return self.client.chat.completions.create(**invoke_kwargs, **model_kwargs)
+
+    async def async_custom_invoke(
+        self,
+        operation: Callable[..., Awaitable[Any]] | None = None,
+        **invoke_kwargs,
+    ) -> Union["ChatCompletion", "BaseModel"]:
+        """
+        Asynchronously invokes a model operation from the OpenAI client with the given keyword arguments.
+
+        This method provides flexibility to either:
+        - Call a specific async OpenAI client operation (e.g., `async_client.images.generate`).
+        - Default to `chat.completions.create` when no operation is provided.
+
+        The operation must be an async callable that accepts keyword arguments.
+        If the callable does not accept a `model` parameter, it will be omitted from the call.
+
+        Example:
+            ```python
+            result = await openai_model_provider.async_custom_invoke(
+                openai_model_provider.async_client.images.generate,
+                prompt="A futuristic cityscape at sunset",
+                n=1,
+                size="1024x1024",
+            )
+            ```
+
+        :param operation:       An async callable representing the OpenAI operation to invoke.
+                                If not provided, defaults to `async_client.chat.completions.create`.
+
+        :param invoke_kwargs:   Additional keyword arguments to pass to the operation.
+                                These are merged with `default_invoke_kwargs` and may
+                                include parameters such as `temperature`, `max_tokens`,
+                                or `messages`.
+
+        :return:                The full response returned by the awaited operation,
+                                typically an OpenAI `ChatCompletion` or other OpenAI SDK model.
+
+        """
+        invoke_kwargs = self.get_invoke_kwargs(invoke_kwargs)
+        model_kwargs = {"model": invoke_kwargs.pop("model", None) or self.model}
+        if operation:
+            if not inspect.iscoroutinefunction(operation):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "OpenAI async_custom_invoke operation must be a coroutine function"
+                )
+            if not accepts_param(operation, "model"):
+                model_kwargs = {}
+            return await operation(**invoke_kwargs, **model_kwargs)
+        else:
+            return await self.async_client.chat.completions.create(
+                **invoke_kwargs, **model_kwargs
+            )
+
+    def _response_handler(
+        self,
+        response: "ChatCompletion",
+        invoke_response_format: InvokeResponseFormat = InvokeResponseFormat.FULL,
+        **kwargs,
+    ) -> InvokeResponse:
+        if InvokeResponseFormat.is_str_response(invoke_response_format.value):
+            str_response = self._extract_string_output(response)
+            if invoke_response_format == InvokeResponseFormat.STRING:
+                return str_response
+            if invoke_response_format == InvokeResponseFormat.USAGE:
+                usage = response.to_dict()["usage"]
+                response = {
+                    UsageResponseKeys.ANSWER: str_response,
+                    UsageResponseKeys.USAGE: usage,
+                }
+        return response
+
+    async def _async_batch_invoke(
+        self,
+        messages_list: list[list[dict]],
+        invoke_response_format: InvokeResponseFormat = InvokeResponseFormat.FULL,
+        **invoke_kwargs,
+    ) -> list[InvokeResponse]:
+        """
+        Invoke multiple message sets in parallel using asyncio.
+
+        Note on concurrency limits:
+            Uses per-batch concurrency control configured during initialization.
+            Limits the maximum number of concurrent tasks per batch invocation.
+
+        :param messages_list:
+            A list of message lists, each to be invoked separately.
+            Each inner list should contain message dictionaries in the format::
+                {
+                    "role": "system" | "user" | "assistant",
+                    "content": "Message content as a string",
+                }
+
+        :param invoke_response_format:
+            Specifies the format of the returned response for all invocations.
+
+        :param invoke_kwargs:
+            Additional keyword arguments passed to each invoke call.
+
+        :return:
+            List of responses in the same order as messages_list.
+            Each response format depends on `invoke_response_format`.
+        """
+        batch_semaphore = asyncio.Semaphore(self._max_concurrent_per_batch)
+
+        async def _bounded_invoke(messages):
+            """Execute invoke with per-batch semaphore control."""
+            async with batch_semaphore:
+                return await self._async_single_invoke(
+                    messages, invoke_response_format, **invoke_kwargs
+                )
+
+        tasks = [
+            asyncio.create_task(_bounded_invoke(messages)) for messages in messages_list
+        ]
+
+        try:
+            # gather() stops on first exception - fast fail
+            return await asyncio.gather(*tasks)
+        except:
+            # Cancel all remaining tasks
+            for task in tasks:
+                task.cancel()
+
+            # Wait for all tasks to acknowledge cancellation
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            raise
+
+    def _single_invoke(
+        self,
+        messages: list[dict],
+        invoke_response_format: InvokeResponseFormat = InvokeResponseFormat.FULL,
+        **invoke_kwargs,
+    ) -> InvokeResponse:
+        """
+        Internal method for single invocation.
+        Used by both invoke and _batch_invoke.
+        """
+        response = self.custom_invoke(messages=messages, **invoke_kwargs)
+        return self._response_handler(
+            messages=messages,
+            invoke_response_format=invoke_response_format,
+            response=response,
+        )
+
+    async def _async_single_invoke(
+        self,
+        messages: list[dict],
+        invoke_response_format: InvokeResponseFormat = InvokeResponseFormat.FULL,
+        **invoke_kwargs,
+    ) -> InvokeResponse:
+        """
+        Internal async method for single invocation.
+        Used by both async_invoke and _async_batch_invoke.
+        """
+        response = await self.async_custom_invoke(messages=messages, **invoke_kwargs)
+        return self._response_handler(
+            messages=messages,
+            invoke_response_format=invoke_response_format,
+            response=response,
+        )
+
+    def invoke(
+        self,
+        messages: Union[list[dict], list[list[dict]]],
+        invoke_response_format: InvokeResponseFormat = InvokeResponseFormat.FULL,
+        **invoke_kwargs,
+    ) -> Union[InvokeResponse, list[InvokeResponse]]:
+        """
+        OpenAI-specific implementation of `ModelProvider.invoke`.
+        Invokes an OpenAI model operation using the synchronous client.
+
+        Supports both single and batch invocations:
+        - If messages is a list of dicts, performs a single invocation.
+        - If messages is a list of lists, performs batch invocation using asyncio.run().
+
+        :param messages:
+            Single invocation: A list of dictionaries representing the conversation history.
+            Batch invocation: A list of message lists for parallel processing.
+
+            Each dictionary should follow the format::
+                {
+                    "role": "system" | "user" | "assistant",
+                    "content": "Message content as a string",
+                }
+
+            Example (single):
+
+            .. code-block:: json
+
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "What is the capital of France?"}
+                ]
+
+            Example (batch):
+
+            .. code-block:: json
+
+                [
+                    [{"role": "user", "content": "What is the capital of France?"}],
+                    [{"role": "user", "content": "What is the capital of Spain?"}]
+                ]
+
+        :param invoke_response_format:
+            Specifies the format of the returned response. Options:
+
+            - "string": Returns only the generated text content, taken from a single response.
+            - "usage": Combines the generated text with metadata (e.g., token usage), returning a dictionary::
+
+                .. code-block:: json
+                   {
+                       "answer": "<generated_text>",
+                       "usage": <ChatCompletion>.to_dict()["usage"]
+                   }
+
+            - "full": Returns the full OpenAI `ChatCompletion` object.
+
+        :param invoke_kwargs:
+            Additional keyword arguments passed to the OpenAI client.
+
+        :return:
+            Single invocation: A string, dictionary, or `ChatCompletion` object.
+            Batch invocation: A list of responses in the same order as input messages.
+            Response format depends on `invoke_response_format`.
+
+        :raises:
+            In batch invocation: Any exception from a single item fails the entire batch.
+        """
+        # Detect if this is a batch invocation
+        is_batch = self._validate_and_detect_batch_invocation(messages)
+
+        if is_batch:
+            # Prepare the async batch coroutine
+            batch_coro = self._async_batch_invoke(
+                messages_list=messages,
+                invoke_response_format=invoke_response_format,
+                **invoke_kwargs,
+            )
+
+            try:
+                asyncio.get_running_loop()
+                in_event_loop = True
+            except RuntimeError:
+                in_event_loop = False
+
+            if in_event_loop:
+                # We're in an event loop - run asyncio.run() in a separate thread
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(asyncio.run, batch_coro)
+                    return future.result()
+            else:
+                # No running loop, use asyncio.run() directly
+                return asyncio.run(batch_coro)
+
+        # Single invocation
+        return self._single_invoke(
+            messages=messages,
+            invoke_response_format=invoke_response_format,
+            **invoke_kwargs,
+        )
+
+    async def async_invoke(
+        self,
+        messages: Union[list[dict], list[list[dict]]],
+        invoke_response_format=InvokeResponseFormat.FULL,
+        **invoke_kwargs,
+    ) -> Union[InvokeResponse, list[InvokeResponse]]:
+        """
+        OpenAI-specific implementation of `ModelProvider.async_invoke`.
+        Invokes an OpenAI model operation using the asynchronous client.
+
+        Supports both single and batch invocations:
+        - If messages is a list of dicts, performs a single invocation.
+        - If messages is a list of lists, performs batch invocation using asyncio.
+
+        :param messages:
+            Single invocation: A list of dictionaries representing the conversation history.
+            Batch invocation: A list of message lists for parallel processing.
+
+            Each dictionary should follow the format::
+                {
+                    "role": "system" | "user" | "assistant",
+                    "content": "Message content as a string",
+                }
+
+            Example (single):
+
+            .. code-block:: json
+
+                [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "What is the capital of France?"}
+                ]
+
+            Example (batch):
+
+            .. code-block:: json
+
+                [
+                    [{"role": "user", "content": "What is the capital of France?"}],
+                    [{"role": "user", "content": "What is the capital of Spain?"}]
+                ]
+
+        :param invoke_response_format:
+            Specifies the format of the returned response. Options:
+
+            - "string": Returns only the generated text content, taken from a single response.
+            - "usage": Combines the generated text with metadata (e.g., token usage), returning a dictionary::
+
+                .. code-block:: json
+                   {
+                       "answer": "<generated_text>",
+                       "usage": <ChatCompletion>.to_dict()["usage"]
+                   }
+
+            - "full": Returns the full OpenAI `ChatCompletion` object.
+
+        :param invoke_kwargs:
+            Additional keyword arguments passed to the OpenAI client.
+
+        :return:
+            Single invocation: A string, dictionary, or `ChatCompletion` object.
+            Batch invocation: A list of responses in the same order as input messages.
+            Response format depends on `invoke_response_format`.
+
+        :raises:
+            In batch invocation: Any exception from a single item fails the entire batch.
+        """
+        # Detect if this is a batch invocation
+        is_batch = self._validate_and_detect_batch_invocation(messages)
+
+        if is_batch:
+            return await self._async_batch_invoke(
+                messages_list=messages,
+                invoke_response_format=invoke_response_format,
+                **invoke_kwargs,
+            )
+
+        # Single invocation
+        return await self._async_single_invoke(
+            messages=messages,
+            invoke_response_format=invoke_response_format,
+            **invoke_kwargs,
+        )
+
+    def _prepare_stream_kwargs(self, messages: list[dict], invoke_kwargs: dict) -> dict:
+        """Validate messages and build the kwargs dict for a streaming create() call."""
+        if self._validate_and_detect_batch_invocation(messages):
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "Batch invocation is not supported in streaming mode"
+            )
+        invoke_kwargs = self.get_invoke_kwargs(invoke_kwargs)
+        model = invoke_kwargs.pop("model", None) or self.model
+        return {"messages": messages, "stream": True, "model": model, **invoke_kwargs}
+
+    @staticmethod
+    def _extract_stream_token(chunk) -> str | None:
+        """Extract the text token from a streaming chunk, or None if empty."""
+        if chunk.choices and chunk.choices[0].delta.content:
+            return chunk.choices[0].delta.content
+        return None
+
+    def invoke_stream(
+        self,
+        messages: list[dict],
+        **invoke_kwargs,
+    ):
+        """
+        Invokes the OpenAI chat completions API in streaming mode, yielding text tokens
+        as they are generated.
+
+        :param messages:        A list of message dicts (single conversation, not a batch).
+        :param invoke_kwargs:   Additional keyword arguments passed to the OpenAI client.
+        :return:                A generator yielding text tokens as strings.
+        """
+        create_kwargs = self._prepare_stream_kwargs(messages, invoke_kwargs)
+        stream = self.client.chat.completions.create(**create_kwargs)
+        for chunk in stream:
+            token = self._extract_stream_token(chunk)
+            if token:
+                yield token
+
+    async def async_invoke_stream(
+        self,
+        messages: list[dict],
+        **invoke_kwargs,
+    ):
+        """
+        Asynchronously invokes the OpenAI chat completions API in streaming mode,
+        yielding text tokens as they are generated.
+
+        :param messages:        A list of message dicts (single conversation, not a batch).
+        :param invoke_kwargs:   Additional keyword arguments passed to the OpenAI client.
+        :return:                An async generator yielding text tokens as strings.
+        """
+        create_kwargs = self._prepare_stream_kwargs(messages, invoke_kwargs)
+        stream = await self.async_client.chat.completions.create(**create_kwargs)
+        async for chunk in stream:
+            token = self._extract_stream_token(chunk)
+            if token:
+                yield token

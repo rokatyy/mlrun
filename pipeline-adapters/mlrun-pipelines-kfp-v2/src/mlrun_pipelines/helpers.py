@@ -11,15 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import typing
 
 
 def new_pipe_metadata(
-    artifact_path: typing.Optional[str] = None,
-    cleanup_ttl: typing.Optional[int] = None,
-    op_transformers: typing.Optional[list[typing.Callable]] = None,
+    artifact_path: str | None = None,
+    cleanup_ttl: int | None = None,
+    op_transformers: list[typing.Callable] | None = None,
 ):
     # This function is not required on a KFP 2.0 setup
     # The definition is here for import compatibility reasons

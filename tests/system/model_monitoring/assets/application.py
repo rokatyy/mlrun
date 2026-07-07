@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import mlrun.common.model_monitoring.helpers
 import mlrun.model_monitoring.applications.context as mm_context
 import mlrun.model_monitoring.applications.results as mm_results
@@ -37,9 +36,9 @@ class DemoMonitoringApp(ModelMonitoringApplicationBase):
     # noinspection PyMethodOverriding
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__()
-        assert (list(kwargs.keys())) == [
-            "check_num_events"
-        ], f"kwargs fields = {list(kwargs.keys())}"  # ml-6071
+        assert (list(kwargs.keys())) == ["check_num_events"], (
+            f"kwargs fields = {list(kwargs.keys())}"
+        )  # ml-6071
         cls.check_num_events = kwargs["check_num_events"]
 
     def do_tracking(

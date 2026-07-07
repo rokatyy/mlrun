@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
 import collections
 import datetime
-import typing
+import time
+import uuid
 
 import fastapi.concurrency
 import humanfriendly
@@ -25,30 +26,51 @@ import mlrun.common.constants as mlrun_constants
 import mlrun.common.formatters
 import mlrun.common.schemas
 import mlrun.errors
+import mlrun.runtimes.constants
 import mlrun.utils.singleton
+import mlrun_pipelines.client
 from mlrun.utils import logger, retry_until_successful
 
 import framework.db.session
 import framework.utils.auth.verifier
-import framework.utils.background_tasks
+import framework.utils.clients.messaging
 import framework.utils.clients.nuclio
+import framework.utils.clients.service_account_token as service_account_token
 import framework.utils.projects.remotes.follower as project_follower
 import framework.utils.singletons.db
 import services.alerts.crud
 import services.api.crud
 import services.api.crud.model_monitoring
-import services.api.crud.runtimes.nuclio
 import services.api.utils.events.events_factory as events_factory
 import services.api.utils.singletons.scheduler
+import services.api.utils.telemetry.inventory as telemetry_inventory
 from framework.utils.singletons.k8s import get_k8s_helper
+
+# Persistable function kinds, zero-filled per project in ``mlrun_functions``.
+_FUNCTION_INVENTORY_KINDS = mlrun.runtimes.constants.RuntimeKinds.all()
 
 
 class Projects(
     project_follower.Member,
     metaclass=mlrun.utils.singleton.AbstractSingleton,
 ):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._service_account_token_client = service_account_token.Client()
+        # Inventory telemetry — cached at construction so live edits to
+        # mlconf.telemetry.* require a chief restart, matching the OTel
+        # exporter's interval (locked in at SDK init).
+        self._inventory_telemetry_enabled: bool = telemetry_inventory.is_enabled()
+        self._inventory_refresh_count: int = 0
+        self._inventory_emit_multiplier: int = max(
+            1, int(mlrun.mlconf.telemetry.system_counters.export_interval_multiplier)
+        )
+
     def create_project(
-        self, session: sqlalchemy.orm.Session, project: mlrun.common.schemas.Project
+        self,
+        session: sqlalchemy.orm.Session,
+        project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         logger.debug(
             "Creating project",
@@ -61,13 +83,30 @@ class Projects(
             artifact_amount=len(project.spec.artifacts or []),
             workflows_amount=len(project.spec.workflows or []),
         )
-        framework.utils.singletons.db.get_db().create_project(session, project)
+        try:
+            framework.utils.singletons.db.get_db().create_project(
+                session, project, auth_info
+            )
+        except Exception as exc:
+            self._emit_project_lifecycle_event(
+                action=mlrun.common.schemas.ProjectLifecycleEventActions.creation_failed,
+                project_name=project.metadata.name,
+                actor=auth_info.username,
+                error=exc,
+            )
+            raise
+        self._emit_project_lifecycle_event(
+            action=mlrun.common.schemas.ProjectLifecycleEventActions.creation_succeeded,
+            project_name=project.metadata.name,
+            actor=auth_info.username,
+        )
 
     def store_project(
         self,
         session: sqlalchemy.orm.Session,
         name: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         logger.debug(
             "Storing project",
@@ -80,7 +119,9 @@ class Projects(
             artifact_amount=len(project.spec.artifacts or []),
             workflows_amount=len(project.spec.workflows or []),
         )
-        framework.utils.singletons.db.get_db().store_project(session, name, project)
+        framework.utils.singletons.db.get_db().store_project(
+            session, name, project, auth_info
+        )
 
     def patch_project(
         self,
@@ -88,6 +129,7 @@ class Projects(
         name: str,
         project: dict,
         patch_mode: mlrun.common.schemas.PatchMode = mlrun.common.schemas.PatchMode.replace,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         logger.debug(
             "Patching project", name=name, project=project, patch_mode=patch_mode
@@ -102,8 +144,8 @@ class Projects(
         name: str,
         deletion_strategy: mlrun.common.schemas.DeletionStrategy = mlrun.common.schemas.DeletionStrategy.default(),
         auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
-        background_task_name: typing.Optional[str] = None,
-        model_monitoring_access_key: typing.Optional[str] = None,
+        background_task_name: str | None = None,
+        model_monitoring_access_key: str | None = None,
     ):
         logger.debug("Deleting project", name=name, deletion_strategy=deletion_strategy)
         self._enrich_project_with_deletion_background_task_name(
@@ -135,8 +177,22 @@ class Projects(
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"Unknown deletion strategy: {deletion_strategy}"
             )
-        framework.utils.singletons.db.get_db().delete_project(
-            session, name, deletion_strategy
+        try:
+            framework.utils.singletons.db.get_db().delete_project(
+                session, name, deletion_strategy
+            )
+        except Exception as exc:
+            self._emit_project_lifecycle_event(
+                action=mlrun.common.schemas.ProjectLifecycleEventActions.deletion_failed,
+                project_name=name,
+                actor=auth_info.username,
+                error=exc,
+            )
+            raise
+        self._emit_project_lifecycle_event(
+            action=mlrun.common.schemas.ProjectLifecycleEventActions.deletion_succeeded,
+            project_name=name,
+            actor=auth_info.username,
         )
 
     def verify_project_is_empty(
@@ -155,7 +211,7 @@ class Projects(
         session: sqlalchemy.orm.Session,
         name: str,
         auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
-        model_monitoring_access_key: typing.Optional[str] = None,
+        model_monitoring_access_key: str | None = None,
     ):
         logger.debug(
             "Deleting project resources",
@@ -203,14 +259,30 @@ class Projects(
             project_name=name,
         )
 
-        # TODO: Forward to alerts service
-        # The messaging client is async, and project deletion is sync.
-        # When deleting a project, we need to use a sync client to send the delete event request to the alerts service,
-        # or to Chief if in Hydra mode. (ML-8390)
-        # Until we implement the sync client, we can allow Chief to delete the project alerts itself, instead of
-        # actually forwarding the request and waiting for a response, since the project deletion flow is handled
-        # by Chief only.
-        services.alerts.crud.Events().delete_project_alert_events(name)
+        # TODO: This should be refactored once we have a proper hydra implementation
+        # Delete alert's service resources
+        # When running in Hydra, alerts is part of the current running service, so we can delete the resources directly
+        # Otherwise, we need to send a message to the alerts service to delete the resources
+        if mlrun.mlconf.services.hydra.services == "*":
+            services.alerts.crud.Alerts().delete_alerts(session=session, project=name)
+        else:
+            messaging_client = framework.utils.clients.messaging.Client()
+            request_headers = auth_info.request_headers
+
+            if mlrun.mlconf.is_iguazio_v4_mode():
+                # In IG4 as the project has already been deleted, it will no longer exist in the permission manifest at
+                # all, so we must escalate the request to have permissions to delete all project resources
+                request_headers = (
+                    self._service_account_token_client.escalate_request_headers(
+                        auth_info.request_headers
+                    )
+                )
+
+            messaging_client.delete(
+                path=f"projects/{name}/alerts",
+                headers=request_headers,
+                raise_on_failure=True,
+            )
 
         # Initialize the MM deleter with data from the DB, before the relevant DB data is deleted
         model_monitoring_deleter = (
@@ -251,21 +323,26 @@ class Projects(
             self._delete_project_configmaps(name)
 
     def get_project(
-        self, session: sqlalchemy.orm.Session, name: str
+        self,
+        session: sqlalchemy.orm.Session,
+        name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.ProjectOut:
         return framework.utils.singletons.db.get_db().get_project(session, name)
 
     def list_projects(
         self,
         session: sqlalchemy.orm.Session,
-        owner: typing.Optional[str] = None,
-        format_: mlrun.common.formatters.ProjectFormat = mlrun.common.formatters.ProjectFormat.full,
-        labels: typing.Optional[list[str]] = None,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        owner: str | None = None,
+        format_: framework.utils.project_formats.ProjectFormatType = mlrun.common.formatters.ProjectFormat.full,
+        labels: list[str] | None = None,
         state: mlrun.common.schemas.ProjectState = None,
-        names: typing.Optional[list[str]] = None,
+        names: list[str] | None = None,
+        updated_after: datetime.datetime | None = None,
     ) -> mlrun.common.schemas.ProjectsOutput:
         return framework.utils.singletons.db.get_db().list_projects(
-            session, owner, format_, labels, state, names
+            session, owner, format_, labels, state, names, updated_after
         )
 
     async def list_allowed_project_names(
@@ -273,10 +350,9 @@ class Projects(
         session: sqlalchemy.orm.Session,
         auth_info: mlrun.common.schemas.AuthInfo,
         action: mlrun.common.schemas.AuthorizationAction = mlrun.common.schemas.AuthorizationAction.read,
-        project: typing.Optional[str] = None,
+        project: str | None = None,
         **project_filters,
     ) -> list[str]:
-        project = project or mlrun.mlconf.default_project
         if project != "*":
             await (
                 framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
@@ -289,6 +365,7 @@ class Projects(
 
         projects_output = self.list_projects(
             session,
+            auth_info,
             format_=mlrun.common.formatters.ProjectFormat.name_only,
             **project_filters,
         )
@@ -303,10 +380,9 @@ class Projects(
         session: sqlalchemy.orm.Session,
         auth_info: mlrun.common.schemas.AuthInfo,
         action: mlrun.common.schemas.AuthorizationAction = mlrun.common.schemas.AuthorizationAction.read,
-        project: typing.Optional[str] = None,
+        project: str | None = None,
         **project_filters,
     ) -> list[tuple[str, datetime.datetime]]:
-        project = project or mlrun.mlconf.default_project
         if project != "*":
             await (
                 framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
@@ -347,10 +423,11 @@ class Projects(
     async def list_project_summaries(
         self,
         session: sqlalchemy.orm.Session,
-        owner: typing.Optional[str] = None,
-        labels: typing.Optional[list[str]] = None,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        owner: str | None = None,
+        labels: list[str] | None = None,
         state: mlrun.common.schemas.ProjectState = None,
-        names: typing.Optional[list[str]] = None,
+        names: list[str] | None = None,
     ) -> mlrun.common.schemas.ProjectSummariesOutput:
         project_summaries = await fastapi.concurrency.run_in_threadpool(
             framework.utils.singletons.db.get_db().list_project_summaries,
@@ -366,7 +443,10 @@ class Projects(
         )
 
     async def get_project_summary(
-        self, session: sqlalchemy.orm.Session, name: str
+        self,
+        session: sqlalchemy.orm.Session,
+        name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.ProjectSummary:
         # Call get project so we'll explode if project doesn't exists
         await fastapi.concurrency.run_in_threadpool(self.get_project, session, name)
@@ -375,6 +455,33 @@ class Projects(
             session,
             project=name,
         )
+
+    def _emit_project_lifecycle_event(
+        self,
+        action: mlrun.common.schemas.ProjectLifecycleEventActions,
+        project_name: str,
+        actor: str | None,
+        error: BaseException | str | None = None,
+    ) -> None:
+        """Best-effort emit of a project lifecycle event; never raises."""
+        try:
+            client = events_factory.EventsFactory.get_events_client()
+            event = client.generate_project_lifecycle_event(
+                action=action,
+                project_name=project_name,
+                actor=actor,
+                error=error,
+            )
+            if event is None:
+                return
+            client.emit(event)
+        except Exception as publish_exc:
+            logger.warning(
+                "Failed to publish project lifecycle event",
+                action=action,
+                project=project_name,
+                exc=mlrun.errors.err_to_str(publish_exc),
+            )
 
     def _verify_project_has_no_external_resources(
         self,
@@ -415,17 +522,36 @@ class Projects(
     async def refresh_project_resources_counters_cache(
         self, session: sqlalchemy.orm.Session
     ):
+        # Threshold (seconds) above which a single counters computation is
+        # considered slow enough to warn — it both starves the summaries refresh
+        # and, once it stalls entirely, silently stops all `mlrun_*` inventory
+        # telemetry (emission is downstream of this await). Surfacing it here is
+        # the cheapest early warning before the query fully wedges.
+        slow_counters_warn_threshold_seconds = 60
+
         projects_output = await fastapi.concurrency.run_in_threadpool(
+            framework.db.session.run_function_with_new_db_session,
             self.list_projects,
-            session,
             format_=mlrun.common.formatters.ProjectFormat.name_and_creation_time,
         )
 
+        counters_start_time = time.monotonic()
         project_counters, pipeline_counters = await asyncio.gather(
             framework.utils.singletons.db.get_db().get_project_resources_counters(
                 projects_output.projects
             ),
             self._calculate_pipelines_counters(),
+        )
+        counters_elapsed_seconds = time.monotonic() - counters_start_time
+        log_counters = (
+            logger.warning
+            if counters_elapsed_seconds >= slow_counters_warn_threshold_seconds
+            else logger.debug
+        )
+        log_counters(
+            "Computed project resources counters",
+            projects=len(projects_output.projects),
+            elapsed_seconds=round(counters_elapsed_seconds, 2),
         )
         (
             project_to_files_count,
@@ -439,7 +565,18 @@ class Projects(
             project_to_running_runs_count,
             project_to_endpoint_alerts_count,
             project_to_job_alerts_count,
-            project_to_other_alerts_count,
+            project_to_application_alerts_count,
+            project_to_infra_alerts_count,
+            project_to_datasets_count,
+            project_to_documents_count,
+            project_to_llm_prompts_count,
+            project_to_running_mm_functions,
+            project_to_failed_mm_functions_count,
+            project_to_real_time_mep_count,
+            project_to_batch_mep_count,
+            _project_to_function_kind_counts,
+            _project_to_alert_config_count,
+            _project_to_workflow_count,
         ) = project_counters
         (
             project_to_recent_completed_pipelines_count,
@@ -491,34 +628,234 @@ class Projects(
                         project_name, 0
                     ),
                     job_alerts_count=project_to_job_alerts_count.get(project_name, 0),
-                    other_alerts_count=project_to_other_alerts_count.get(
+                    application_alerts_count=project_to_application_alerts_count.get(
+                        project_name, 0
+                    ),
+                    infra_alerts_count=project_to_infra_alerts_count.get(
+                        project_name, 0
+                    ),
+                    datasets_count=project_to_datasets_count.get(project_name, 0),
+                    documents_count=project_to_documents_count.get(project_name, 0),
+                    llm_prompts_count=project_to_llm_prompts_count.get(project_name, 0),
+                    running_model_monitoring_functions=project_to_running_mm_functions.get(
+                        project_name, 0
+                    ),
+                    failed_model_monitoring_functions=project_to_failed_mm_functions_count.get(
+                        project_name, 0
+                    ),
+                    real_time_model_endpoint_count=project_to_real_time_mep_count.get(
+                        project_name, 0
+                    ),
+                    batch_model_endpoint_count=project_to_batch_mep_count.get(
                         project_name, 0
                     ),
                 )
             )
         await fastapi.concurrency.run_in_threadpool(
+            framework.db.session.run_function_with_new_db_session,
             framework.utils.singletons.db.get_db().refresh_project_summaries,
-            session,
             project_summaries,
         )
+
+        if self._inventory_telemetry_enabled:
+            if self._inventory_refresh_count % self._inventory_emit_multiplier == 0:
+                self._emit_inventory_telemetry(
+                    projects_output, project_counters, pipeline_counters
+                )
+            self._inventory_refresh_count += 1
+
+    @staticmethod
+    def _emit_inventory_telemetry(
+        projects_output: mlrun.common.schemas.ProjectsOutput,
+        project_counters: tuple[dict[str, int], ...],
+        pipeline_counters: tuple[dict[str, int], ...],
+    ) -> None:
+        """Emit periodic-snapshot inventory gauges to OTel.
+
+        Mirrors the cache fields produced by
+        ``refresh_project_resources_counters_cache``. No-op when telemetry is
+        disabled at startup; individual emission failures are swallowed and
+        logged by ``telemetry_inventory.set_count``.
+        """
+        (
+            project_to_files_count,
+            project_to_schedule_count,
+            project_to_schedule_pending_jobs_count,
+            project_to_schedule_pending_workflows_count,
+            project_to_feature_set_count,
+            project_to_models_count,
+            project_to_recent_completed_runs_count,
+            project_to_recent_failed_runs_count,
+            project_to_running_runs_count,
+            project_to_endpoint_alerts_count,
+            project_to_job_alerts_count,
+            project_to_application_alerts_count,
+            project_to_infra_alerts_count,
+            project_to_datasets_count,
+            project_to_documents_count,
+            project_to_llm_prompts_count,
+            project_to_running_mm_functions,
+            project_to_failed_mm_functions_count,
+            project_to_real_time_mep_count,
+            project_to_batch_mep_count,
+            project_to_function_kind_counts,
+            project_to_alert_config_count,
+            project_to_workflow_count,
+        ) = project_counters
+        (
+            project_to_recent_completed_pipelines_count,
+            project_to_recent_failed_pipelines_count,
+            project_to_running_pipelines_count,
+        ) = pipeline_counters
+
+        telemetry_inventory.set_count("mlrun_projects", len(projects_output.projects))
+        for project_data in projects_output.projects:
+            project_name = project_data[0]
+
+            for kind, by_project in (
+                ("model", project_to_models_count),
+                ("dataset", project_to_datasets_count),
+                ("document", project_to_documents_count),
+                ("llm_prompt", project_to_llm_prompts_count),
+                ("other", project_to_files_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_artifacts",
+                    by_project.get(project_name, 0),
+                    project=project_name,
+                    kind=kind,
+                )
+
+            telemetry_inventory.set_count(
+                "mlrun_feature_sets",
+                project_to_feature_set_count.get(project_name, 0),
+                project=project_name,
+            )
+
+            # Zero-fill every known function kind so a project/kind with no
+            # functions reports 0 (and a kind that drops to zero resets to 0
+            # rather than going absent), matching the other per-kind inventory
+            # metrics. The DB only returns kinds the project actually has, so
+            # absent kinds fall back to 0.
+            fn_counts_by_kind = dict(
+                project_to_function_kind_counts.get(project_name, ())
+            )
+            for fn_kind in _FUNCTION_INVENTORY_KINDS:
+                telemetry_inventory.set_count(
+                    "mlrun_functions",
+                    fn_counts_by_kind.get(fn_kind, 0),
+                    project=project_name,
+                    kind=fn_kind,
+                )
+            telemetry_inventory.set_count(
+                "mlrun_schedules",
+                project_to_schedule_count.get(project_name, 0),
+                project=project_name,
+            )
+            # schedule-pending counters are defaultdict → index, do not .get()
+            for kind, by_project in (
+                ("job", project_to_schedule_pending_jobs_count),
+                ("workflow", project_to_schedule_pending_workflows_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_schedules_pending",
+                    by_project[project_name],
+                    project=project_name,
+                    kind=kind,
+                )
+
+            telemetry_inventory.set_count(
+                "mlrun_workflows",
+                project_to_workflow_count.get(project_name, 0),
+                project=project_name,
+            )
+
+            # Distinct from `mlrun_alert_activations` below, which counts
+            # recent activations rather than configured alerts.
+            telemetry_inventory.set_count(
+                "mlrun_alerts",
+                project_to_alert_config_count.get(project_name, 0),
+                project=project_name,
+            )
+
+            for state, by_project in (
+                ("completed", project_to_recent_completed_runs_count),
+                ("failed", project_to_recent_failed_runs_count),
+                ("running", project_to_running_runs_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_runs",
+                    by_project.get(project_name, 0),
+                    project=project_name,
+                    state=state,
+                )
+
+            # pipeline counters are defaultdict → index, do not .get()
+            for state, by_project in (
+                ("completed", project_to_recent_completed_pipelines_count),
+                ("failed", project_to_recent_failed_pipelines_count),
+                ("running", project_to_running_pipelines_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_pipeline_executions",
+                    by_project[project_name],
+                    project=project_name,
+                    state=state,
+                )
+
+            for kind, by_project in (
+                ("endpoint", project_to_endpoint_alerts_count),
+                ("job", project_to_job_alerts_count),
+                ("application", project_to_application_alerts_count),
+                ("infra", project_to_infra_alerts_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_alert_activations",
+                    by_project.get(project_name, 0),
+                    project=project_name,
+                    kind=kind,
+                )
+
+            for kind, by_project in (
+                ("real_time", project_to_real_time_mep_count),
+                ("batch", project_to_batch_mep_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_model_endpoints",
+                    by_project.get(project_name, 0),
+                    project=project_name,
+                    kind=kind,
+                )
+
+            for state, by_project in (
+                ("running", project_to_running_mm_functions),
+                ("failed", project_to_failed_mm_functions_count),
+            ):
+                telemetry_inventory.set_count(
+                    "mlrun_model_monitoring_functions",
+                    by_project.get(project_name, 0),
+                    project=project_name,
+                    state=state,
+                )
 
     @staticmethod
     def _list_pipelines(
         session,
         format_: mlrun.common.formatters.PipelineFormat = mlrun.common.formatters.PipelineFormat.metadata_only,
         page_token: str = "",
+        filter_: str = "",
     ):
         return services.api.crud.Pipelines().list_pipelines(
-            session, "*", format_=format_, page_token=page_token
+            session,
+            "*",
+            format_=format_,
+            page_token=page_token,
+            filter_json=filter_,
         )
 
     async def _calculate_pipelines_counters(
         self,
-    ) -> (
-        dict[str, typing.Union[int, None]],
-        dict[str, typing.Union[int, None]],
-        dict[str, typing.Union[int, None]],
-    ):
+    ) -> tuple[dict[str, int | None], dict[str, int | None], dict[str, int | None]]:
         # creating defaultdict instead of a regular dict, because it possible that not all projects have pipelines
         # and we want to return 0 for those projects, or None if we failed to get the information
         project_to_running_pipelines_count = collections.defaultdict(lambda: 0)
@@ -532,6 +869,15 @@ class Projects(
                 project_to_running_pipelines_count,
             )
 
+        # include pipelines created in the past x days.
+        start_date = mlrun.utils.validate_and_convert_date(
+            str(
+                datetime.datetime.now()
+                - datetime.timedelta(
+                    days=mlrun.mlconf.httpdb.projects.summaries.list_pipelines_time_period_in_days
+                )
+            )
+        )
         try:
             next_page_token = ""
             while True:
@@ -543,6 +889,9 @@ class Projects(
                     framework.db.session.run_function_with_new_db_session,
                     self._list_pipelines,
                     page_token=next_page_token,
+                    filter_=mlrun_pipelines.client.create_list_runs_filter(
+                        start_date=start_date
+                    ),
                 )
 
                 for pipeline in pipelines:
@@ -556,7 +905,7 @@ class Projects(
                             pipeline["finished_at"], "%Y-%m-%d %H:%M:%S%z"
                         )
                         if finished_at > datetime.datetime.now().astimezone(
-                            tz=datetime.timezone.utc
+                            tz=datetime.UTC
                         ) - datetime.timedelta(days=1):
                             if pipeline["status"] in mlrun.run.RunStatuses.succeeded:
                                 project_to_recent_completed_pipelines_count[
@@ -622,8 +971,8 @@ class Projects(
         for config_map in config_maps.items:
             k8s_helper.delete_configmap(config_map.metadata.name)
 
-    @staticmethod
     def _wait_for_nuclio_project_deletion(
+        self,
         project_name: str,
         session: sqlalchemy.orm.Session,
         auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
@@ -633,9 +982,23 @@ class Projects(
 
         nuclio_client = framework.utils.clients.nuclio.Client()
 
+        # The background task may outlive the user's token, so poll with the
+        # service account token instead (the deletion is already authorized).
+        nuclio_auth_info = auth_info
+        if mlrun.mlconf.is_iguazio_v4_mode():
+            nuclio_auth_info = auth_info.copy(
+                update={
+                    "request_headers": self._service_account_token_client.escalate_request_headers(
+                        auth_info.request_headers
+                    )
+                }
+            )
+
         def _check_nuclio_project_deletion():
             try:
-                nuclio_client.get_project(session, project_name, auth_info=auth_info)
+                nuclio_client.get_project(
+                    session, project_name, auth_info=nuclio_auth_info
+                )
             except mlrun.errors.MLRunNotFoundError:
                 logger.debug(
                     "Nuclio project deleted",
@@ -710,4 +1073,61 @@ class Projects(
 
         framework.utils.singletons.db.get_db().patch_project(
             session, name, project_patch
+        )
+
+    # ----- 2PC follower-interface stubs ------------------------------------
+    # mlrun is the 2PC leader, so these per-follower hooks (called by the
+    # orchestrator on every remote follower) must never run on mlrun itself.
+    # They are present only to satisfy the abstract follower interface and
+    # to fail loudly if the orchestrator ever fans out incorrectly.
+
+    def prepare_create_project(
+        self,
+        project: mlrun.common.schemas.Project,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError(
+            "MLRun is the leader of the 2PC project sync flow, not a follower; "
+            "this hook must not be invoked on the mlrun follower"
+        )
+
+    def commit_create_project(
+        self,
+        name: str,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError(
+            "MLRun is the leader of the 2PC project sync flow, not a follower; "
+            "this hook must not be invoked on the mlrun follower"
+        )
+
+    def prepare_delete_project(
+        self,
+        name: str,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError(
+            "MLRun is the leader of the 2PC project sync flow, not a follower; "
+            "this hook must not be invoked on the mlrun follower"
+        )
+
+    def commit_delete_project(
+        self,
+        name: str,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError(
+            "MLRun is the leader of the 2PC project sync flow, not a follower; "
+            "this hook must not be invoked on the mlrun follower"
+        )
+
+    def update_project_follower(
+        self,
+        name: str,
+        project: mlrun.common.schemas.Project,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError(
+            "MLRun is the leader of the 2PC project sync flow, not a follower; "
+            "this hook must not be invoked on the mlrun follower"
         )

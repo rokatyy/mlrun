@@ -1,6 +1,8 @@
 (run_project_functions)=
 # Run, build, and deploy functions
 
+The set of methods used to deploy and run project functions can be used interactively or inside a pipeline (for example, Kubeflow). When used inside a pipeline, each method is automatically mapped to the relevant pipeline engine command.
+
 **In this section**
 - [Overview](#overview)
 - [run_function](#run_function)
@@ -13,8 +15,7 @@
 <a id="overview"></a>
 ## Overview
 
-There is a set of methods used to deploy and run project functions. They can be used interactively or inside a pipeline (e.g. Kubeflow). 
-When used inside a pipeline, each method is automatically mapped to the relevant pipeline engine command.
+The methods are:
 
 * {py:meth}`~mlrun.projects.run_function` &mdash; Run a local or remote task as part of local or remote batch/scheduled task
 * {py:meth}`~mlrun.projects.build_function` &mdash; deploy an ML function, build a container with its dependencies for use in runs
@@ -31,7 +32,7 @@ The first parameter in all three methods is either the function name (in the pro
 specify functions that you imported/created or to modify a function spec. For example:
 
 ```python
-# import a serving function from the Function Hub and deploy a trained model over it
+# import a serving function from the MLRun Hub and deploy a trained model over it
 serving = import_function("hub://v2_model_server", new_name="serving")
 serving.spec.replicas = 2
 deploy = deploy_function(
@@ -49,6 +50,7 @@ run = project.run_function("train", inputs={"data": data_url})
 ```
 
 <a id="run"></a>
+(run_function)=
 ## run_function
 
 Use the {py:meth}`~mlrun.projects.run_function` method to run a local or remote batch/scheduled task.
@@ -58,9 +60,11 @@ parameters and the advanced options.
 
 Functions can host multiple methods (handlers). You can set the default handler per function. You need to specify which handler you intend to call in the run command. 
 You can pass `parameters` (arguments) or data `inputs` (such as datasets, feature-vectors, models, or files) to the functions through the `run_function` method.
- 
+
 The {py:meth}`~mlrun.projects.run_function` command returns an MLRun {py:class}`~mlrun.model.RunObject` object that you can use to track the job and its results. 
 If you pass the parameter `watch=True` (default), the command blocks until the job completes.
+
+You can also specify the retry configuration for the run by using the `retry` parameter. The retry status is shown in the <b>Retries</b> column in the <b>Jobs and Workflows > Monitor Jobs</b> table. To configure the retry behavior, see {py:meth}`~mlrun.projects.MlrunProject.run_function`.
 
 MLRun also supports iterative jobs that can run and track multiple child jobs (for hyperparameter tasks, AutoML, etc.). 
 See {ref}`hyper-params` for details and examples.
@@ -75,7 +79,7 @@ parameter in the {py:meth}`~mlrun.runtimes.BaseRuntime.run` method (for batch fu
 Usage examples:
 
 ```python
-# create a project with two functions (local and from Function Hub)
+# create a project with two functions (local and from the MLRun Hub)
 project = mlrun.new_project(project_name, "./proj")
 project.set_function("mycode.py", "prep", image="mlrun/mlrun")
 project.set_function("hub://auto_trainer", "train")
@@ -93,7 +97,6 @@ import mlrun
 
 project = mlrun.get_or_create_project("example-project")
 
-from mlrun import RunTemplate, new_task, mlconf
 from os import path
 
 artifact_path = path.join(mlconf.artifact_path, "{{run.uid}}")
@@ -165,7 +168,7 @@ mlrun.deploy_function(
         {
             "key": model_name,
             "model_path": train.outputs["model"],
-            "class_name": "mlrun.frameworks.sklearn.SklearnModelServer",
+            "class_name": "mlrun.frameworks.sklearn.SKLearnModelServer",
         }
     ],
 )
@@ -295,4 +298,8 @@ project.set_function(
     "sentiment.py", name="scores", kind="job", handler="handler", image=image_name
 )
 ```
-   
+
+To build a new image that is based on mlrun/mlrun and add packages to the build, use a build image that looks something like this:
+```
+project.build_image(image=".my-new-image", base_image="mlrun/mlrun", requirements=["tensorflow"])
+```

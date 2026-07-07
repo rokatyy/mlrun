@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 import dask.dataframe as dd
 import pandas as pd
 import pytest
+from v3io.dataplane.transport.httpclient import Transport
 
 import mlrun.datastore
 from mlrun.datastore.datastore_profile import (
@@ -30,6 +31,8 @@ from mlrun.datastore.datastore_profile import (
     register_temporary_client_datastore_profile,
 )
 from tests.system.base import TestMLRunSystem
+
+Transport.set_connection_timeout(300)
 
 
 @TestMLRunSystem.skip_test_if_env_not_configured
@@ -101,6 +104,7 @@ class TestV3ioDataStore(TestMLRunSystem):
 
     def teardown_method(self, method):
         os.environ["V3IO_ACCESS_KEY"] = self.token
+        os.environ["MLRUN_SYSTEM_TESTS_CLEAN_RESOURCES"] = "false"
         super().teardown_method(method=method)
 
     @staticmethod
@@ -141,9 +145,9 @@ class TestV3ioDataStore(TestMLRunSystem):
         start_time = time.monotonic()
         cmp_process = subprocess.Popen(cmp_command, stdout=subprocess.PIPE)
         stdout, stderr = cmp_process.communicate()
-        assert (
-            cmp_process.returncode == 0
-        ), f"stdout = {stdout}, stderr={stderr}, returncode={cmp_process.returncode}"
+        assert cmp_process.returncode == 0, (
+            f"stdout = {stdout}, stderr={stderr}, returncode={cmp_process.returncode}"
+        )
         self._logger.debug(
             f"test_v3io_large_object_upload - finished cmp 1 in {time.monotonic() - start_time} seconds"
         )
@@ -167,9 +171,9 @@ class TestV3ioDataStore(TestMLRunSystem):
         start_time = time.monotonic()
         cmp_process = subprocess.Popen(cmp_command, stdout=subprocess.PIPE)
         stdout, stderr = cmp_process.communicate()
-        assert (
-            cmp_process.returncode == 0
-        ), f"stdout = {stdout}, stderr={stderr}, returncode={cmp_process.returncode}"
+        assert cmp_process.returncode == 0, (
+            f"stdout = {stdout}, stderr={stderr}, returncode={cmp_process.returncode}"
+        )
         self._logger.debug(
             f"test_v3io_large_object_upload - finished cmp 2 in {time.monotonic() - start_time} seconds"
         )

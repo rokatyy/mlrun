@@ -16,16 +16,33 @@ import asyncio
 import typing
 from copy import deepcopy
 
+import aiohttp
+
 import mlrun.common.schemas
 import mlrun.lists
+
+
+class TimedHTTPClient:
+    def __init__(self, timeout: float | None = 30.0):
+        """
+        HTTP client wrapper with built-in timeout.
+
+        Args:
+            timeout: Request timeout in seconds (default: 30.0)
+        """
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+
+    def session(self, **kwargs) -> aiohttp.ClientSession:
+        """Create a new ClientSession with the configured timeout and additional parameters."""
+        return aiohttp.ClientSession(timeout=self.timeout, **kwargs)
 
 
 class NotificationBase:
     def __init__(
         self,
-        name: typing.Optional[str] = None,
-        params: typing.Optional[dict[str, str]] = None,
-        default_params: typing.Optional[dict[str, str]] = None,
+        name: str | None = None,
+        params: dict[str, typing.Any] | None = None,
+        default_params: dict[str, typing.Any] | None = None,
     ):
         """
         NotificationBase is the base class for all notification types.
@@ -53,25 +70,24 @@ class NotificationBase:
     def push(
         self,
         message: str,
-        severity: typing.Optional[
-            typing.Union[mlrun.common.schemas.NotificationSeverity, str]
-        ] = mlrun.common.schemas.NotificationSeverity.INFO,
-        runs: typing.Optional[typing.Union[mlrun.lists.RunList, list]] = None,
-        custom_html: typing.Optional[str] = None,
-        alert: typing.Optional[mlrun.common.schemas.AlertConfig] = None,
-        event_data: typing.Optional[mlrun.common.schemas.Event] = None,
+        severity: typing.Union[mlrun.common.schemas.NotificationSeverity, str]
+        | None = mlrun.common.schemas.NotificationSeverity.INFO,
+        runs: typing.Union[mlrun.lists.RunList, list] | None = None,
+        custom_html: str | None = None,
+        alert: mlrun.common.schemas.AlertConfig | None = None,
+        event_data: mlrun.common.schemas.Event | None = None,
     ):
         raise NotImplementedError()
 
     def load_notification(
         self,
-        params: dict[str, str],
+        params: dict[str, typing.Any],
     ) -> None:
         self.params = params or {}
 
     @classmethod
     def enrich_default_params(
-        cls, params: dict, default_params: typing.Optional[dict] = None
+        cls, params: dict, default_params: dict | None = None
     ) -> dict:
         default_params = default_params or {}
         returned_params = deepcopy(default_params)
@@ -81,13 +97,12 @@ class NotificationBase:
     def _get_html(
         self,
         message: str,
-        severity: typing.Optional[
-            typing.Union[mlrun.common.schemas.NotificationSeverity, str]
-        ] = mlrun.common.schemas.NotificationSeverity.INFO,
-        runs: typing.Optional[typing.Union[mlrun.lists.RunList, list]] = None,
-        custom_html: typing.Optional[typing.Optional[str]] = None,
-        alert: typing.Optional[mlrun.common.schemas.AlertConfig] = None,
-        event_data: typing.Optional[mlrun.common.schemas.Event] = None,
+        severity: typing.Union[mlrun.common.schemas.NotificationSeverity, str]
+        | None = mlrun.common.schemas.NotificationSeverity.INFO,
+        runs: typing.Union[mlrun.lists.RunList, list] | None = None,
+        custom_html: str | None = None,
+        alert: mlrun.common.schemas.AlertConfig | None = None,
+        event_data: mlrun.common.schemas.Event | None = None,
     ) -> str:
         if custom_html:
             return custom_html

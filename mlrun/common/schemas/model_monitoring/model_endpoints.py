@@ -14,8 +14,10 @@
 import abc
 import json
 from datetime import datetime
-from typing import Any, NamedTuple, Optional, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
+from uuid import UUID
 
+from pydantic import validator  # use `validator` if you’re still on Pydantic v1
 from pydantic.v1 import BaseModel, Field, constr
 
 # TODO: remove the unused import below after `mlrun.datastore` and `mlrun.utils` usage is removed.
@@ -26,7 +28,9 @@ from .constants import (
     FQN_REGEX,
     MODEL_ENDPOINT_ID_PATTERN,
     PROJECT_PATTERN,
+    EndpointMode,
     EndpointType,
+    ModelEndpointCreationStrategy,
     ModelEndpointMonitoringMetricType,
     ModelMonitoringMode,
     ResultKindApp,
@@ -34,12 +38,6 @@ from .constants import (
 )
 
 Model = TypeVar("Model", bound=BaseModel)
-
-
-class ModelMonitoringStoreKinds:
-    # TODO: do changes in examples & demos In 1.5.0 remove
-    ENDPOINTS = "endpoints"
-    EVENTS = "events"
 
 
 class Histogram(BaseModel):
@@ -54,7 +52,7 @@ class FeatureValues(BaseModel):
     histogram: Histogram
 
     @classmethod
-    def from_dict(cls, stats: Optional[dict]):
+    def from_dict(cls, stats: dict | None):
         if stats:
             return FeatureValues(
                 min=stats["min"],
@@ -69,15 +67,15 @@ class FeatureValues(BaseModel):
 class Features(BaseModel):
     name: str
     weight: float
-    expected: Optional[FeatureValues]
-    actual: Optional[FeatureValues]
+    expected: FeatureValues | None
+    actual: FeatureValues | None
 
     @classmethod
     def new(
         cls,
         feature_name: str,
-        feature_stats: Optional[dict],
-        current_stats: Optional[dict],
+        feature_stats: dict | None,
+        current_stats: dict | None,
     ):
         return cls(
             name=feature_name,
@@ -94,13 +92,18 @@ class ModelEndpointParser(abc.ABC, BaseModel):
 
     @classmethod
     def from_flat_dict(
-        cls, endpoint_dict: dict, json_parse_values: Optional[list] = None
+        cls,
+        endpoint_dict: dict,
+        json_parse_values: list | None = None,
+        validate: bool = True,
     ) -> "ModelEndpointParser":
         """Create a `ModelEndpointParser` object from an endpoint dictionary
 
         :param endpoint_dict:     Model endpoint dictionary.
         :param json_parse_values: List of dictionary keys with a JSON string value that will be parsed into a
                                   dictionary using json.loads().
+        :param validate:          Whether to validate the flattened dictionary.
+                                  Skip validation to optimize performance when it is safe to do so.
         """
         if json_parse_values is None:
             json_parse_values = cls.json_parse_values()
@@ -109,46 +112,58 @@ class ModelEndpointParser(abc.ABC, BaseModel):
             model_class=cls,
             flattened_dictionary=endpoint_dict,
             json_parse_values=json_parse_values,
+            validate=validate,
         )
 
 
 class ModelEndpointMetadata(ObjectMetadata, ModelEndpointParser):
     project: constr(regex=PROJECT_PATTERN)
     endpoint_type: EndpointType = EndpointType.NODE_EP
-    uid: Optional[constr(regex=MODEL_ENDPOINT_ID_PATTERN)]
+    uid: constr(regex=MODEL_ENDPOINT_ID_PATTERN) | None
+    mode: EndpointMode | None = None
 
     @classmethod
     def mutable_fields(cls):
         return ["labels"]
 
+    @validator("uid", pre=True)
+    def _uid_to_str(cls, v):  # noqa: N805
+        if isinstance(v, UUID):
+            return str(v)
+        return v
+
+    @validator("mode", pre=True, always=True)
+    def _set_mode_based_on_endpoint_type(cls, v, values):  # noqa: N805
+        if v is None:
+            if values.get("endpoint_type") == EndpointType.BATCH_EP:
+                return EndpointMode.BATCH_LEGACY
+            else:
+                return EndpointMode.REAL_TIME
+        return v
+
 
 class ModelEndpointSpec(ObjectSpec, ModelEndpointParser):
-    model_uid: Optional[str] = ""
-    model_name: Optional[str] = ""
-    model_db_key: Optional[str] = ""
-    model_tag: Optional[str] = ""
-    model_class: Optional[str] = ""
-    function_name: Optional[str] = ""
-    function_tag: Optional[str] = ""
-    function_uid: Optional[str] = ""
-    feature_names: Optional[list[str]] = []
-    label_names: Optional[list[str]] = []
-    feature_stats: Optional[dict] = {}
-    function_uri: Optional[str] = ""  # <project_name>/<function_hash>
-    model_uri: Optional[str] = ""
-    children: Optional[list[str]] = []
-    children_uids: Optional[list[str]] = []
-    monitoring_feature_set_uri: Optional[str] = ""
+    model_class: str | None = ""
+    function_name: str | None = ""
+    function_tag: str | None = ""
+    model_path: str | None = ""
+    model_name: str | None = ""
+    model_tags: list[str] | None = []
+    _model_id: int | None = ""
+    feature_names: list[str] | None = []
+    label_names: list[str] | None = []
+    feature_stats: dict | None = {}
+    function_uri: str | None = ""  # <project_name>/<function_hash>
+    model_uri: str | None = ""
+    children: list[str] | None = []
+    children_uids: list[str] | None = []
+    monitoring_feature_set_uri: str | None = ""
 
     @classmethod
     def mutable_fields(cls):
         return [
-            "model_uid",
-            "model_name",
-            "model_db_key",
-            "model_tag",
+            "model_path",
             "model_class",
-            "function_uid",
             "feature_names",
             "label_names",
             "children",
@@ -157,20 +172,20 @@ class ModelEndpointSpec(ObjectSpec, ModelEndpointParser):
 
 
 class ModelEndpointStatus(ObjectStatus, ModelEndpointParser):
-    state: Optional[str] = "unknown"  # will be updated according to the function state
-    first_request: Optional[datetime] = None
-    monitoring_mode: Optional[ModelMonitoringMode] = ModelMonitoringMode.disabled
-    sampling_percentage: Optional[float] = 100
+    state: str | None = "unknown"  # will be updated according to the function state
+    first_request: datetime | None = None
+    monitoring_mode: ModelMonitoringMode | None = ModelMonitoringMode.disabled
+    sampling_percentage: float | None = 100
 
     # operative
-    last_request: Optional[datetime] = None
-    result_status: Optional[int] = -1
-    avg_latency: Optional[float] = None
-    error_count: Optional[int] = 0
-    current_stats: Optional[dict] = {}
-    current_stats_timestamp: Optional[datetime] = None
-    drift_measures: Optional[dict] = {}
-    drift_measures_timestamp: Optional[datetime] = None
+    last_request: datetime | None = None
+    result_status: int | None = -1
+    avg_latency: float | None = None
+    error_count: int | None = 0
+    current_stats: dict | None = {}
+    current_stats_timestamp: datetime | None = None
+    drift_measures: dict | None = {}
+    drift_measures_timestamp: datetime | None = None
 
     @classmethod
     def mutable_fields(cls):
@@ -212,7 +227,6 @@ class ModelEndpoint(BaseModel):
             ModelEndpointSchema.CURRENT_STATS,
             ModelEndpointSchema.DRIFT_MEASURES,
             ModelEndpointSchema.FUNCTION_URI,
-            ModelEndpointSchema.MODEL_URI,
         }
         # Initialize a flattened dictionary that will be filled with the model endpoint dictionary attributes
         flatten_dict = {}
@@ -225,17 +239,27 @@ class ModelEndpoint(BaseModel):
         return flatten_dict
 
     @classmethod
-    def from_flat_dict(cls, endpoint_dict: dict) -> "ModelEndpoint":
+    def from_flat_dict(
+        cls, endpoint_dict: dict, validate: bool = True
+    ) -> "ModelEndpoint":
         """Create a `ModelEndpoint` object from an endpoint flattened dictionary. Because the provided dictionary
         is flattened, we pass it as is to the subclasses without splitting the keys into spec, metadata, and status.
 
         :param endpoint_dict:     Model endpoint dictionary.
+        :param validate:          Whether to validate the flattened dictionary.
+                                  Skip validation to optimize performance when it is safe to do so.
         """
 
         return cls(
-            metadata=ModelEndpointMetadata.from_flat_dict(endpoint_dict=endpoint_dict),
-            spec=ModelEndpointSpec.from_flat_dict(endpoint_dict=endpoint_dict),
-            status=ModelEndpointStatus.from_flat_dict(endpoint_dict=endpoint_dict),
+            metadata=ModelEndpointMetadata.from_flat_dict(
+                endpoint_dict=endpoint_dict, validate=validate
+            ),
+            spec=ModelEndpointSpec.from_flat_dict(
+                endpoint_dict=endpoint_dict, validate=validate
+            ),
+            status=ModelEndpointStatus.from_flat_dict(
+                endpoint_dict=endpoint_dict, validate=validate
+            ),
         )
 
     def get(self, field, default=None):
@@ -251,13 +275,79 @@ class ModelEndpointList(BaseModel):
     endpoints: list[ModelEndpoint]
 
 
+class ModelEndpointInstruction(BaseModel):
+    """
+    Instructions for creating a user-defined model endpoint (``EndpointType.USER_EP``).
+
+    This object can be constructed up-front and passed to
+    ``MlrunProject.create_user_model_endpoint`` as an alternative to providing
+    the individual keyword arguments.
+
+    :param name:               Name of the model endpoint.
+    :param input_schema:       List of input feature names.
+    :param output_schema:      List of output / label names.
+    :param function_name:      Name of the associated MLRun function. Must not be set when used
+                               with ``setup_model_monitoring`` — it is derived from the function's
+                               ``metadata.name`` at deployment time.
+    :param function_tag:       Tag of the associated MLRun function. Must not be set when used
+                               with ``setup_model_monitoring`` — it is derived from the function's
+                               ``metadata.tag`` at deployment time.
+    :param creation_strategy: Strategy for creating or updating the model endpoint:
+            * **overwrite**:
+            1. If model endpoints with the same name exist, delete the `latest` one.
+            2. Create a new model endpoint entry and set it as `latest`.
+            * **inplace** (default):
+            1. If model endpoints with the same name exist, update the `latest` entry.
+            2. Otherwise, create a new entry.
+            * **archive**:
+            1. If model endpoints with the same name exist, preserve them.
+            2. Create a new model endpoint with the same name and set it to `latest`.
+    :param monitoring_mode: Monitoring mode written to the created endpoint's
+        ``status.monitoring_mode``. One of
+        :class:`~mlrun.common.schemas.model_monitoring.constants.ModelMonitoringMode`
+        (``enabled`` or ``disabled``). Defaults to ``enabled``.
+    """
+
+    name: constr(regex=MODEL_ENDPOINT_ID_PATTERN)
+    input_schema: list[str] | None = None
+    output_schema: list[str] | None = None
+    function_name: str | None = None
+    function_tag: str | None = None
+    creation_strategy: ModelEndpointCreationStrategy = (
+        ModelEndpointCreationStrategy.INPLACE
+    )
+    monitoring_mode: ModelMonitoringMode = ModelMonitoringMode.enabled
+
+    def to_dict(self) -> dict:
+        """Serialize to a plain dictionary (enum values are converted to their primitives)."""
+        return self.dict()
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ModelEndpointInstruction":
+        """Deserialize from a plain dictionary, with pydantic validation."""
+        return cls(**data)
+
+    @property
+    def spec_fields(self) -> dict:
+        return {
+            k: v
+            for k, v in {
+                "feature_names": self.input_schema,
+                "label_names": self.output_schema,
+                "function_name": self.function_name,
+                "function_tag": self.function_tag,
+            }.items()
+            if v is not None
+        }
+
+
 class ModelEndpointMonitoringMetric(BaseModel):
     project: str
     app: str
     type: ModelEndpointMonitoringMetricType
     name: str
-    full_name: Optional[str] = None
-    kind: Optional[ResultKindApp] = None
+    full_name: str | None = None
+    kind: ResultKindApp | None = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -294,7 +384,7 @@ class _ResultPoint(NamedTuple):
     timestamp: datetime
     value: float
     status: ResultStatusApp
-    extra_data: Optional[str] = ""
+    extra_data: str | None = ""
 
 
 class _ModelEndpointMonitoringMetricValuesBase(BaseModel):
@@ -322,8 +412,39 @@ class ModelEndpointMonitoringMetricNoData(_ModelEndpointMonitoringMetricValuesBa
     data: bool = False
 
 
+class ApplicationBaseRecord(BaseModel):
+    type: Literal["metric", "result"]
+    value: float
+    time: datetime | None = None
+
+
+class ApplicationResultRecord(ApplicationBaseRecord):
+    kind: ResultKindApp
+    status: ResultStatusApp
+    result_name: str
+    type: Literal["result"] = "result"
+
+
+class ApplicationMetricRecord(ApplicationBaseRecord):
+    metric_name: str
+    type: Literal["metric"] = "metric"
+
+
+class _DriftBin(NamedTuple):
+    timestamp: datetime
+    count_suspected: int
+    count_detected: int
+
+
+class ModelEndpointDriftValues(BaseModel):
+    values: list[_DriftBin]
+
+
 def _mapping_attributes(
-    model_class: type[Model], flattened_dictionary: dict, json_parse_values: list
+    model_class: type[Model],
+    flattened_dictionary: dict,
+    json_parse_values: list,
+    validate: bool = True,
 ) -> Model:
     """Generate a `BaseModel` object with the provided dictionary attributes.
 
@@ -331,8 +452,10 @@ def _mapping_attributes(
     :param flattened_dictionary: Flattened dictionary that contains the model endpoint attributes.
     :param json_parse_values:    List of dictionary keys with a JSON string value that will be parsed into a
                                  dictionary using json.loads().
+    :param validate:             Whether to validate the flattened dictionary.
+                                 Skip validation to optimize performance when it is safe to do so.
     """
-    # Get the fields of the provided base model object. These fields will be used to filter to relevent keys
+    # Get the fields of the provided base model object. These fields will be used to filter to relevant keys
     # from the flattened dictionary.
     wanted_keys = model_class.__fields__.keys()
 
@@ -350,7 +473,10 @@ def _mapping_attributes(
             else:
                 dict_to_parse[field_key] = None
 
-    return model_class.parse_obj(dict_to_parse)
+    if validate:
+        return model_class.parse_obj(dict_to_parse)
+
+    return model_class.construct(**dict_to_parse)
 
 
 def _json_loads_if_not_none(field: Any) -> Any:

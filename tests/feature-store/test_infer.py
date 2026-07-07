@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import unittest.mock
 
 import pandas as pd
@@ -57,27 +57,27 @@ def test_infer_from_df():
 
     # test entity infer
     assert len(featureset.spec.entities) == 1, "entity not properly inferred"
-    assert (
-        list(featureset.spec.entities.keys())[0] == key
-    ), "entity key not properly inferred"
-    assert (
-        list(featureset.spec.entities.values())[0].value_type == "str"
-    ), "entity type not properly inferred"
+    assert list(featureset.spec.entities.keys())[0] == key, (
+        "entity key not properly inferred"
+    )
+    assert list(featureset.spec.entities.values())[0].value_type == "str", (
+        "entity type not properly inferred"
+    )
 
     # test infer features
-    assert (
-        featureset.spec.features.to_dict() == expected_schema
-    ), "did not infer schema properly"
+    assert featureset.spec.features.to_dict() == expected_schema, (
+        "did not infer schema properly"
+    )
 
     preview = featureset.status.preview
     # by default preview should be 20 lines + 1 for headers
     assert len(preview) == 21, "unexpected num of preview lines"
-    assert len(preview[0]) == df.shape[1] + len(
-        df.index.names
-    ), "unexpected num of header columns"
-    assert len(preview[1]) == df.shape[1] + len(
-        df.index.names
-    ), "unexpected num of value columns"
+    assert len(preview[0]) == df.shape[1] + len(df.index.names), (
+        "unexpected num of header columns"
+    )
+    assert len(preview[1]) == df.shape[1] + len(df.index.names), (
+        "unexpected num of value columns"
+    )
 
     features = sorted(featureset.spec.features.keys())
     stats = sorted(featureset.status.stats.keys())
@@ -130,8 +130,7 @@ def test_check_permissions(rundb_mock, monkeypatch):
     )
 
     with pytest.raises(mlrun.errors.MLRunAccessDeniedError):
-        fstore.preview(
-            data_set1,
+        data_set1.preview(
             data,
             entity_columns=[Entity("string")],
         )
@@ -141,10 +140,10 @@ def test_check_permissions(rundb_mock, monkeypatch):
     features = ["fs1.*"]
     feature_vector = fstore.FeatureVector("test", features)
     with pytest.raises(mlrun.errors.MLRunAccessDeniedError):
-        fstore.get_offline_features(feature_vector)
+        feature_vector.get_offline_features()
 
     with pytest.raises(mlrun.errors.MLRunAccessDeniedError):
-        fstore.get_online_feature_service(feature_vector)
+        feature_vector.get_online_feature_service()
 
     with pytest.raises(mlrun.errors.MLRunAccessDeniedError):
         data_set1.deploy_ingestion_service()

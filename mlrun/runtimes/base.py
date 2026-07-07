@@ -14,11 +14,9 @@
 import enum
 import http
 import re
-import typing
-import warnings
-from base64 import b64encode
+from collections.abc import Callable
 from os import environ
-from typing import Callable, Optional, Union
+from typing import Union
 
 import requests.exceptions
 from nuclio.build import mlrun_footer
@@ -31,9 +29,19 @@ import mlrun.common.schemas
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
 import mlrun.errors
 import mlrun.launcher.factory
+import mlrun.runtimes
 import mlrun.utils.helpers
 import mlrun.utils.notifications
 import mlrun.utils.regex
+from mlrun.common.runtimes.constants import RunStates
+from mlrun.model import (
+    BaseMetadata,
+    HyperParamOptions,
+    ImageBuilder,
+    ModelObj,
+    RunObject,
+    RunTemplate,
+)
 from mlrun.utils.helpers import generate_object_uri, verify_field_regex
 from mlrun_pipelines.common.ops import mlrun_op
 
@@ -41,7 +49,6 @@ from ..config import config
 from ..datastore import store_manager
 from ..errors import err_to_str
 from ..lists import RunList
-from ..model import BaseMetadata, HyperParamOptions, ImageBuilder, ModelObj, RunObject
 from ..utils import (
     dict_to_json,
     dict_to_yaml,
@@ -68,7 +75,6 @@ spec_fields = [
     "pythonpath",
     "disable_auto_mount",
     "allow_empty_resources",
-    "clone_target_dir",
     "reset_on_run",
 ]
 
@@ -111,7 +117,6 @@ class FunctionSpec(ModelObj):
         default_handler=None,
         pythonpath=None,
         disable_auto_mount=False,
-        clone_target_dir=None,
     ):
         self.command = command or ""
         self.image = image or ""
@@ -128,9 +133,6 @@ class FunctionSpec(ModelObj):
         self.entry_points = entry_points or {}
         self.disable_auto_mount = disable_auto_mount
         self.allow_empty_resources = None
-        # The build.source is cloned/extracted to the specified clone_target_dir
-        # if a relative path is specified, it will be enriched with a temp dir path
-        self._clone_target_dir = clone_target_dir or None
 
     @property
     def build(self) -> ImageBuilder:
@@ -140,32 +142,9 @@ class FunctionSpec(ModelObj):
     def build(self, build):
         self._build = self._verify_dict(build, "build", ImageBuilder)
 
-    @property
-    def clone_target_dir(self):
-        # TODO: remove this property in 1.9.0
-        if self.build.source_code_target_dir:
-            warnings.warn(
-                "The clone_target_dir attribute is deprecated in 1.6.2 and will be removed in 1.9.0. "
-                "Use spec.build.source_code_target_dir instead.",
-                FutureWarning,
-            )
-        return self.build.source_code_target_dir
-
-    @clone_target_dir.setter
-    def clone_target_dir(self, clone_target_dir):
-        # TODO: remove this property in 1.9.0
-        if clone_target_dir:
-            warnings.warn(
-                "The clone_target_dir attribute is deprecated in 1.6.2 and will be removed in 1.9.0. "
-                "Use spec.build.source_code_target_dir instead.",
-                FutureWarning,
-            )
-        self.build.source_code_target_dir = clone_target_dir
-
-    def enrich_function_preemption_spec(self):
-        pass
-
-    def validate_service_account(self, allowed_service_accounts):
+    def validate_service_account(
+        self, allowed_service_accounts, forbidden_service_accounts
+    ):
         pass
 
 
@@ -193,6 +172,22 @@ class BaseRuntime(ModelObj):
         self.status = None
         self.verbose = False
         self._enriched_image = False
+
+    def __getstate__(self) -> dict:
+        """Exclude the live run-DB connection from copy/pickle.
+
+        ``_db_conn`` holds an ``HTTPRunDB`` with a live ``requests`` session and
+        socket pool. Cloning a runtime - e.g. ``enrich_function_object`` deep-copies
+        project functions during pipeline compilation - must not clone the
+        connection; ``_get_db`` reconnects lazily (to the cached run-DB) on the
+        copy. This avoids both cloning sockets and propagating a half-initialized
+        session (see ML-12648).
+
+        :return: The instance state to pickle/copy, with ``_db_conn`` cleared.
+        """
+        state = self.__dict__.copy()
+        state["_db_conn"] = None
+        return state
 
     def set_db_connection(self, conn):
         if not self._db_conn:
@@ -228,6 +223,14 @@ class BaseRuntime(ModelObj):
 
     def set_categories(self, categories: list[str]):
         self.metadata.categories = mlrun.utils.helpers.as_list(categories)
+
+    def validate(self):
+        """
+        Validate that this runtime is allowed to run on the current system.
+
+        Subclasses override this to enforce runtime-specific preconditions (raising an
+        ``mlrun.errors`` exception when violated).
+        """
 
     @property
     def uri(self):
@@ -275,7 +278,10 @@ class BaseRuntime(ModelObj):
         pass
 
     def validate_and_enrich_service_account(
-        self, allowed_service_account, default_service_account
+        self,
+        allowed_service_accounts,
+        forbidden_service_accounts,
+        default_service_account,
     ):
         pass
 
@@ -300,45 +306,32 @@ class BaseRuntime(ModelObj):
             mlrun.model.Credentials.generate_access_key
         )
 
-    def generate_runtime_k8s_env(self, runobj: RunObject = None) -> list[dict]:
-        """
-        Prepares a runtime environment as it's expected by kubernetes.models.V1Container
-
-        :param runobj: Run context object (RunObject) with run metadata and status
-        :return: List of dicts with the structure {"name": "var_name", "value": "var_value"}
-        """
-        return [
-            {"name": k, "value": v}
-            for k, v in self._generate_runtime_env(runobj).items()
-        ]
-
     def run(
         self,
-        runspec: Optional[
-            Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict]
-        ] = None,
-        handler: Optional[Union[str, Callable]] = None,
-        name: Optional[str] = "",
-        project: Optional[str] = "",
-        params: Optional[dict] = None,
-        inputs: Optional[dict[str, str]] = None,
-        out_path: Optional[str] = "",
-        workdir: Optional[str] = "",
-        artifact_path: Optional[str] = "",
-        watch: Optional[bool] = True,
-        schedule: Optional[Union[str, mlrun.common.schemas.ScheduleCronTrigger]] = None,
-        hyperparams: Optional[dict[str, list]] = None,
-        hyper_param_options: Optional[HyperParamOptions] = None,
-        verbose: Optional[bool] = None,
-        scrape_metrics: Optional[bool] = None,
-        local: Optional[bool] = False,
-        local_code_path: Optional[str] = None,
-        auto_build: Optional[bool] = None,
-        param_file_secrets: Optional[dict[str, str]] = None,
-        notifications: Optional[list[mlrun.model.Notification]] = None,
-        returns: Optional[list[Union[str, dict[str, str]]]] = None,
-        state_thresholds: Optional[dict[str, int]] = None,
-        reset_on_run: Optional[bool] = None,
+        runspec: Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict]
+        | None = None,
+        handler: Union[str, Callable] | None = None,
+        name: str | None = "",
+        project: str | None = "",
+        params: dict | None = None,
+        inputs: dict[str, str | list | dict] | None = None,
+        workdir: str | None = "",
+        watch: bool | None = True,
+        schedule: Union[str, mlrun.common.schemas.ScheduleCronTrigger] | None = None,
+        hyperparams: dict[str, list] | None = None,
+        hyper_param_options: HyperParamOptions | None = None,
+        verbose: bool | None = None,
+        scrape_metrics: bool | None = None,
+        local: bool | None = False,
+        local_code_path: str | None = None,
+        auto_build: bool | None = None,
+        param_file_secrets: dict[str, str] | None = None,
+        notifications: list[mlrun.model.Notification] | None = None,
+        returns: "list[str | mlrun.LogHint] | None" = None,
+        state_thresholds: dict[str, int] | None = None,
+        reset_on_run: bool | None = None,
+        output_path: str | None = "",
+        retry: Union[mlrun.model.Retry, dict] | None = None,
         **launcher_kwargs,
     ) -> RunObject:
         """
@@ -351,10 +344,9 @@ class BaseRuntime(ModelObj):
         :param params:         Input parameters (dict).
         :param inputs:         Input objects to pass to the handler. Type hints can be given so the input will be parsed
                                during runtime from `mlrun.DataItem` to the given type hint. The type hint can be given
-                               in the key field of the dictionary after a colon, e.g: "<key> : <type_hint>".
-        :param out_path:       Default artifact output path.
-        :param artifact_path:  Default artifact output path (will replace out_path).
-        :param workdir:        Default input artifacts path.
+                               in the key field of the dictionary after a colon, e.g: "<key> : <type_hint>". An input
+                               can include a collection of inputs in a dict or list.
+        :param workdir:        Working directory of the executed job and the default path for artifact inputs
         :param watch:          Watch/follow run log.
         :param schedule:       ScheduleCronTrigger class instance or a standard crontab expression string
                                (which will be converted to the class using its `from_crontab` constructor),
@@ -378,16 +370,21 @@ class BaseRuntime(ModelObj):
         :param param_file_secrets:  Dictionary of secrets to be used only for accessing the hyper-param parameter file.
                                     These secrets are only used locally and will not be stored anywhere
         :param notifications:       List of notifications to push when the run is completed
-        :param returns: List of log hints - configurations for how to log the returning values from the handler's run
-                        (as artifacts or results). The list's length must be equal to the amount of returning objects. A
-                        log hint may be given as:
+        :param returns:             List of log hints - configurations for how to log the returning values from the
+                                    handler's run (as artifacts or results). The list's length must be equal to the
+                                    amount of returning objects. A log hint may be given as:
 
-                        * A string of the key to use to log the returning value as result or as an artifact. To specify
-                          The artifact type, it is possible to pass a string in the following structure:
-                          "<key> : <type>". Available artifact types can be seen in `mlrun.ArtifactType`. If no
-                          artifact type is specified, the object's default artifact type will be used.
-                        * A dictionary of configurations to use when logging. Further info per object type and artifact
-                          type can be given there. The artifact key must appear in the dictionary as "key": "the_key".
+                                    * A ``LogHint`` object with the key and extra configurations.
+                                    * A "shortcut" string of the key to use to log the returning value as result or as
+                                      an artifact. To specify The artifact type, it is possible to pass a string in the
+                                      following structure: "<key> : <type>". Available artifact types can be seen in
+                                      `mlrun.ArtifactType`. If no artifact type is specified, the object's default
+                                      artifact type will be used. Packing kwargs can be passed alongside the artifact
+                                      type using square brackets:
+                                      ``"<key> : <type>[<kwarg1>=<value1>, <kwarg2>=<value2>]"``.
+                                      Itemization can also be specified before the key using
+                                      the following structure: "<unbundle-level> * <key>". If unbundle level is not
+                                      specified, the default is full unbundling.
         :param state_thresholds:    Dictionary of states to time thresholds. The state will be matched against the
                 k8s resource's status. The threshold should be a time string that conforms to timelength python package
                 standards and is at least 1 minute (-1 for infinite).
@@ -396,6 +393,13 @@ class BaseRuntime(ModelObj):
         :param reset_on_run: When True, function python modules would reload prior to code execution.
                              This ensures latest code changes are executed. This argument must be used in
                              conjunction with the local=True argument.
+        :param output_path:    Default artifact output path.
+        :param retry:          Retry configuration for the run, can be a dict or an instance of
+                               :py:class:`~mlrun.model.Retry`.
+                               The `count` field in the `Retry` object specifies the number of retry attempts.
+                               If `count=0`, the run will not be retried.
+                               The `backoff` field specifies the retry backoff strategy between retry attempts.
+                               If not provided, the default backoff delay is 30 seconds.
         :return: Run context object (RunObject) with run metadata, results and status
         """
         launcher = mlrun.launcher.factory.LauncherFactory().create_launcher(
@@ -409,9 +413,8 @@ class BaseRuntime(ModelObj):
             project=project,
             params=params,
             inputs=inputs,
-            out_path=out_path,
             workdir=workdir,
-            artifact_path=artifact_path,
+            output_path=output_path,
             watch=watch,
             schedule=schedule,
             hyperparams=hyperparams,
@@ -425,6 +428,7 @@ class BaseRuntime(ModelObj):
             returns=returns,
             state_thresholds=state_thresholds,
             reset_on_run=reset_on_run,
+            retry=retry,
         )
 
     def _get_db_run(
@@ -445,30 +449,86 @@ class BaseRuntime(ModelObj):
         if task:
             return task.to_dict()
 
-    def _generate_runtime_env(self, runobj: RunObject = None) -> dict:
+    def _generate_runtime_env(self, runobj: RunObject = None):
         """
-        Prepares all available environment variables for usage on a runtime
-        Data will be extracted from several sources and most of them are not guaranteed to be available
+        Prepares all available environment variables for usage on a runtime.
 
-        :param runobj: Run context object (RunObject) with run metadata and status
-        :return: Dictionary with all the variables that could be parsed
+        :param runobj: Optional run context object (RunObject) with run metadata and status
+        :return: Tuple of (runtime_env, external_source_env) where:
+                 - runtime_env: Dict of {env_name: value} for standard env vars
+                 - external_source_env: Dict of {env_name: value_from} for env vars with external sources
         """
+        active_project = self.metadata.project or config.active_project
         runtime_env = {
-            "MLRUN_DEFAULT_PROJECT": self.metadata.project or config.default_project
+            mlrun_constants.MLRUN_ACTIVE_PROJECT: active_project,
+            # TODO: Remove this in 1.12.0 as MLRUN_DEFAULT_PROJECT is deprecated and should not be injected anymore
+            "MLRUN_DEFAULT_PROJECT": active_project,
         }
+
+        # Set auth session only for nuclio runtimes that have an access key
+        if (
+            self.kind in mlrun.runtimes.RuntimeKinds.nuclio_runtimes()
+            and self.metadata.credentials.access_key
+        ):
+            runtime_env[
+                mlrun.common.runtimes.constants.FunctionEnvironmentVariables.auth_session
+            ] = self.metadata.credentials.access_key
+
         if runobj:
             runtime_env["MLRUN_EXEC_CONFIG"] = runobj.to_json(
                 exclude_notifications_params=True
             )
             if runobj.metadata.project:
-                runtime_env["MLRUN_DEFAULT_PROJECT"] = runobj.metadata.project
+                runtime_env[mlrun_constants.MLRUN_ACTIVE_PROJECT] = (
+                    runobj.metadata.project
+                )
             if runobj.spec.verbose:
                 runtime_env["MLRUN_LOG_LEVEL"] = "DEBUG"
         if config.httpdb.api_url:
             runtime_env["MLRUN_DBPATH"] = config.httpdb.api_url
         if self.metadata.namespace or config.namespace:
             runtime_env["MLRUN_NAMESPACE"] = self.metadata.namespace or config.namespace
-        return runtime_env
+
+        external_source_env = self._generate_external_source_runtime_envs()
+
+        return runtime_env, external_source_env
+
+    def _generate_external_source_runtime_envs(self):
+        """
+        Returns non-static env vars to be added to the runtime pod/container.
+
+        :return: Dict of {env_name: value_from} for env vars with external sources (e.g., fieldRef)
+        """
+        return {
+            "MLRUN_RUNTIME_KIND": {
+                "fieldRef": {
+                    "apiVersion": "v1",
+                    "fieldPath": f"metadata.labels['{mlrun_constants.MLRunInternalLabels.mlrun_class}']",
+                }
+            },
+        }
+
+    def _generate_k8s_runtime_env(self, runobj: RunObject = None):
+        """
+        Generates runtime environment variables in Kubernetes format.
+
+        :param runobj: Optional run context object (RunObject) with run metadata and status
+        :return: List of env var dicts in K8s format:
+                 - Standard envs: [{"name": key, "value": value}, ...]
+                 - External source envs: [{"name": key, "valueFrom": value_from}, ...]
+        """
+        runtime_env, external_source_env = self._generate_runtime_env(runobj)
+
+        # Convert standard env vars to K8s format
+        k8s_env = [{"name": k, "value": v} for k, v in runtime_env.items()]
+
+        # Convert external source env vars to K8s format
+        k8s_external_env = [
+            {"name": k, "valueFrom": v} for k, v in external_source_env.items()
+        ]
+
+        k8s_env.extend(k8s_external_env)
+        return k8s_env
 
     @staticmethod
     def _handle_submit_job_http_error(error: requests.HTTPError):
@@ -483,12 +543,12 @@ class BaseRuntime(ModelObj):
     def _store_function(self, runspec, meta, db):
         meta.labels["kind"] = self.kind
         mlrun.runtimes.utils.enrich_run_labels(
-            meta.labels, [mlrun.common.runtimes.constants.RunLabels.owner]
+            meta.labels, [mlrun_constants.MLRunInternalLabels.owner]
         )
-        if runspec.spec.output_path:
-            runspec.spec.output_path = runspec.spec.output_path.replace(
-                "{{run.user}}", meta.labels[mlrun_constants.MLRunInternalLabels.owner]
-            )
+        runspec.spec.output_path = mlrun.runtimes.utils.resolve_run_user_template(
+            runspec.spec.output_path,
+            meta.labels.get(mlrun_constants.MLRunInternalLabels.owner),
+        )
 
         if db and self.kind != "handler":
             struct = self.to_dict()
@@ -554,11 +614,11 @@ class BaseRuntime(ModelObj):
 
     def _update_run_state(
         self,
-        resp: Optional[dict] = None,
+        resp: dict | None = None,
         task: RunObject = None,
-        err: Optional[Union[Exception, str]] = None,
+        err: Union[Exception, str] | None = None,
         run_format: mlrun.common.formatters.RunFormat = mlrun.common.formatters.RunFormat.full,
-    ) -> typing.Optional[dict]:
+    ) -> dict | None:
         """update the task state in the DB"""
         was_none = False
         if resp is None and task:
@@ -581,12 +641,27 @@ class BaseRuntime(ModelObj):
         updates = None
         last_state = get_in(resp, "status.state", "")
         kind = get_in(resp, "metadata.labels.kind", "")
-        if last_state == "error" or err:
+        if last_state in RunStates.error_states() or err:
+            new_state = RunStates.error
+            status_text = None
+            max_retries = get_in(resp, "spec.retry.count", 0)
+            retry_count = get_in(resp, "status.retry_count", 0) or 0
+            attempts = retry_count + 1
+            if max_retries:
+                if retry_count < max_retries:
+                    new_state = RunStates.pending_retry
+                    status_text = f"Run failed attempt {attempts} of {max_retries + 1}"
+                elif retry_count >= max_retries:
+                    status_text = f"Run failed after {attempts} attempts"
+
             updates = {
                 "status.last_update": now_date().isoformat(),
-                "status.state": "error",
+                "status.state": new_state,
             }
-            update_in(resp, "status.state", "error")
+            update_in(resp, "status.state", new_state)
+            if status_text:
+                updates["status.status_text"] = status_text
+                update_in(resp, "status.status_text", status_text)
             if err:
                 update_in(resp, "status.error", err_to_str(err))
             err = get_in(resp, "status.error")
@@ -595,9 +670,8 @@ class BaseRuntime(ModelObj):
 
         elif (
             not was_none
-            and last_state != mlrun.common.runtimes.constants.RunStates.completed
-            and last_state
-            not in mlrun.common.runtimes.constants.RunStates.error_and_abortion_states()
+            and last_state != RunStates.completed
+            and last_state not in RunStates.error_and_abortion_states()
         ):
             try:
                 runtime_cls = mlrun.runtimes.get_runtime_class(kind)
@@ -647,8 +721,8 @@ class BaseRuntime(ModelObj):
     def full_image_path(
         self,
         image=None,
-        client_version: Optional[str] = None,
-        client_python_version: Optional[str] = None,
+        client_version: str | None = None,
+        client_python_version: str | None = None,
     ):
         image = image or self.spec.image or ""
 
@@ -669,24 +743,24 @@ class BaseRuntime(ModelObj):
 
     def as_step(
         self,
-        runspec: RunObject = None,
+        runspec: Union[RunObject, RunTemplate] = None,
         handler=None,
         name: str = "",
         project: str = "",
-        params: Optional[dict] = None,
+        params: dict | None = None,
         hyperparams=None,
         selector="",
         hyper_param_options: HyperParamOptions = None,
-        inputs: Optional[dict] = None,
-        outputs: Optional[list] = None,
+        inputs: dict[str, str | list | dict] | None = None,
+        outputs: list | None = None,
         workdir: str = "",
         artifact_path: str = "",
         image: str = "",
-        labels: Optional[dict] = None,
+        labels: dict | None = None,
         use_db=True,
         verbose=None,
         scrape_metrics=False,
-        returns: Optional[list[Union[str, dict[str, str]]]] = None,
+        returns: "list[str | mlrun.LogHint] | None" = None,
         auto_build: bool = False,
     ):
         """Run a local or remote task.
@@ -702,27 +776,28 @@ class BaseRuntime(ModelObj):
                             see: :py:class:`~mlrun.model.HyperParamOptions`
         :param inputs:          Input objects to pass to the handler. Type hints can be given so the input will be
                                 parsed during runtime from `mlrun.DataItem` to the given type hint. The type hint can be
-                                given in the key field of the dictionary after a colon, e.g: "<key> : <type_hint>".
+                                given in the key field of the dictionary after a colon, e.g: "<key> : <type_hint>". An
+                                input can include a collection of inputs in a dict or list.
         :param outputs:         list of outputs which can pass in the workflow
         :param artifact_path:   default artifact output path (replace out_path)
-        :param workdir:         default input artifacts path
+        :param workdir:         working directory of the executed job and the default path for artifact inputs
         :param image:           container image to use
         :param labels:          labels to tag the job/run with ({key:val, ..})
         :param use_db:          save function spec in the db (vs the workflow file)
         :param verbose:         add verbose prints/logs
         :param scrape_metrics:  whether to add the `mlrun/scrape-metrics` label to this run's resources
-        :param returns:         List of configurations for how to log the returning values from the handler's run
-                                (as artifacts or results). The list's length must be equal to the amount of returning
-                                objects. A configuration may be given as:
+        :param returns:         List of log hints - configurations for how to log the returning values from the
+                                handler's run (as artifacts or results). The list's length must be equal to the
+                                amount of returning objects. A log hint may be given as:
 
-                                * A string of the key to use to log the returning value as result or as an artifact.
-                                  To specify The artifact type, it is possible to pass a string in the following
-                                  structure:
-                                  "<key> : <type>". Available artifact types can be seen in `mlrun.ArtifactType`. If no
-                                  artifact type is specified, the object's default artifact type will be used.
-                                * A dictionary of configurations to use when logging. Further info per object type and
-                                  artifact type can be given there. The artifact key must appear in the dictionary as
-                                  "key": "the_key".
+                                * A ``LogHint`` object with the key and extra configurations.
+                                * A "shortcut" string of the key to use to log the returning value as result or as
+                                  an artifact. To specify The artifact type, it is possible to pass a string in the
+                                  following structure: "<key> : <type>". Available artifact types can be seen in
+                                  `mlrun.ArtifactType`. If no artifact type is specified, the object's default
+                                  artifact type will be used. Itemization can also be specified before the key using
+                                  the following structure: "<unbundle-level> * <key>". If unbundle level is not
+                                  specified, the default is full unbundling.
         :param auto_build:      when set to True and the function require build it will be built on the first
                                 function run, use only if you dont plan on changing the build config between runs
         :return: mlrun_pipelines.models.PipelineNodeWrapper
@@ -795,19 +870,17 @@ class BaseRuntime(ModelObj):
                     mlrun.runtimes.nuclio.serving.serving_subkind
                 )
 
-        self.spec.build.functionSourceCode = b64encode(body.encode("utf-8")).decode(
-            "utf-8"
-        )
+        self.spec.build.functionSourceCode = mlrun.utils.helpers.encode_user_code(body)
         if with_doc:
             update_function_entry_points(self, body)
         return self
 
     def with_requirements(
         self,
-        requirements: Optional[list[str]] = None,
+        requirements: list[str] | None = None,
         overwrite: bool = False,
         prepare_image_for_deploy: bool = True,
-        requirements_file: Optional[str] = "",
+        requirements_file: str | None = "",
     ):
         """add package requirements from file or list to build spec.
 
@@ -933,6 +1006,35 @@ class BaseRuntime(ModelObj):
                         if "default" in p:
                             line += f", default={p['default']}"
                         print("    " + line)
+
+    def remove_auth_secret_volumes(self):
+        secret_name_prefix = (
+            mlrun.mlconf.secret_stores.kubernetes.auth_secret_name.format(
+                hashed_access_key=""
+            )
+        )
+        volumes = self.spec.volumes or []
+        mounts = self.spec.volume_mounts or []
+
+        volumes_to_remove = set()
+
+        # Identify volumes to remove
+        for vol in volumes:
+            secret_name = mlrun.utils.get_in(vol, "secret.secretName", "")
+
+            # Pattern of auth secret volumes
+            if secret_name.startswith(secret_name_prefix):
+                volumes_to_remove.add(vol["name"])
+
+        # Filter out only the matched volumes
+        self.spec.volumes = [
+            volume for volume in volumes if volume["name"] not in volumes_to_remove
+        ]
+
+        # Filter out matching mounts
+        self.spec.volume_mounts = [
+            mount for mount in mounts if mount["name"] not in volumes_to_remove
+        ]
 
     def skip_image_enrichment(self):
         return False

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+import copy
 import typing
 from http import HTTPStatus
 
@@ -41,10 +41,8 @@ class MLRunHTTPError(MLRunBaseError, requests.HTTPError):
     def __init__(
         self,
         *args,
-        response: typing.Optional[
-            typing.Union[requests.Response, aiohttp.ClientResponse]
-        ] = None,
-        status_code: typing.Optional[int] = None,
+        response: typing.Union[requests.Response, aiohttp.ClientResponse] | None = None,
+        status_code: int | None = None,
         **kwargs,
     ):
         # because response object is probably with an error, it returns False, so we
@@ -86,7 +84,7 @@ def raise_for_status(
         requests.Response,
         aiohttp.ClientResponse,
     ],
-    message: typing.Optional[str] = None,
+    message: str | None = None,
 ):
     """
     Raise a specific MLRunSDK error depending on the given response status code.
@@ -107,7 +105,7 @@ def raise_for_status(
             raise MLRunHTTPError(error_message, response=response) from exc
 
 
-def err_for_status_code(status_code: int, message: typing.Optional[str] = None):
+def err_for_status_code(status_code: int, message: str | None = None):
     """
     Return a specific MLRunSDK error depending on the given response status code.
     If no specific error exists, returns an MLRunHTTPError.
@@ -170,6 +168,14 @@ class MLRunBadRequestError(MLRunHTTPStatusError):
     error_status_code = HTTPStatus.BAD_REQUEST.value
 
 
+class MLRunMethodNotAllowedError(MLRunHTTPStatusError):
+    error_status_code = HTTPStatus.METHOD_NOT_ALLOWED.value
+
+
+class MLRunUnprocessableEntityError(MLRunHTTPStatusError):
+    error_status_code = HTTPStatus.UNPROCESSABLE_ENTITY.value
+
+
 class MLRunInvalidArgumentError(MLRunHTTPStatusError, ValueError):
     error_status_code = HTTPStatus.BAD_REQUEST.value
 
@@ -230,6 +236,13 @@ class MLRunTSDBConnectionFailureError(MLRunHTTPStatusError, ValueError):
     error_status_code = HTTPStatus.BAD_REQUEST.value
 
 
+class MLRunMissingProjectError(MLRunBadRequestError):
+    default_message = "Project must be provided"
+
+    def __init__(self, message=None):
+        super().__init__(message or self.default_message)
+
+
 class MLRunRetryExhaustedError(Exception):
     pass
 
@@ -242,6 +255,17 @@ class MLRunValueError(ValueError):
     pass
 
 
+class MLRunEmptySampleDFError(MLRunValueError):
+    """Raised when a model monitoring application's sample DataFrame is empty.
+
+    Distinct from a generic :class:`MLRunValueError` so that callers iterating over
+    monitoring windows can skip windows with no inference data without swallowing
+    unrelated value errors (e.g. missing endpoint details or storage failures).
+    """
+
+    pass
+
+
 class MLRunFatalFailureError(Exception):
     """
     Internal exception meant to be used inside mlrun.utils.helpers.retry_until_successful to signal the loop not to
@@ -250,10 +274,33 @@ class MLRunFatalFailureError(Exception):
     """
 
     def __init__(
-        self, *args, original_exception: typing.Optional[Exception] = None, **kwargs
+        self, *args, original_exception: Exception | None = None, **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
         self.original_exception = original_exception
+
+
+class ModelRunnerError(MLRunBaseError):
+    def __init__(self, models_errors: dict[str, str], *args) -> None:
+        self.models_errors = models_errors
+        super().__init__(self.__repr__(), *args)
+
+    def __repr__(self):
+        return "ModelRunnerError: " + ";\n".join(
+            f"{model} {msg}" for model, msg in self.models_errors.items()
+        )
+
+    def __copy__(self):
+        return type(self)(models_errors=self.models_errors)
+
+    def __deepcopy__(self, memo):
+        return type(self)(copy.deepcopy(self.models_errors, memo))
+
+    def get_errors(self):
+        return self.models_errors
+
+    def get_model_error(self, model: str):
+        return self.models_errors.get(model)
 
 
 STATUS_ERRORS = {

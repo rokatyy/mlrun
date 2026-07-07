@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import unittest.mock
 
 from fastapi.testclient import TestClient
@@ -46,26 +46,126 @@ class TestMpiV1Runtime(TestRuntimeBase):
             mpijob_function = self._generate_runtime(self.runtime_kind)
             self.deploy(db, mpijob_function)
             run = mpijob_function.run(
-                artifact_path="v3io:///mypath",
+                output_path="v3io:///mypath",
                 watch=False,
                 auth_info=mlrun.common.schemas.AuthInfo(),
             )
 
             assert run.status.state == "running"
 
-    def _mock_get_namespaced_custom_object(self, workers=1):
+    def test_run_with_affinity_and_tolerations(
+        self, db: Session, client: TestClient, k8s_secrets_mock
+    ):
+        """
+        Verify that affinity and tolerations are correctly applied to MPIJob pod templates.
+
+        This test ensures that when affinity and tolerations are set,
+        they are properly serialized and applied to the pod template without triggering type
+        validation errors during job submission.
+
+        """
+        self._mock_list_pods()
+        self._mock_create_namespaced_custom_object()
+        self._mock_get_namespaced_custom_object(workers=1)
+
+        mpijob_function = self._generate_runtime(self.runtime_kind)
+
+        # Create V1 affinity and tolerations objects
+        affinity = k8s_client.V1Affinity(
+            node_affinity=k8s_client.V1NodeAffinity(
+                required_during_scheduling_ignored_during_execution=k8s_client.V1NodeSelector(
+                    node_selector_terms=[
+                        k8s_client.V1NodeSelectorTerm(
+                            match_expressions=[
+                                k8s_client.V1NodeSelectorRequirement(
+                                    key="app.iguazio.com/lifecycle",
+                                    operator="NotIn",
+                                    values=["preemptible"],
+                                )
+                            ]
+                        )
+                    ]
+                )
+            )
+        )
+
+        tolerations = [
+            k8s_client.V1Toleration(
+                key="nvidia.com/gpu",
+                operator="Equal",
+                value="true",
+                effect="NoSchedule",
+            )
+        ]
+
+        mpijob_function.with_node_selection(
+            affinity=affinity,
+            tolerations=tolerations,
+        )
+
+        self.deploy(db, mpijob_function)
+
+        run = mpijob_function.run(
+            output_path="v3io:///mypath",
+            watch=False,
+            auth_info=mlrun.common.schemas.AuthInfo(),
+        )
+
+        assert run.status.state == "running"
+
+    def test_run_launcher_status_update(
+        self, db: Session, client: TestClient, k8s_secrets_mock
+    ):
+        self._mock_list_pods()
+        self._mock_create_namespaced_custom_object()
+
+        # case 1: launcher pod is active
+        self._mock_get_namespaced_custom_object(workers=1)
+
+        mpijob_function = self._generate_runtime(self.runtime_kind)
+        self.deploy(db, mpijob_function)
+        run = mpijob_function.run(
+            output_path="v3io:///mypath",
+            watch=False,
+            auth_info=mlrun.common.schemas.AuthInfo(),
+        )
+
+        launcher_pod_name = get_k8s_helper().crdapi.get_namespaced_custom_object()[
+            "metadata"
+        ]["name"]
+        expected_prefix = f"launcher pod {launcher_pod_name} is in state running"
+        assert expected_prefix in run.status.status_text
+        assert run.status.state == "running"
+
+        # case 2: launcher pod has not started yet
+        self._mock_get_namespaced_custom_object(workers=1, active=False)
+
+        mpijob_function = self._generate_runtime(self.runtime_kind)
+        self.deploy(db, mpijob_function)
+        run = mpijob_function.run(
+            output_path="v3io:///mypath",
+            watch=False,
+            auth_info=mlrun.common.schemas.AuthInfo(),
+        )
+
+        assert run.status.state == "pending"
+        assert "awaiting launcher pod startup" in run.status.status_text
+
+    def _mock_get_namespaced_custom_object(self, workers=1, active=True):
+        launcher_pod_name = f"{self.name}"
         get_k8s_helper().crdapi.get_namespaced_custom_object = unittest.mock.Mock(
             return_value={
                 "status": {
                     "replicaStatuses": {
                         "Launcher": {
-                            "active": 1,
+                            "active": active,
                         },
                         "Worker": {
                             "active": workers,
                         },
                     }
                 },
+                "metadata": {"name": launcher_pod_name},
             }
         )
 

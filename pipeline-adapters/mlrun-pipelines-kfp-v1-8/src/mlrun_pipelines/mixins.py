@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import json
+
+import yaml
+from orjson import orjson
 
 import mlrun
 from mlrun_pipelines.common.helpers import PROJECT_ANNOTATION
@@ -67,13 +68,30 @@ class PipelineProviderMixin:
                 else:
                     raise NotImplementedError(f"Unknown action: {action}")
 
-        return mlrun.mlconf.default_project
+        raise mlrun.errors.MLRunMissingProjectError()
+
+    def resolve_auth_token_name_from_workflow_manifest(self, yaml_data) -> str | None:
+        """
+        Extract auth_token_name from pipeline manifest env var.
+
+        :param workflow_manifest: The pipeline manifest dict
+        :return: The auth_token_name if found, None otherwise
+        """
+        workflow_manifest = yaml.safe_load(yaml_data)
+        templates = workflow_manifest.get("spec", {}).get("templates", [])
+        for template in templates:
+            container = template.get("container", {})
+            env_vars = container.get("env", [])
+            for env_var in env_vars:
+                if env_var.get("name") == "MLRUN_AUTH_WITH_OAUTH_TOKEN__TOKEN_NAME":
+                    return env_var.get("value")
+        return None
 
     @staticmethod
     def resolve_error_from_pipeline(pipeline):
         if pipeline.run.status in [RunStatuses.error, RunStatuses.failed]:
             # status might not be available just yet
-            workflow_status = json.loads(
+            workflow_status = orjson.loads(
                 pipeline.pipeline_runtime.workflow_manifest
             ).get("status", {})
             for node in workflow_status.get("nodes", {}).values():
@@ -81,3 +99,4 @@ class PipelineProviderMixin:
                 if node["type"] not in ["DAG", "Skipped"]:
                     if message := node.get("message"):
                         return message
+        return None

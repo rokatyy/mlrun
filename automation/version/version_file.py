@@ -19,7 +19,7 @@ import os
 import pathlib
 import re
 import subprocess
-import typing
+import sys
 
 import packaging.version
 
@@ -49,6 +49,14 @@ def main():
         "is-stable", help="check if the version is stable"
     )
     is_stable_parser.add_argument("version", type=str)
+
+    promotion_inputs_parser = subparsers.add_parser(
+        "promotion-inputs",
+        help="resolve release-promotion inputs as key=value lines "
+        "(version, previous_version, prerelease, make_latest)",
+    )
+    promotion_inputs_parser.add_argument("--version", type=str, required=True)
+    promotion_inputs_parser.add_argument("--previous-version", type=str, default="")
 
     subparsers.add_parser("current-version", help="get the current version")
     next_version_parser = subparsers.add_parser("next-version", help="get next version")
@@ -93,6 +101,22 @@ def main():
         is_stable = is_stable_version(args.version)
         print(str(is_stable).lower())
 
+    elif args.command == "promotion-inputs":
+        try:
+            resolved = resolve_promotion_inputs(
+                version=args.version,
+                previous_version=args.previous_version,
+            )
+        except (
+            ValueError,
+            packaging.version.InvalidVersion,
+            subprocess.CalledProcessError,
+        ) as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+        for key, value in resolved.items():
+            print(f"{key}={value}")
+
     elif args.command == "is-feature-branch":
         print(str(is_feature_branch()).lower())
 
@@ -128,6 +152,11 @@ def get_current_version(
                 continue
 
             semver_tag = packaging.version.parse(tag.removeprefix("v"))
+
+            # Local versions (e.g. 1.10.1-rc2+ui-navbar) are used for feature/testing builds and
+            # should not affect release version calculations on non-feature branches.
+            if semver_tag.local and not feature_name:
+                continue
 
             # compare base versions on both base and current tag
             # if current tag version (e.g.: 1.4.0) is smaller than base version (e.g.: 1.5.0)
@@ -172,10 +201,9 @@ def get_current_version(
             # tag is not rc, not feature branch, and not older than current tag. use it
             found_tag = semver_tag
 
-        # stop here because
-        # we either have a tag
-        # or, moving back in time wont find newer tags on same branch timeline
-        break
+        # stop iteration to older commits if we already have a valid tag
+        if found_tag:
+            break
 
     # nothing to bump, just return the version
     if not found_tag:
@@ -187,11 +215,60 @@ def get_current_version(
     return version_to_mlrun_version(found_tag)
 
 
+def get_previous_version(target_version: str) -> str:
+    """Greatest tag below target_version as a raw tag (e.g. "1.10.3"), or "" if none."""
+    target = packaging.version.Version(target_version)
+    candidates = []
+    for tag in _run_command("git", args=["tag", "--list"]).split():
+        if not tag.startswith("v"):
+            continue
+        raw = tag.removeprefix("v")
+        try:
+            parsed = packaging.version.Version(raw)
+        except packaging.version.InvalidVersion:
+            continue
+        if parsed < target and (target.is_prerelease or not parsed.is_prerelease):
+            candidates.append((parsed, raw))
+    return max(candidates, default=(None, ""))[1]
+
+
+def resolve_promotion_inputs(
+    version: str,
+    previous_version: str = "",
+) -> dict[str, str]:
+    """Resolve version, previous_version, prerelease and make_latest for a promotion."""
+    version = version.strip()
+    previous_version = previous_version.strip()
+    if not version:
+        raise ValueError("version must not be empty")
+    try:
+        packaging.version.Version(version)
+    except packaging.version.InvalidVersion as exc:
+        raise ValueError(f"'{version}' is not a valid version") from exc
+
+    if not previous_version:
+        previous_version = get_previous_version(version)
+        if not previous_version:
+            raise ValueError(
+                f"could not derive a previous version (no tag below {version}); "
+                "pass --previous-version explicitly"
+            )
+
+    # stable (X.Y.Z) -> latest GA release; anything else (e.g. rc) -> prerelease
+    stable = is_stable_version(version)
+    return {
+        "version": version,
+        "previous_version": previous_version,
+        "prerelease": str(not stable).lower(),
+        "make_latest": str(stable).lower(),
+    }
+
+
 def resolve_next_version(
     mode: str,
     current_version: packaging.version.Version,
     base_version: packaging.version.Version,
-    feature_name: typing.Optional[str] = None,
+    feature_name: str | None = None,
 ):
     if (
         base_version.major > current_version.major
@@ -276,7 +353,10 @@ def create_or_update_version_file(mlrun_version: str, version_file_path: str):
     ):
         feature_name = resolve_feature_name(git_branch)
         if not mlrun_version.endswith(feature_name):
-            mlrun_version = f"{mlrun_version}+{feature_name}"
+            # Use "." separator if version already has a "+" (build metadata),
+            # since semver only allows one "+" segment
+            sep = "." if "+" in mlrun_version else "+"
+            mlrun_version = f"{mlrun_version}{sep}{feature_name}"
             logger.debug(f"With feature_name: {mlrun_version = }")
 
     # Check if the provided version is a semver and followed by a "-"
@@ -342,7 +422,7 @@ def is_feature_branch() -> bool:
     return get_feature_branch_feature_name() != ""
 
 
-def get_feature_branch_feature_name() -> typing.Optional[str]:
+def get_feature_branch_feature_name() -> str | None:
     current_branch = _run_command(
         "git", args=["rev-parse", "--abbrev-ref", "HEAD"]
     ).strip()

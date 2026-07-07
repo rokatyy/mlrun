@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import base64
 import json
 import os
-import typing
 import unittest
 
 import deepdiff
@@ -99,15 +98,15 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
         self,
         expected_runtime_class_name="spark",
         assert_create_custom_object_called=True,
-        expected_volumes: typing.Optional[list] = None,
-        expected_driver_volume_mounts: typing.Optional[list] = None,
-        expected_executor_volume_mounts: typing.Optional[list] = None,
+        expected_volumes: list | None = None,
+        expected_driver_volume_mounts: list | None = None,
+        expected_executor_volume_mounts: list | None = None,
         expected_driver_java_options=None,
         expected_executor_java_options=None,
-        expected_driver_resources: typing.Optional[dict] = None,
-        expected_executor_resources: typing.Optional[dict] = None,
-        expected_cores: typing.Optional[dict] = None,
-        expected_code: typing.Optional[str] = None,
+        expected_driver_resources: dict | None = None,
+        expected_executor_resources: dict | None = None,
+        expected_cores: dict | None = None,
+        expected_code: str | None = None,
     ):
         if assert_create_custom_object_called:
             framework.utils.singletons.k8s.get_k8s_helper().crdapi.create_namespaced_custom_object.assert_called_once()
@@ -151,9 +150,9 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
     def _assert_volume_and_mounts(
         self,
         body: dict,
-        expected_volumes: typing.Optional[list] = None,
-        expected_driver_volume_mounts: typing.Optional[list] = None,
-        expected_executor_volume_mounts: typing.Optional[list] = None,
+        expected_volumes: list | None = None,
+        expected_driver_volume_mounts: list | None = None,
+        expected_executor_volume_mounts: list | None = None,
     ):
         if expected_volumes is not None:
             sanitized_volumes = self._sanitize_list_for_serialization(expected_volumes)
@@ -615,6 +614,305 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
         ):
             runtime.with_node_selection(node_selector=function_node_selector)
 
+    @pytest.mark.parametrize(
+        "function_node_selector,driver_node_selector,executor_node_selector,"
+        "driver_affinity,executor_affinity,driver_tolerations,executor_tolerations,"
+        "preemption_mode,expected_driver_node_selector,expected_executor_node_selector,"
+        "expect_driver_anti_affinity,expect_executor_anti_affinity,"
+        "expected_driver_tolerations,expected_executor_tolerations",
+        [
+            # Case: prevent mode removes tolerations and adds anti-affinity
+            (
+                {"function-label": "val"},
+                None,
+                None,
+                None,
+                None,
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                "prevent",
+                {
+                    "function-label": "val"
+                },  # remains because it's not a preemptible selector
+                {"function-label": "val"},
+                False,
+                False,
+                [],  # tolerations removed
+                [],
+            ),
+            # Case: constrain mode keeps tolerations and sets required affinity
+            (
+                {"function-label": "val"},
+                None,
+                None,
+                None,
+                None,
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                "constrain",
+                {"function-label": "val"},
+                {"function-label": "val"},
+                False,
+                False,
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+            ),
+            # Case: allow mode leaves everything untouched
+            (
+                {"function-label": "val"},
+                None,
+                None,
+                {"some": "affinity"},
+                {"other": "affinity"},
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                "allow",
+                {"function-label": "val"},
+                {"function-label": "val"},
+                False,
+                False,
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+            ),
+            # Case: allow mode keeps preemptible selector and adds tolerations
+            (
+                {"function-label": "val"},
+                {"label-1": "val1"},
+                {"label-1": "val1"},
+                {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchExpressions": [
+                                        {
+                                            "key": "spot",
+                                            "operator": "In",
+                                            "values": ["true"],
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchExpressions": [
+                                        {
+                                            "key": "spot",
+                                            "operator": "In",
+                                            "values": ["true"],
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                None,
+                None,
+                "allow",
+                {"label-1": "val1"},
+                {"label-1": "val1"},
+                False,
+                False,
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+            ),
+        ],
+    )
+    def test_preemption_mode_node_selector_enrichment(
+        self,
+        db: sqlalchemy.orm.Session,
+        k8s_secrets_mock,
+        function_node_selector,
+        driver_node_selector,
+        executor_node_selector,
+        driver_affinity,
+        executor_affinity,
+        driver_tolerations,
+        executor_tolerations,
+        preemption_mode,
+        expected_driver_node_selector,
+        expected_executor_node_selector,
+        expect_driver_anti_affinity,
+        expect_executor_anti_affinity,
+        expected_driver_tolerations,
+        expected_executor_tolerations,
+    ):
+        runtime: mlrun.runtimes.Spark3Runtime = self._generate_runtime(
+            set_resources=False
+        )
+
+        runtime.with_driver_preemption_mode(preemption_mode)
+        runtime.with_executor_preemption_mode(preemption_mode)
+        runtime.with_node_selection(node_selector=function_node_selector)
+        runtime.with_driver_node_selection(
+            node_selector=driver_node_selector,
+            affinity=driver_affinity,
+            tolerations=driver_tolerations,
+        )
+        runtime.with_executor_node_selection(
+            node_selector=executor_node_selector,
+            affinity=executor_affinity,
+            tolerations=executor_tolerations,
+        )
+
+        # Preemptible config (to match values in tolerations)
+        kubernetes_api_client = kubernetes.client.ApiClient()
+        mlrun.mlconf.preemptible_nodes.tolerations = base64.b64encode(
+            json.dumps(
+                [
+                    {
+                        "key": "spot",
+                        "operator": "Equal",
+                        "value": "true",
+                        "effect": "NoSchedule",
+                    }
+                ],
+            ).encode("utf-8")
+        )
+        mlrun.mlconf.preemptible_nodes.node_selector = base64.b64encode(
+            json.dumps({"label-1": "val1"}).encode("utf-8")
+        )
+
+        self.execute_function(runtime)
+        body = self._get_custom_object_creation_body()
+
+        driver = body["spec"]["driver"]
+        executor = body["spec"]["executor"]
+
+        # Assert actual node selectors
+        assert driver["nodeSelector"] == expected_driver_node_selector
+        assert executor["nodeSelector"] == expected_executor_node_selector
+
+        def normalize_tolerations(val):
+            return val if val is not None else []
+
+        # Assert tolerations
+        assert kubernetes_api_client.sanitize_for_serialization(
+            driver.get("tolerations", [])
+        ) == kubernetes_api_client.sanitize_for_serialization(
+            normalize_tolerations(expected_driver_tolerations)
+        )
+
+        assert kubernetes_api_client.sanitize_for_serialization(
+            executor.get("tolerations", [])
+        ) == kubernetes_api_client.sanitize_for_serialization(
+            normalize_tolerations(expected_executor_tolerations)
+        )
+
+        # Assert affinity contents
+        def assert_affinity(spec, expect_anti_affinity: bool):
+            affinity = spec.get("affinity")
+            required = None
+
+            if affinity and affinity.get("nodeAffinity"):
+                required = affinity.get("nodeAffinity").get(
+                    "requiredDuringSchedulingIgnoredDuringExecution"
+                )
+
+            if expect_anti_affinity:
+                # Required anti-affinity should be present and non-empty
+                assert required is not None
+                assert len(required.get("nodeSelectorTerms")) > 0
+            else:
+                # Either no required affinity or an empty set of terms
+                assert required is None or isinstance(
+                    required.get("nodeSelectorTerms"), list
+                )
+
+        assert_affinity(driver, expect_driver_anti_affinity)
+        assert_affinity(executor, expect_executor_anti_affinity)
+
     def test_run_with_host_path_volume(
         self, db: sqlalchemy.orm.Session, k8s_secrets_mock
     ):
@@ -810,11 +1108,13 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
         client: fastapi.testclient.TestClient,
         k8s_secrets_mock,
     ):
+        self.project = "test-project3"
         # TODO - this test needs to be moved outside of the api runtimes tests and into the spark runtime sdk tests
         #   once moved, the `watch=False` can be removed
         import mlrun.feature_store as fstore
 
         fv = fstore.FeatureVector("my-vector", features=[])
+        fv.metadata.project = self.project
         fv.save = unittest.mock.Mock()
 
         runtime = self._generate_runtime()
@@ -834,8 +1134,7 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
 
         # remote-spark is not a merge engine but a runtime
         with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
-            fstore.get_offline_features(
-                fv,
+            fv.get_offline_features(
                 with_indexes=True,
                 timestamp_for_filtering="timestamp",
                 engine="remote-spark",
@@ -843,12 +1142,10 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
                 target=ParquetTarget(),
             )
 
-        self.project = "default"
         self.project_default_function_node_selector = {}
         self._create_project(client)
 
-        resp = fstore.get_offline_features(
-            fv,
+        resp = fv.get_offline_features(
             with_indexes=True,
             timestamp_for_filtering="timestamp",
             engine="spark",
@@ -859,7 +1156,7 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
         runspec = resp.run.spec.to_dict()
         expected_runspec = {
             "parameters": {
-                "vector_uri": "store://feature-vectors/default/my-vector",
+                "vector_uri": f"store://feature-vectors/{self.project}/my-vector",
                 "target": {
                     "name": "parquet",
                     "kind": "parquet",
@@ -944,4 +1241,105 @@ class TestSpark3Runtime(services.api.tests.unit.runtimes.base.TestRuntimeBase):
         assert (
             str(exc.value) == "Sparkjob does not support loading source code on run, "
             "use func.with_source_archive(pull_at_runtime=False)"
+        )
+
+    def test_mount_secret_token_to_spark_driver_and_executor(
+        self, db: sqlalchemy.orm.Session, k8s_secrets_mock
+    ):
+        """
+        Test that auth token secret is mounted to both driver and executor pods.
+        This test addresses ML-11590.
+        """
+        import mlrun.common.constants
+        from mlrun.common.types import AuthenticationMode
+
+        token_name = "test-token"
+
+        runtime: mlrun.runtimes.Spark3Runtime = self._generate_runtime()
+        runtime.metadata.name = "test-spark-auth-mount"
+        runtime.metadata.project = self.project
+
+        # Create a mock secret
+        mock_secret = kubernetes.client.V1Secret(
+            metadata=kubernetes.client.V1ObjectMeta(
+                name="mlrun-auth-secrets.abcdef123456"
+            ),
+            data={"tokensFile": base64.b64encode(b"dummy-token").decode("utf-8")},
+        )
+
+        # Set authentication mode to IG4 to enable token mounting
+        original_auth_mode = mlrun.mlconf.httpdb.authentication.mode
+        mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO_V4
+
+        # Get the existing k8s helper and add our mocks to it
+        k8s_helper = framework.utils.singletons.k8s.get_k8s_helper()
+        k8s_helper._get_user_token_secret = unittest.mock.Mock(return_value=mock_secret)
+        k8s_helper.get_user_secret_tokens_as_igz_yml_data = unittest.mock.Mock(
+            return_value=""
+        )
+        k8s_helper.get_project_secret_keys = unittest.mock.Mock(return_value=[])
+
+        try:
+            with (
+                unittest.mock.patch(
+                    "services.api.crud.secrets.Secrets.list_project_secrets",
+                    return_value=mlrun.common.schemas.SecretsData(
+                        provider="kubernetes", secrets={"tokensFile": "dummy-token"}
+                    ),
+                ),
+                unittest.mock.patch(
+                    "services.api.utils.helpers.resolve_auth_token_name",
+                    return_value=token_name,
+                ),
+            ):
+                # Execute function with auth in run_spec
+                run_spec = {"parameters": {}, "auth": {"token_name": token_name}}
+                self.execute_function(runtime, run_spec=run_spec)
+        finally:
+            # Restore original auth mode
+            mlrun.mlconf.httpdb.authentication.mode = original_auth_mode
+
+        # Get the created SparkApplication CRD
+        body = self._get_custom_object_creation_body()
+
+        # Verify that the auth secret is mounted to both driver and executor
+        expected_secret_volume_mount_path = (
+            mlrun.common.constants.MLRUN_JOB_AUTH_SECRET_PATH
+        )
+
+        # Check driver volume mounts
+        driver_volume_mounts = body["spec"]["driver"]["volumeMounts"]
+        driver_auth_mount = [
+            vm
+            for vm in driver_volume_mounts
+            if vm["mountPath"] == expected_secret_volume_mount_path
+        ]
+        assert len(driver_auth_mount) == 1, (
+            f"Auth secret should be mounted to driver. "
+            f"Expected mount path: {expected_secret_volume_mount_path}. "
+            f"Actual mounts: {driver_volume_mounts}"
+        )
+
+        # Check executor volume mounts
+        executor_volume_mounts = body["spec"]["executor"]["volumeMounts"]
+        executor_auth_mount = [
+            vm
+            for vm in executor_volume_mounts
+            if vm["mountPath"] == expected_secret_volume_mount_path
+        ]
+        assert len(executor_auth_mount) == 1, (
+            "Auth secret should be mounted to executor"
+        )
+
+        # Verify the secret volume is in the volumes list
+        volumes = body["spec"]["volumes"]
+        auth_volumes = [
+            vol
+            for vol in volumes
+            if vol.get("secret", {}).get("secretName") == mock_secret.metadata.name
+        ]
+        assert len(auth_volumes) == 1, (
+            f"Auth secret volume should be in volumes list. "
+            f"Expected secret name: {mock_secret.metadata.name}. "
+            f"Actual volumes: {volumes}"
         )

@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
+import inspect
 import math
 import tarfile
 import tempfile
 import typing
-import warnings
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
@@ -26,7 +26,7 @@ import mlrun.datastore
 
 
 def parse_kafka_url(
-    url: str, brokers: typing.Optional[typing.Union[list, str]] = None
+    url: str, brokers: typing.Union[list, str] | None = None
 ) -> tuple[str, list]:
     """Generating Kafka topic and adjusting a list of bootstrap servers.
 
@@ -71,7 +71,7 @@ def upload_tarball(source_dir, target, secrets=None):
 
 def filter_df_start_end_time(
     df: typing.Union[pd.DataFrame, typing.Iterator[pd.DataFrame]],
-    time_column: typing.Optional[str] = None,
+    time_column: str | None = None,
     start_time: pd.Timestamp = None,
     end_time: pd.Timestamp = None,
 ) -> typing.Union[pd.DataFrame, typing.Iterator[pd.DataFrame]]:
@@ -151,7 +151,6 @@ def _generate_sql_query_with_time_filter(
     table = sqlalchemy.Table(
         table_name,
         sqlalchemy.MetaData(),
-        autoload=True,
         autoload_with=engine,
     )
     query = sqlalchemy.select(table)
@@ -168,19 +167,10 @@ def _generate_sql_query_with_time_filter(
     return query, parse_dates
 
 
-def get_kafka_brokers_from_dict(options: dict, pop=False) -> typing.Optional[str]:
+def get_kafka_brokers_from_dict(options: dict, pop=False) -> str | None:
     get_or_pop = options.pop if pop else options.get
     kafka_brokers = get_or_pop("kafka_brokers", None)
-    if kafka_brokers:
-        return kafka_brokers
-    kafka_bootstrap_servers = get_or_pop("kafka_bootstrap_servers", None)
-    if kafka_bootstrap_servers:
-        warnings.warn(
-            "The 'kafka_bootstrap_servers' parameter is deprecated and will be removed in "
-            "1.9.0. Please pass the 'kafka_brokers' parameter instead.",
-            FutureWarning,
-        )
-    return kafka_bootstrap_servers
+    return kafka_brokers
 
 
 def transform_list_filters_to_tuple(additional_filters):
@@ -200,12 +190,12 @@ def validate_additional_filters(additional_filters):
     for filter_tuple in additional_filters:
         if filter_tuple == () or filter_tuple == []:
             continue
-        if not isinstance(filter_tuple, (list, tuple)):
+        if not isinstance(filter_tuple, list | tuple):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"mlrun supports additional_filters only as a list of tuples."
                 f" Current additional_filters: {additional_filters}"
             )
-        if isinstance(filter_tuple[0], (list, tuple)):
+        if isinstance(filter_tuple[0], list | tuple):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"additional_filters does not support nested list inside filter tuples except in -in- logic."
                 f" Current filter_tuple: {filter_tuple}."
@@ -218,7 +208,153 @@ def validate_additional_filters(additional_filters):
         col_name, op, value = filter_tuple
         if isinstance(value, float) and math.isnan(value):
             raise mlrun.errors.MLRunInvalidArgumentError(nan_error_message)
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, list | tuple):
             for sub_value in value:
                 if isinstance(sub_value, float) and math.isnan(sub_value):
                     raise mlrun.errors.MLRunInvalidArgumentError(nan_error_message)
+
+
+class KafkaParameters:
+    def __init__(self, kwargs: dict | None = None):
+        import kafka
+
+        if kwargs is None:
+            kwargs = {}
+        self._kafka = kafka
+        self._kwargs = kwargs
+        self._client_configs = {
+            "consumer": self._kafka.KafkaConsumer.DEFAULT_CONFIG,
+            "producer": self._kafka.KafkaProducer.DEFAULT_CONFIG,
+            "admin": self._kafka.KafkaAdminClient.DEFAULT_CONFIG,
+        }
+        self._custom_attributes = {
+            "max_workers": "",
+            "brokers": "",
+            "topics": "",
+            "group": "",
+            "initial_offset": "",
+            "partitions": "",
+            "sasl": "",
+            "worker_allocation_mode": "",
+            # for Nuclio with Confluent Kafka
+            "tls_enable": "",
+            "tls": "",
+            "new_topic": "",
+            "nuclio_annotations": "",
+        }
+        self._reference_dicts = (
+            self._custom_attributes,
+            self._kafka.KafkaAdminClient.DEFAULT_CONFIG,
+            self._kafka.KafkaProducer.DEFAULT_CONFIG,
+            self._kafka.KafkaConsumer.DEFAULT_CONFIG,
+        )
+
+        self._validate_keys()
+
+    def _validate_keys(self) -> None:
+        for key in self._kwargs:
+            if all(key not in d for d in self._reference_dicts):
+                raise ValueError(
+                    f"Key '{key}' not found in any of the Kafka reference dictionaries"
+                )
+
+    def _get_config(self, client_type: str) -> dict:
+        res = {
+            k: self._kwargs[k]
+            for k in self._kwargs.keys() & self._client_configs[client_type].keys()
+        }
+        if sasl := self._kwargs.get("sasl"):
+            res |= {
+                "security_protocol": self._kwargs.get(
+                    "security_protocol", "SASL_PLAINTEXT"
+                ),
+                "sasl_mechanism": sasl["mechanism"],
+                "sasl_plain_username": sasl["user"],
+                "sasl_plain_password": sasl["password"],
+            }
+        return res
+
+    def consumer(self) -> dict:
+        return self._get_config("consumer")
+
+    def producer(self) -> dict:
+        return self._get_config("producer")
+
+    def admin(self) -> dict:
+        return self._get_config("admin")
+
+    def sasl(
+        self, *, usr: str | None = None, pwd: str | None = None
+    ) -> dict[str, typing.Union[str, bool]]:
+        res = self._kwargs.get("sasl", {})
+        usr = usr or self._kwargs.get("sasl_plain_username")
+        pwd = pwd or self._kwargs.get("sasl_plain_password")
+        if usr and pwd:
+            res["enable"] = True
+            res["user"] = usr
+            res["password"] = pwd
+            res["mechanism"] = self._kwargs.get("sasl_mechanism", "PLAIN")
+            res["handshake"] = self._kwargs.get("sasl_handshake", True)
+        return res
+
+    def tls(self, *, tls_enable: bool | None = None) -> dict[str, bool]:
+        res = self._kwargs.get("tls", {})
+        tls_enable = (
+            tls_enable if tls_enable is not None else self._kwargs.get("tls_enable")
+        )
+        if tls_enable:
+            res["enable"] = tls_enable
+        return res
+
+    def valid_entries_only(self, input_dict: dict) -> dict:
+        valid_keys = set()
+        for ref_dict in self._reference_dicts:
+            valid_keys.update(ref_dict.keys())
+        # Return a new dictionary with only valid keys
+        return {k: v for k, v in input_dict.items() if k in valid_keys}
+
+
+def parse_url(url):
+    if url and url.startswith("v3io://") and not url.startswith("v3io:///"):
+        url = url.replace("v3io://", "v3io:///", 1)
+    parsed_url = urlparse(url)
+    schema = parsed_url.scheme.lower()
+    endpoint = parsed_url.hostname
+
+    # Special handling for WASBS URLs to preserve container information
+    if schema in ["wasbs", "wasb"] and parsed_url.netloc and "@" in parsed_url.netloc:
+        # For wasbs://container@host format, preserve the full netloc as endpoint
+        # This allows the datastore to extract container later
+        endpoint = parsed_url.netloc
+    elif endpoint:
+        # HACK - urlparse returns the hostname after in lower case - we want the original case:
+        # the hostname is a substring of the netloc, in which it's the original case, so we find the indexes of the
+        # hostname in the netloc and take it from there
+        lower_hostname = parsed_url.hostname
+        netloc = str(parsed_url.netloc)
+        lower_netloc = netloc.lower()
+        hostname_index_in_netloc = lower_netloc.index(str(lower_hostname))
+        endpoint = netloc[
+            hostname_index_in_netloc : hostname_index_in_netloc + len(lower_hostname)
+        ]
+        if parsed_url.port:
+            endpoint += f":{parsed_url.port}"
+    return schema, endpoint, parsed_url
+
+
+def accepts_param(func: callable, param_name):
+    sig = inspect.signature(func)
+    return param_name in sig.parameters
+
+
+def parse_s3_bucket_and_key(s3_path: str) -> tuple[str, str]:
+    try:
+        path_parts = s3_path.replace("s3://", "").split("/")
+        bucket = path_parts.pop(0)
+        key = "/".join(path_parts)
+    except Exception as exc:
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            "failed to parse s3 bucket and key"
+        ) from exc
+
+    return bucket, key

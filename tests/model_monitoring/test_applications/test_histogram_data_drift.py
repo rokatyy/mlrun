@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
 from pathlib import Path
-from typing import Any
 from unittest.mock import Mock
 
 import pandas as pd
@@ -23,7 +21,6 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-import mlrun.artifacts.manager
 import mlrun.common.model_monitoring.helpers
 import mlrun.model_monitoring.applications
 import mlrun.model_monitoring.applications.context as mm_context
@@ -32,38 +29,38 @@ from mlrun.common.schemas.model_monitoring.constants import (
     ResultKindApp,
     ResultStatusApp,
 )
+from mlrun.model_monitoring.applications._application_steps import (
+    _ApplicationErrorHandler,
+)
 from mlrun.model_monitoring.applications.histogram_data_drift import (
     DataDriftClassifier,
     HistogramDataDriftApplication,
     InvalidMetricValueError,
     InvalidThresholdValueError,
 )
-from mlrun.utils import Logger
+from mlrun.serving.server import MockEvent
 
 assets_folder = Path(__file__).parent / "assets"
 
 
 @pytest.fixture
+def project(tmp_path: Path) -> mlrun.MlrunProject:
+    project = mlrun.get_or_create_project("temp", allow_cross_project=True)
+    project.artifact_path = str(tmp_path)
+    return project
+
+
+@pytest.fixture
 def application() -> HistogramDataDriftApplication:
-    app = HistogramDataDriftApplication()
+    app = HistogramDataDriftApplication(
+        produce_json_artifact=True, produce_plotly_artifact=True
+    )
     return app
 
 
 @pytest.fixture
 def logger() -> mlrun.utils.Logger:
-    return mlrun.utils.Logger(level=logging.DEBUG, name=__name__)
-
-
-@pytest.fixture
-def monitoring_context() -> Mock:
-    mock_monitoring_context = Mock(spec=mm_context.MonitoringApplicationContext)
-    mock_monitoring_context.log_stream = Logger(
-        name="test_data_drift_app", level=logging.DEBUG
-    )
-    mock_monitoring_context._artifacts_manager = Mock(
-        spec=mlrun.artifacts.manager.ArtifactManager
-    )
-    return mock_monitoring_context
+    return mlrun.utils.Logger(level=logging.DEBUG, name="test_histogram_data_drift_app")
 
 
 class TestDataDriftClassifier:
@@ -106,9 +103,9 @@ class TestDataDriftClassifier:
     def test_status(
         classifier: DataDriftClassifier, value: float, expected_status: ResultStatusApp
     ) -> None:
-        assert (
-            classifier.value_to_status(value) == expected_status
-        ), "The status is different than expected"
+        assert classifier.value_to_status(value) == expected_status, (
+            "The status is different than expected"
+        )
 
 
 class TestApplication:
@@ -177,40 +174,34 @@ class TestApplication:
 
     @staticmethod
     @pytest.fixture
-    def application_kwargs(
+    def monitoring_context(
         sample_df_stats: mlrun.common.model_monitoring.helpers.FeatureStats,
         feature_stats: mlrun.common.model_monitoring.helpers.FeatureStats,
         application: HistogramDataDriftApplication,
-        monitoring_context: Mock,
         logger: mlrun.utils.Logger,
-    ) -> dict[str, Any]:
-        kwargs = {}
-        kwargs["monitoring_context"] = monitoring_context
-        monitoring_context.application_name = application.NAME
-        monitoring_context.sample_df_stats = sample_df_stats
-        monitoring_context.feature_stats = feature_stats
-        monitoring_context.sample_df = Mock(spec=pd.DataFrame)
-        monitoring_context.start_infer_time = Mock(spec=pd.Timestamp)
-        monitoring_context.end_infer_time = Mock(spec=pd.Timestamp)
-        monitoring_context.latest_request = Mock(spec=pd.Timestamp)
-        monitoring_context.endpoint_id = Mock(spec=str)
-        monitoring_context.dict_to_histogram = (
-            mm_context.MonitoringApplicationContext.dict_to_histogram
+        project: mlrun.MlrunProject,
+    ) -> mm_context.MonitoringApplicationContext:
+        monitoring_context = mm_context.MonitoringApplicationContext(
+            application_name=application.NAME,
+            event={},
+            artifacts_logger=project,
+            logger=logger,
+            project=project,
+            nuclio_logger=logger,  # the wrong type but works here
         )
-        monitoring_context.logger = logger
-        assert (
-            kwargs.keys()
-            == inspect.signature(application.do_tracking).parameters.keys()
-        )
-        return kwargs
+        monitoring_context._sample_df_stats = sample_df_stats
+        monitoring_context._feature_stats = feature_stats
+
+        return monitoring_context
 
     @classmethod
     def test(
         cls,
         application: HistogramDataDriftApplication,
-        application_kwargs: dict[str, Any],
+        monitoring_context: mm_context.MonitoringApplicationContext,
+        project: mlrun.MlrunProject,
     ) -> None:
-        results = application.do_tracking(**application_kwargs)
+        results = application.do_tracking(monitoring_context)
         metrics = []
         assert len(results) == 6, "Expected four results & metrics % stats"
         for res in results:
@@ -218,21 +209,31 @@ class TestApplication:
                 res,
                 mlrun.model_monitoring.applications.ModelMonitoringApplicationResult,
             ):
-                assert (
-                    res.kind == ResultKindApp.data_drift
-                ), "The kind should be data drift"
-                assert (
-                    res.name == "general_drift"
-                ), "The result name should be general_drift"
-                assert (
-                    res.status == ResultStatusApp.potential_detection
-                ), "Expected potential detection in the general drift"
+                assert res.kind == ResultKindApp.data_drift, (
+                    "The kind should be data drift"
+                )
+                assert res.name == "general_drift", (
+                    "The result name should be general_drift"
+                )
+                assert res.status == ResultStatusApp.potential_detection, (
+                    "Expected potential detection in the general drift"
+                )
             elif isinstance(
                 res,
                 mlrun.model_monitoring.applications.ModelMonitoringApplicationMetric,
             ):
                 metrics.append(res)
         assert len(metrics) == 3, "Expected three metrics"
+
+        # Check the artifacts
+        assert project._artifact_manager.artifact_uris.keys() == {
+            "features_drift_results",
+            "drift_table_plot",
+        }, "The artifacts in the artifact manager are different than expected"
+        assert {f.name for f in Path(project.artifact_path).glob("*")} == {
+            "drift_table_plot.html",
+            "features_drift_results.json",
+        }, "The artifact files were not found or are different than expected"
 
 
 class TestMetricsPerFeature:
@@ -277,6 +278,32 @@ class TestMetricsPerFeature:
         assert set(metrics_per_feature.columns) == {
             metric.NAME for metric in application.metrics
         }, "Different metrics than expected"
-        assert set(metrics_per_feature.index) == set(
-            feature_stats.columns
-        ), "The features are different than expected"
+        assert set(metrics_per_feature.index) == set(feature_stats.columns), (
+            "The features are different than expected"
+        )
+
+
+class TestApplicationErrorHandler:
+    """ML-12380 secondary issue: _ApplicationErrorHandler.do() must return the event."""
+
+    @staticmethod
+    def test_do_returns_event() -> None:
+        handler = _ApplicationErrorHandler(project="test-project")
+
+        event = MockEvent()
+        event.body = Mock(endpoint_id="ep-123", application_name="test-app")
+        event.error = ValueError("test error")
+        event.timestamp = "2024-01-01T00:00:00"
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_db = Mock()
+            mp.setattr(
+                "mlrun.model_monitoring.applications._application_steps.mlrun.get_run_db",
+                lambda: mock_db,
+            )
+            result = handler.do(event)
+
+        assert result is event, (
+            "_ApplicationErrorHandler.do() must return the event to avoid "
+            "passing None downstream in the serving graph"
+        )

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
 import http
 import unittest.mock
@@ -32,11 +32,12 @@ import mlrun.common.model_monitoring.helpers
 import mlrun.common.schemas
 import mlrun.errors
 import tests.conftest
+from mlrun.common.types import AuthenticationMode
 
 import framework.api.utils
 import framework.utils.clients.async_nuclio
 import framework.utils.clients.chief
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
 import framework.utils.singletons.db
 import framework.utils.singletons.k8s
 import services.api.api.endpoints.functions
@@ -50,6 +51,7 @@ from services.api.daemon import daemon
 PROJECT = "project-name"
 ORIGINAL_VERSIONED_API_PREFIX = daemon.service.base_versioned_service_prefix
 FUNCTIONS_API = "projects/{project}/functions/{name}"
+BUILD_STATUS_API = "build/status"
 
 
 def test_build_status_pod_not_found(
@@ -80,7 +82,7 @@ def test_build_status_pod_not_found(
         ),
     ):
         response = client.get(
-            "build/status",
+            BUILD_STATUS_API,
             params={
                 "project": function["metadata"]["project"],
                 "name": function["metadata"]["name"],
@@ -88,6 +90,53 @@ def test_build_status_pod_not_found(
             },
         )
         assert response.status_code == HTTPStatus.NOT_FOUND.value
+
+
+def test_build_status_with_missing_state(
+    db: sqlalchemy.orm.Session, client: fastapi.testclient.TestClient
+):
+    # Test that a function without status.state returns 'initialized' in build/status
+    services.api.tests.unit.api.utils.create_project(client, PROJECT)
+    function = {
+        "kind": "job",
+        "metadata": {
+            "name": "function-name",
+            "project": PROJECT,
+            "tag": "latest",
+        },
+        "spec": {
+            "build": {"image": "some-image"},
+        },
+    }
+
+    client.post(
+        FUNCTIONS_API.format(
+            project=function["metadata"]["project"], name=function["metadata"]["name"]
+        ),
+        json=function,
+    )
+    response = client.get(
+        FUNCTIONS_API.format(
+            project=function["metadata"]["project"],
+            name=function["metadata"]["name"],
+        ),
+    )
+    assert response.status_code == HTTPStatus.OK.value
+    assert response.json().get("status", {}).get("state") is None
+
+    response = client.get(
+        BUILD_STATUS_API,
+        params={
+            "project": function["metadata"]["project"],
+            "name": function["metadata"]["name"],
+            "tag": function["metadata"]["tag"],
+        },
+    )
+    assert response.status_code == HTTPStatus.OK.value
+    assert (
+        response.headers["function_status"]
+        == mlrun.common.schemas.FunctionState.initialized
+    )
 
 
 @pytest.mark.asyncio
@@ -279,6 +328,52 @@ async def test_list_functions_with_hash_key_versioned(
     assert list_functions_results[0]["metadata"]["hash"] == hash_key
 
 
+@pytest.mark.asyncio
+async def test_list_functions_filter_by_states(db, async_client):
+    await services.api.tests.unit.api.utils.create_project_async(async_client, PROJECT)
+
+    function_name = "function-name"
+    function = {
+        "kind": "job",
+        "metadata": {
+            "name": function_name,
+            "project": PROJECT,
+            "tag": "latest",
+        },
+        "spec": {"image": "mlrun/mlrun"},
+        "status": {"state": mlrun.common.schemas.FunctionState.ready},
+    }
+
+    post_function_response = await async_client.post(
+        f"projects/{PROJECT}/functions/{function_name}",
+        json=function,
+    )
+
+    assert post_function_response.status_code == HTTPStatus.OK.value
+
+    response = await async_client.get(
+        f"projects/{PROJECT}/functions?state={mlrun.common.schemas.FunctionState.ready}&state={mlrun.common.schemas.FunctionState.error}",
+    )
+
+    assert response.status_code == HTTPStatus.OK.value
+    assert len(response.json()["funcs"]) == 1
+
+    # list with default param value
+    response = await async_client.get(
+        f"projects/{PROJECT}/functions",
+    )
+
+    assert response.status_code == HTTPStatus.OK.value
+    assert len(response.json()["funcs"]) == 1
+
+    response = await async_client.get(
+        f"projects/{PROJECT}/functions?state={mlrun.common.schemas.FunctionState.error}",
+    )
+
+    assert response.status_code == HTTPStatus.OK.value
+    assert len(response.json()["funcs"]) == 0
+
+
 @pytest.mark.parametrize(
     "kind",
     [
@@ -286,10 +381,6 @@ async def test_list_functions_with_hash_key_versioned(
         "job",
         "remote",
     ],
-)
-@pytest.mark.parametrize(
-    "function_deletion_endpoint_prefix, expected_status",
-    [("v1/", HTTPStatus.NO_CONTENT.value), ("v2/", HTTPStatus.ACCEPTED.value)],
 )
 @unittest.mock.patch.object(framework.utils.clients.async_nuclio, "Client")
 @unittest.mock.patch.object(
@@ -301,8 +392,6 @@ def test_delete_function(
     db: sqlalchemy.orm.Session,
     unversioned_client: fastapi.testclient.TestClient,
     kind,
-    function_deletion_endpoint_prefix,
-    expected_status,
 ):
     patched_nuclio_client.return_value = fastapi.testclient.TestClient
     patched_delete_nuclio_function.return_value.return_value = None
@@ -334,10 +423,8 @@ def test_delete_function(
     hash_key = function.json()["hash_key"]
 
     # delete the function and assert that it has been removed, as has its schedule if created
-    response = unversioned_client.delete(
-        f"{function_deletion_endpoint_prefix}{function_endpoint}"
-    )
-    assert response.status_code == expected_status
+    response = unversioned_client.delete(f"v2/{function_endpoint}")
+    assert response.status_code == HTTPStatus.ACCEPTED.value
 
     response = unversioned_client.get(
         f"{endpoint_prefix}{function_endpoint}", params={"hash_key": hash_key}
@@ -441,7 +528,9 @@ def test_redirection_from_worker_to_chief_only_if_serving_function_with_track_mo
 
 
 def test_redirection_from_worker_to_chief_deploy_serving_function_with_track_models(
-    db: sqlalchemy.orm.Session, client: fastapi.testclient.TestClient, httpserver
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    httpserver,
 ):
     mlrun.mlconf.httpdb.clusterization.role = "worker"
     endpoint = "/build/function"
@@ -721,14 +810,10 @@ def test_build_function_masks_access_key(
     client: fastapi.testclient.TestClient,
     k8s_secrets_mock,
 ):
-    mlrun.mlconf.httpdb.authentication.mode = "iguazio"
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO
     # set auto mount to ensure it doesn't override the access key
     mlrun.mlconf.storage.auto_mount_type = "v3io_credentials"
-    monkeypatch.setattr(
-        framework.utils.clients.iguazio,
-        "AsyncClient",
-        lambda *args, **kwargs: unittest.mock.AsyncMock(),
-    )
+    services.api.tests.unit.api.utils.setup_iguazio_v3_async_client_mock(monkeypatch)
     services.api.tests.unit.api.utils.create_project(client, PROJECT)
     function_dict = {
         "kind": "job",
@@ -792,12 +877,8 @@ def test_build_no_access_key(
     expected_status_code,
     expected_reason,
 ):
-    mlrun.mlconf.httpdb.authentication.mode = "iguazio"
-    monkeypatch.setattr(
-        framework.utils.clients.iguazio,
-        "AsyncClient",
-        lambda *args, **kwargs: unittest.mock.AsyncMock(),
-    )
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO
+    services.api.tests.unit.api.utils.setup_iguazio_v3_async_client_mock(monkeypatch)
 
     services.api.tests.unit.api.utils.create_project(client, PROJECT)
     function_dict = {
@@ -825,39 +906,6 @@ def test_build_no_access_key(
     assert response.status_code == expected_status_code
     if expected_reason:
         assert response.json()["detail"]["reason"] == expected_reason
-
-
-def test_build_clone_target_dir_backwards_compatability(
-    monkeypatch,
-    db: sqlalchemy.orm.Session,
-    client: fastapi.testclient.TestClient,
-    k8s_secrets_mock,
-):
-    services.api.tests.unit.api.utils.create_project(client, PROJECT)
-    clone_target_dir = "/some/path"
-    function_dict = {
-        "kind": "job",
-        "metadata": {
-            "name": "function-name",
-            "project": "project-name",
-            "tag": "latest",
-        },
-        "spec": {
-            "clone_target_dir": clone_target_dir,
-        },
-    }
-
-    monkeypatch.setattr(
-        services.api.utils.builder,
-        "build_image",
-        lambda *args, **kwargs: "success",
-    )
-
-    response = client.post(
-        "build/function",
-        json={"function": function_dict},
-    )
-    assert response.json()["data"]["spec"]["clone_target_dir"] == clone_target_dir
 
 
 def test_start_function_succeeded(
@@ -1061,7 +1109,7 @@ def test_build_status_events_and_logs(
         ),
     ):
         response = client.get(
-            "build/status",
+            BUILD_STATUS_API,
             params={
                 "project": function["metadata"]["project"],
                 "name": function["metadata"]["name"],
@@ -1090,11 +1138,11 @@ def test_build_status_events_and_logs(
         unittest.mock.patch.object(
             framework.utils.singletons.k8s.get_k8s_helper().v1api,
             "read_namespaced_pod_log",
-            return_value="log",
+            return_value=unittest.mock.Mock(data=b"log"),
         ),
     ):
         response = client.get(
-            "build/status",
+            BUILD_STATUS_API,
             params={
                 "project": function["metadata"]["project"],
                 "name": function["metadata"]["name"],
@@ -1109,6 +1157,80 @@ def test_build_status_events_and_logs(
             == mlrun.common.constants.DeployStatusTextKind.logs
         )
         assert response.content.decode() == "log"
+
+
+@pytest.mark.parametrize(
+    "kind,pod_phase,expected_persisted_state",
+    [
+        # ML-12689: an application's in-progress build pod must be persisted as `building` (the UI renders that as
+        # "Deploying"), not `running`.
+        ("application", "running", mlrun.common.schemas.FunctionState.building),
+        ("application", "pending", mlrun.common.schemas.FunctionState.building),
+        # other built runtimes keep surfacing the raw build-pod phase as before.
+        ("job", "running", mlrun.common.schemas.FunctionState.running),
+        ("job", "pending", mlrun.common.schemas.FunctionState.pending),
+    ],
+)
+def test_build_status_building_for_application(
+    mocked_k8s_helper,
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    kind,
+    pod_phase,
+    expected_persisted_state,
+):
+    services.api.tests.unit.api.utils.create_project(client, PROJECT)
+    function = {
+        "kind": kind,
+        "metadata": {"name": f"fn-{kind}", "project": PROJECT, "tag": "latest"},
+        "status": {"build_pod": "some-pod-name"},
+    }
+    response = client.post(
+        FUNCTIONS_API.format(
+            project=function["metadata"]["project"], name=function["metadata"]["name"]
+        ),
+        json=function,
+    )
+    assert response.status_code == HTTPStatus.OK.value
+
+    with (
+        unittest.mock.patch.object(
+            framework.utils.singletons.k8s.get_k8s_helper(),
+            "get_pod_phase",
+            return_value=pod_phase,
+        ),
+        unittest.mock.patch.object(
+            framework.utils.singletons.k8s.get_k8s_helper().v1api,
+            "read_namespaced_pod_log",
+            return_value=unittest.mock.Mock(data=b"log"),
+        ),
+        unittest.mock.patch.object(
+            framework.utils.singletons.k8s.get_k8s_helper(),
+            "list_object_events",
+            return_value=[],
+        ),
+    ):
+        response = client.get(
+            BUILD_STATUS_API,
+            params={
+                "project": function["metadata"]["project"],
+                "name": function["metadata"]["name"],
+                "tag": function["metadata"]["tag"],
+            },
+            headers={mlrun.common.schemas.HeaderNames.client_version: "1.12.0"},
+        )
+        assert response.status_code == HTTPStatus.OK.value
+
+    assert response.headers.get("x-mlrun-function-status") == pod_phase
+
+    # The persisted state is what the UI reads; only application is remapped.
+    stored = services.api.crud.Functions().get_function(
+        db_session=db,
+        project=PROJECT,
+        name=function["metadata"]["name"],
+        tag="latest",
+    )
+    assert stored["status"]["state"] == expected_persisted_state
 
 
 def _generate_function(

@@ -11,15 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import datetime
-import typing
 
 import pydantic.v1
 
 import mlrun.common.types
 
 from .object import ObjectKind
+
+
+class BackGroundTaskLabel(mlrun.common.types.StrEnum):
+    pipeline = "pipeline"
 
 
 class BackgroundTaskState(mlrun.common.types.StrEnum):
@@ -37,11 +40,12 @@ class BackgroundTaskState(mlrun.common.types.StrEnum):
 
 class BackgroundTaskMetadata(pydantic.v1.BaseModel):
     name: str
-    kind: typing.Optional[str]
-    project: typing.Optional[str]
-    created: typing.Optional[datetime.datetime]
-    updated: typing.Optional[datetime.datetime]
-    timeout: typing.Optional[int]
+    id: int | None
+    kind: str | None
+    project: str | None
+    created: datetime.datetime | None
+    updated: datetime.datetime | None
+    timeout: int | None
 
 
 class BackgroundTaskSpec(pydantic.v1.BaseModel):
@@ -50,7 +54,7 @@ class BackgroundTaskSpec(pydantic.v1.BaseModel):
 
 class BackgroundTaskStatus(pydantic.v1.BaseModel):
     state: BackgroundTaskState
-    error: typing.Optional[str]
+    error: str | None
 
 
 class BackgroundTask(pydantic.v1.BaseModel):

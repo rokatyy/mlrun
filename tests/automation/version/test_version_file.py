@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import json
 import os
 import subprocess
@@ -22,8 +22,10 @@ import pytest
 from automation.version.version_file import (
     create_or_update_version_file,
     get_current_version,
+    get_previous_version,
     is_stable_version,
     resolve_next_version,
+    resolve_promotion_inputs,
 )
 
 
@@ -88,6 +90,15 @@ def git_repo(tmpdir, request):
             ],
             "1.5.1",
         ),
+        # ML-11751: local version tag should be ignored on non-feature branches
+        (
+            "1.10.0",
+            [
+                (1, "1.10.1-rc1"),
+                (0, "1.10.1-rc2+ui-navbar"),  # Local version from feature branch
+            ],
+            "1.10.1-rc1",  # Should return rc1, not the local version
+        ),
     ],
 )
 def test_current_version(git_repo, base_version, tags, expected_current_version):
@@ -103,7 +114,9 @@ def test_current_version(git_repo, base_version, tags, expected_current_version)
                 f"HEAD~{tag[0]}",
             ]
         )
-    current_version = get_current_version(base_version=packaging.version.parse("1.5.0"))
+    current_version = get_current_version(
+        base_version=packaging.version.parse(base_version)
+    )
     assert current_version == expected_current_version
 
 
@@ -147,9 +160,9 @@ def test_next_version(
         packaging.version.parse(base_version),
         feature_name,
     )
-    assert (
-        next_version == expected_next_version
-    ), f"expected {expected_next_version}, got {next_version}"
+    assert next_version == expected_next_version, (
+        f"expected {expected_next_version}, got {next_version}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -193,3 +206,75 @@ def test_create_or_update_version_file(git_repo, base_version, expected_version)
 )
 def test_is_stable_version(version: str, expected_is_stable: bool):
     assert is_stable_version(version) is expected_is_stable
+
+
+@pytest.mark.parametrize(
+    "target_version,tags,expected_previous_version",
+    [
+        # no tags at all
+        ("1.5.0", [], ""),
+        # greatest stable below target
+        ("1.5.0", ["1.4.0", "1.3.0"], "1.4.0"),
+        # equal and greater tags are ignored
+        ("1.5.0", ["1.5.0", "1.6.0", "1.4.0"], "1.4.0"),
+        # prereleases are skipped, even the target's own rc
+        ("1.5.0", ["1.5.0-rc1", "1.4.0"], "1.4.0"),
+        # only a prerelease below target -> nothing stable to return
+        ("1.5.0", ["1.4.0-rc1"], ""),
+        # realistic patch line with an in-flight rc above the previous GA
+        ("1.10.4", ["1.10.3", "1.10.4-rc1", "1.9.0"], "1.10.3"),
+        ("1.12.0-rc17", ["1.11.0", "1.12.0-rc16", "1.12.0-rc17"], "1.12.0-rc16"),
+        ("1.12.0-rc1", ["1.11.0", "1.12.0-rc1"], "1.11.0"),
+    ],
+)
+def test_previous_version(git_repo, target_version, tags, expected_previous_version):
+    for tag in tags:
+        subprocess.run(["git", "tag", "-a", "-m", f"test tag {tag}", f"v{tag}", "HEAD"])
+    assert get_previous_version(target_version) == expected_previous_version
+
+
+def test_resolve_promotion_inputs_with_override():
+    # previous_version provided -> no git access needed; classify a stable version
+    assert resolve_promotion_inputs(version="1.5.0", previous_version="1.4.0") == {
+        "version": "1.5.0",
+        "previous_version": "1.4.0",
+        "prerelease": "false",
+        "make_latest": "true",
+    }
+    # an rc is flagged as a prerelease and not made latest
+    assert resolve_promotion_inputs(version="1.5.0-rc1", previous_version="1.4.0") == {
+        "version": "1.5.0-rc1",
+        "previous_version": "1.4.0",
+        "prerelease": "true",
+        "make_latest": "false",
+    }
+
+
+def test_resolve_promotion_inputs_derives_previous(git_repo):
+    for tag in ["1.4.0", "1.4.0-rc1", "1.3.0"]:
+        subprocess.run(["git", "tag", "-a", "-m", f"test tag {tag}", f"v{tag}", "HEAD"])
+    resolved = resolve_promotion_inputs(version="1.5.0")
+    assert resolved["previous_version"] == "1.4.0"
+    assert resolved["make_latest"] == "true"
+
+
+def test_resolve_promotion_inputs_derives_previous_rc(git_repo):
+    for tag in ["1.11.0", "1.12.0-rc16", "1.12.0-rc17"]:
+        subprocess.run(["git", "tag", "-a", "-m", f"test tag {tag}", f"v{tag}", "HEAD"])
+    resolved = resolve_promotion_inputs(version="1.12.0-rc17")
+    assert resolved == {
+        "version": "1.12.0-rc17",
+        "previous_version": "1.12.0-rc16",
+        "prerelease": "true",
+        "make_latest": "false",
+    }
+
+
+def test_resolve_promotion_inputs_invalid_version():
+    with pytest.raises(ValueError):
+        resolve_promotion_inputs(version="not-a-version", previous_version="1.4.0")
+
+
+def test_resolve_promotion_inputs_no_previous(git_repo):
+    with pytest.raises(ValueError):
+        resolve_promotion_inputs(version="1.5.0")

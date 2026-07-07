@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from abc import ABC, abstractmethod
-from typing import Optional
 
 from torch import Tensor
 from torch.nn import Module
@@ -68,7 +67,7 @@ class Callback(ABC):
         validation_set: DataLoader = None,
         loss_function: Module = None,
         optimizer: Optimizer = None,
-        metric_functions: Optional[list[PyTorchTypes.MetricFunctionType]] = None,
+        metric_functions: list[PyTorchTypes.MetricFunctionType] | None = None,
         scheduler=None,
     ):
         """

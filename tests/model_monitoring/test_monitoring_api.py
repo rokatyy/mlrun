@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime
 import pathlib
 from typing import Any, Literal
 from unittest.mock import Mock, patch
@@ -60,30 +59,6 @@ def test_read_dataset_as_dataframe():
     )
     feature_columns.remove("feature_2")
     assert list(df.columns) == feature_columns
-
-
-def test_record_result_updates_last_request() -> None:
-    db_mock = Mock(spec=RunDBInterface)
-    datetime_mock = datetime.datetime(
-        2011, 11, 4, 0, 5, 23, 283000, tzinfo=datetime.timezone.utc
-    )
-    with patch("mlrun.model_monitoring.api.datetime_now", return_value=datetime_mock):
-        with patch("mlrun.model_monitoring.api.mlrun.get_run_db", return_value=db_mock):
-            with patch(
-                "mlrun.model_monitoring.api.get_or_create_model_endpoint",
-                spec=ModelEndpoint,
-            ):
-                mlrun.model_monitoring.api.record_results(
-                    project="some-project",
-                    model_path="path/to/model",
-                    model_endpoint_name="my-endpoint",
-                )
-
-    db_mock.patch_model_endpoint.assert_called_once()
-    assert (
-        db_mock.patch_model_endpoint.call_args.kwargs["attributes"]["last_request"]
-        == datetime_mock
-    ), "last_request attribute of the model endpoint was not updated as expected"
 
 
 def _get_metrics(
@@ -140,7 +115,7 @@ def _get_metrics(
 def test_project_create_model_monitoring_alert_configs() -> None:
     db_mock = Mock(spec=RunDBInterface)
     db_mock.get_metrics_by_multiple_endpoints.side_effect = _get_metrics
-    project = mlrun.get_or_create_project("mm-project")
+    project = mlrun.get_or_create_project("mm-project", allow_cross_project=True)
 
     notification = Notification(
         kind=NotificationKind.mail,
@@ -156,14 +131,18 @@ def test_project_create_model_monitoring_alert_configs() -> None:
     with patch("mlrun.db.get_run_db", return_value=db_mock):
         mep1 = ModelEndpoint(
             metadata=ModelEndpointMetadata(
-                project=project.name, uid="mep_id1", name="mep_id1"
+                project=project.name,
+                uid="2af2282a-3ca1-4501-9284-125f0fc9219b",
+                name="mep_id1",
             ),
             spec=ModelEndpointSpec(),
             status=ModelEndpointStatus(),
         )
         mep2 = ModelEndpoint(
             metadata=ModelEndpointMetadata(
-                project=project.name, uid="mep_id2", name="mep_id2"
+                project=project.name,
+                uid="a2929c19-0eb7-4fc7-9e71-f0b83ea1ee40",
+                name="mep_id2",
             ),
             spec=ModelEndpointSpec(),
             status=ModelEndpointStatus(),
@@ -223,9 +202,66 @@ def test_create_model_monitoring_function(function: dict[str, Any]) -> None:
     assert "DemoMonitoringApp" in steps
     assert "PushToMonitoringWriter" in steps
     assert "ApplicationErrorHandler" in steps
+    # Default `otlp_enabled=False` → no OTel exporter in the graph.
+    assert "OTelMetricsExporter" not in steps
 
     app_step = steps["DemoMonitoringApp"]
     assert app_step.class_args == {"param_1": 1, "param_2": 2}
 
     with pytest.raises(NotImplementedError):
         app.to_mock_server()
+
+
+def test_create_model_monitoring_function_otlp_enabled() -> None:
+    """When `otlp_enabled=True`, the OTel branch is:
+        app_step → PrepareOTelEvent → OTelMetricsExporter
+    running in parallel with PushToMonitoringWriter (which sits directly
+    under app_step).
+    """
+    app = mlrun.model_monitoring.api._create_model_monitoring_function_base(
+        project="",
+        name="my-app",
+        func=str(pathlib.Path(__file__).parent / "assets" / "application.py"),
+        application_class="DemoMonitoringApp",
+        otlp_enabled=True,
+        param_1=1,
+        param_2=2,
+    )
+    steps = app.spec.graph.steps
+    assert "PushToMonitoringWriter" in steps
+    assert "PrepareOTelEvent" in steps
+    assert "OTelMetricsExporter" in steps
+
+    otel_step = steps["OTelMetricsExporter"]
+    # MM apps default to the operator-managed headers secret mounted onto
+    # the pod (gated by runtime.spec.mount_otlp_secret).
+    assert otel_step.class_args == {"headers_source": "file"}
+    assert otel_step.class_name == "mlrun.serving.OTelMetricsExporter"
+
+    prep_step = steps["PrepareOTelEvent"]
+    assert (
+        prep_step.class_name
+        == "mlrun.model_monitoring.applications._application_steps._PrepareOTelEvent"
+    )
+    app_step_name = "DemoMonitoringApp"
+    assert steps["PushToMonitoringWriter"].after == [app_step_name]
+    assert steps["PrepareOTelEvent"].after == [app_step_name]
+    assert steps["OTelMetricsExporter"].after == ["PrepareOTelEvent"]
+    assert "ApplicationErrorHandler" in steps
+    handler_args = steps["ApplicationErrorHandler"].class_args
+    assert handler_args["application_name"] == "my-app"
+    assert handler_args["user_step_name"] == "DemoMonitoringApp"
+
+
+def test_create_model_monitoring_function_otlp_disabled_omits_step() -> None:
+    """Explicit `otlp_enabled=False` matches the default — no OTel step."""
+    app = mlrun.model_monitoring.api._create_model_monitoring_function_base(
+        project="",
+        name="my-app",
+        func=str(pathlib.Path(__file__).parent / "assets" / "application.py"),
+        application_class="DemoMonitoringApp",
+        otlp_enabled=False,
+        param_1=1,
+        param_2=2,
+    )
+    assert "OTelMetricsExporter" not in app.spec.graph.steps

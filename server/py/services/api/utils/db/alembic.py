@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import pathlib
-import typing
 
 import alembic.command
 import alembic.config
@@ -37,6 +36,13 @@ class AlembicUtil:
         logger.debug("Performing alembic schema migrations")
         alembic.command.upgrade(self._alembic_config, "head")
 
+    @property
+    def latest_revision(self) -> str:
+        return self._latest_revision
+
+    def get_current_revision(self) -> str | None:
+        return self._get_current_revision()
+
     def is_schema_migration_needed(self):
         current_revision = self._get_current_revision()
         logger.debug(
@@ -52,21 +58,32 @@ class AlembicUtil:
             return True
         return current_revision == self._initial_revision
 
-    def _get_current_revision(self) -> typing.Optional[str]:
+    def _get_current_revision(self) -> str | None:
         # create separate config in order to catch the stdout
         catch_stdout_config = alembic.config.Config(self._alembic_config_path)
         catch_stdout_config.print_stdout = self._save_output
+        logger.debug("Alembic output", revision=self._alembic_output)
 
         self._flush_output()
         try:
             alembic.command.current(catch_stdout_config)
+            logger.debug("Alembic current revision", revision=self._alembic_output)
             return self._alembic_output.strip().replace(" (head)", "")
         except Exception as exc:
-            if "Can't locate revision identified by" in exc.args[0]:
-                # DB has a revision that isn't known to us, extracting it from the exception.
-                return exc.args[0].split("'")[2]
+            msg = exc.args[0]
 
-            return None
+            if (
+                "Can't locate revision identified by" in msg
+                or "no such revision" in msg.lower()
+            ):
+                # run every migration from scratch up to head
+                alembic.command.upgrade(catch_stdout_config, "head")
+                # now capture and return the current (head) revision
+                self._flush_output()
+                alembic.command.current(catch_stdout_config)
+                return self._alembic_output.strip().replace(" (head)", "")
+
+            raise ValueError("Failed to get current alembic revision") from exc
 
     def _get_revision_history_list(self) -> list[str]:
         """
@@ -83,6 +100,7 @@ class AlembicUtil:
 
     @staticmethod
     def _parse_revision_history(output: str) -> list[str]:
+        logger.debug("Alembic output", output=output)
         return [line.split(" ")[2].replace(",", "") for line in output.splitlines()]
 
     def _save_output(self, text: str, *_):

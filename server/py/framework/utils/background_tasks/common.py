@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import datetime
 
 import mlrun.common.schemas
+import mlrun.utils
 
 
 def background_task_exceeded_timeout(start_time, timeout, task_state) -> bool:
@@ -26,8 +26,9 @@ def background_task_exceeded_timeout(start_time, timeout, task_state) -> bool:
     if (
         timeout
         and task_state not in mlrun.common.schemas.BackgroundTaskState.terminal_states()
-        and datetime.datetime.utcnow()
-        > datetime.timedelta(seconds=int(timeout)) + start_time
+        and mlrun.utils.now_date()
+        > datetime.timedelta(seconds=int(timeout))
+        + mlrun.utils.ensure_tz_aware(start_time)
     ):
         return True
     return False

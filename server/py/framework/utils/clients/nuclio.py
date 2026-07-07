@@ -11,22 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import copy
+import datetime
 import enum
 import http
-import typing
+import uuid
 
 import requests.adapters
 import requests.auth
 import sqlalchemy.orm
 
+import mlrun.auth.nuclio
 import mlrun.common.formatters
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.utils.singleton
 from mlrun.utils import logger
 
+import framework.utils.clients.helpers
 import framework.utils.projects.remotes.follower as project_follower
 
 
@@ -40,28 +43,32 @@ class Client(
         self._api_url = mlrun.mlconf.nuclio_dashboard_url
 
     def create_project(
-        self, session: sqlalchemy.orm.Session, project: mlrun.common.schemas.Project
+        self,
+        session: sqlalchemy.orm.Session,
+        project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         logger.debug("Creating project in Nuclio", project=project)
         body = self._generate_request_body(project)
-        self._post_project_to_nuclio(body)
+        self._post_project_to_nuclio(body, auth_info=auth_info)
 
     def store_project(
         self,
         session: sqlalchemy.orm.Session,
         name: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         logger.debug("Storing project in Nuclio", name=name, project=project)
         body = self._generate_request_body(project)
         try:
-            self._get_project_from_nuclio(name)
+            self._get_project_from_nuclio(name, auth_info=auth_info)
         except requests.HTTPError as exc:
             if exc.response.status_code != http.HTTPStatus.NOT_FOUND.value:
                 raise
-            self._post_project_to_nuclio(body)
+            self._post_project_to_nuclio(body, auth_info=auth_info)
         else:
-            self._put_project_to_nuclio(body)
+            self._put_project_to_nuclio(name, body, auth_info=auth_info)
 
     def patch_project(
         self,
@@ -69,6 +76,7 @@ class Client(
         name: str,
         project: dict,
         patch_mode: mlrun.common.schemas.PatchMode = mlrun.common.schemas.PatchMode.replace,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         logger.debug(
             "Patching project in Nuclio",
@@ -76,7 +84,7 @@ class Client(
             project=project,
             patch_mode=patch_mode,
         )
-        response = self._get_project_from_nuclio(name)
+        response = self._get_project_from_nuclio(name, auth_info=auth_info)
         response_body = response.json()
         if project.get("metadata", {}).get("labels") is not None:
             response_body.setdefault("metadata", {}).setdefault("labels", {}).update(
@@ -90,7 +98,7 @@ class Client(
             response_body.setdefault("spec", {})["description"] = project["spec"][
                 "description"
             ]
-        self._put_project_to_nuclio(response_body)
+        self._put_project_to_nuclio(name, response_body, auth_info=auth_info)
 
     def delete_project(
         self,
@@ -140,12 +148,13 @@ class Client(
     def list_projects(
         self,
         session: sqlalchemy.orm.Session,
-        owner: typing.Optional[str] = None,
-        format_: mlrun.common.formatters.ProjectFormat = mlrun.common.formatters.ProjectFormat.full,
-        labels: typing.Optional[list[str]] = None,
-        state: mlrun.common.schemas.ProjectState = None,
-        names: typing.Optional[list[str]] = None,
         auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        owner: str | None = None,
+        format_: mlrun.common.formatters.ProjectFormat = mlrun.common.formatters.ProjectFormat.full,
+        labels: list[str] | None = None,
+        state: mlrun.common.schemas.ProjectState = None,
+        names: list[str] | None = None,
+        updated_after: datetime.datetime | None = None,
     ) -> mlrun.common.schemas.ProjectsOutput:
         if owner:
             raise NotImplementedError(
@@ -158,6 +167,10 @@ class Client(
         if state:
             raise NotImplementedError(
                 "Filtering nuclio projects by state is currently not supported"
+            )
+        if updated_after:
+            raise NotImplementedError(
+                "Filtering nuclio projects by updated_after is currently not supported"
             )
         if names:
             raise NotImplementedError(
@@ -182,15 +195,19 @@ class Client(
     def list_project_summaries(
         self,
         session: sqlalchemy.orm.Session,
-        owner: typing.Optional[str] = None,
-        labels: typing.Optional[list[str]] = None,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        owner: str | None = None,
+        labels: list[str] | None = None,
         state: mlrun.common.schemas.ProjectState = None,
-        names: typing.Optional[list[str]] = None,
+        names: list[str] | None = None,
     ) -> mlrun.common.schemas.ProjectSummariesOutput:
         raise NotImplementedError("Listing project summaries is not supported")
 
     def get_project_summary(
-        self, session: sqlalchemy.orm.Session, name: str
+        self,
+        session: sqlalchemy.orm.Session,
+        name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.ProjectSummary:
         raise NotImplementedError("Get project summary is not supported")
 
@@ -199,22 +216,60 @@ class Client(
         response_body = response.json()
         return response_body["dashboard"]["label"]
 
+    def prepare_create_project(
+        self,
+        project: mlrun.common.schemas.Project,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError
+
+    def commit_create_project(
+        self,
+        name: str,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError
+
+    def prepare_delete_project(
+        self,
+        name: str,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError
+
+    def commit_delete_project(
+        self,
+        name: str,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError
+
+    def update_project_follower(
+        self,
+        name: str,
+        project: mlrun.common.schemas.Project,
+        op_id: uuid.UUID,
+    ) -> None:
+        raise NotImplementedError
+
     def _get_project_from_nuclio(
         self, name, auth_info: mlrun.common.schemas.AuthInfo = None
     ):
         return self._send_request_to_api("GET", f"projects/{name}", auth_info=auth_info)
 
     def _post_project_to_nuclio(
-        self, body, auth_info: mlrun.common.schemas.AuthInfo = None
+        self, body: dict, auth_info: mlrun.common.schemas.AuthInfo = None
     ):
         return self._send_request_to_api(
             "POST", "projects", auth_info=auth_info, json=body
         )
 
     def _put_project_to_nuclio(
-        self, body, auth_info: mlrun.common.schemas.AuthInfo = None
+        self, name: str, body, auth_info: mlrun.common.schemas.AuthInfo = None
     ):
-        self._send_request_to_api("PUT", "projects", auth_info=auth_info, json=body)
+        self._send_request_to_api(
+            "PUT", f"projects/{name}", auth_info=auth_info, json=body
+        )
 
     def _send_request_to_api(
         self,
@@ -227,6 +282,11 @@ class Client(
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = 20
 
+        kwargs["headers"] = framework.utils.clients.helpers.enrich_headers(
+            headers=kwargs.get("headers"),
+            path=path,
+        )
+
         # requests no longer supports header values to be enum (https://github.com/psf/requests/pull/6154)
         # convert to strings. Do the same for params for niceness
         for kwarg in ["headers", "params"]:
@@ -237,7 +297,9 @@ class Client(
 
         auth = None
         if auth_info:
-            auth = auth_info.to_nuclio_auth_info().to_requests_auth()
+            auth = mlrun.auth.nuclio.NuclioAuthInfo.from_auth_info(
+                auth_info
+            ).to_requests_auth()
 
         response = self._session.request(
             method,

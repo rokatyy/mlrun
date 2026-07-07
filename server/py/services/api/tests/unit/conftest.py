@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import pathlib
-import typing
 import unittest.mock
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from datetime import datetime
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import mock
 
 import fastapi
@@ -26,48 +25,36 @@ import pytest
 import semver
 import sqlalchemy.orm
 from fastapi.testclient import TestClient
+from kfp_server_api.models.api_experiment import ApiExperiment
 
 import mlrun
 import mlrun.common.schemas
-import mlrun.common.secrets
-import mlrun.db.factory
 import mlrun.launcher.factory
-import mlrun.runtimes.utils
 import mlrun.utils
 import mlrun.utils.singleton
+import mlrun_pipelines.client
 import mlrun_pipelines.utils
 
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
+import framework.utils.clients.iguazio.v4
 import framework.utils.projects.remotes.leader
-import framework.utils.runtimes.nuclio
-import framework.utils.singletons.db
 import framework.utils.singletons.k8s
 import services.api.crud
+import services.api.daemon
 import services.api.launcher
 import services.api.runtime_handlers.mpijob
 import services.api.utils.singletons.logs_dir
 import services.api.utils.singletons.scheduler
-from framework.tests.unit.common_fixtures import (
-    K8sSecretsMock,
-    TestServiceBase,
-)
+from framework.tests.unit.common_fixtures import K8sSecretsMock, TestServiceBase
 from services.api.daemon import daemon
 
 tests_root_directory = pathlib.Path(__file__).absolute().parent
 assets_path = tests_root_directory.joinpath("assets")
 
-if str(tests_root_directory) in os.getcwd():
-    # If this is the top level conftest - we need to explicitly declare the base common fixtures to
-    # make pytest use them. If this is not the top level conftest (e.g. when running the tests from the project root)
-    # then providing pytest_plugins is not allowed.
-    pytest_plugins = [
-        "tests.common_fixtures",
-    ]
-
 
 class TestAPIBase(TestServiceBase):
     @pytest.fixture(scope="module")
-    def app(self) -> fastapi.FastAPI:
+    def app(self) -> Iterator[fastapi.FastAPI]:
         mlrun.mlconf.services.service_name = "api"
         mlrun.mlconf.services.hydra.services = ""
         yield services.api.daemon.app()
@@ -140,55 +127,49 @@ def kfp_client_mock(monkeypatch):
     framework.utils.singletons.k8s.get_k8s_helper().is_running_inside_kubernetes_cluster = mock.Mock(
         return_value=True
     )
+    client_klass = mlrun_pipelines.client.Client
 
-    def mock_get_healthz(*args, **kwargs):
-        mock_healthz = mock.Mock()
-        mock_healthz.multi_user = True  # Adjust based on your test scenario
-        return mock_healthz
-
-    monkeypatch.setattr(
-        kfp_server_api.api.healthz_service_api.HealthzServiceApi,
-        "get_healthz",
-        mock_get_healthz,
-    )
-
+    monkeypatch.setattr("kubernetes.config.load_incluster_config", lambda: None)
+    monkeypatch.setattr(client_klass, "_determine_server_major_version", lambda self: 2)
     mock_experiment_api = mock.Mock()
-    mock_experiment_api.api_client.call_api = mock.Mock()
     monkeypatch.setattr(
         kfp_server_api.api.experiment_service_api,
         "ExperimentServiceApi",
         mock.Mock(return_value=mock_experiment_api),
     )
+    mock_experiment_api.list_experiment = mock.Mock(
+        return_value=SimpleNamespace(
+            experiments=[
+                ApiExperiment(name="some-project"),
+                ApiExperiment(name="another"),
+            ],
+            next_page_token=None,
+        )
+    )
+    mock_experiment_api.api_client = mock.Mock()
+    mock_experiment_api.api_client.call_api = mock.Mock()
 
+    # Mock the KFP Run API; tests can stub methods on this as needed
     mock_run_api = mock.Mock()
     mock_run_api.create_run = mock.Mock()
+    # It’s common that list_runs is used in pipeline listing; leave it mockable
+    mock_run_api.list_runs = mock.Mock(return_value=SimpleNamespace(runs=[]))
     monkeypatch.setattr(
         kfp_server_api.api.run_service_api,
         "RunServiceApi",
         mock.Mock(return_value=mock_run_api),
     )
 
-    mock_healthz_api = mock.Mock()
-    mock_healthz_api.create_run = mock.Mock()
-    monkeypatch.setattr(
-        kfp_server_api.api.healthz_service_api,
-        "HealthzServiceApi",
-        mock.Mock(return_value=mock_healthz_api),
-    )
-
-    monkeypatch.setattr(kfp_server_api.api_client.ApiClient, "call_api", mock.Mock())
-
-    kfp_client = mlrun_pipelines.utils.ExtendedKfpClient()
-
+    # Build a real mlrun_pipelines client that will use our mocked APIs
+    kfp_client = mlrun_pipelines.client.Client(logger=mock.Mock())
+    # Point mlrun to a fake in-cluster KFP URL (not actually contacted due to mocks)
     mlrun.mlconf.kfp_url = "http://ml-pipeline.custom_namespace.svc.cluster.local:8888"
 
-    kfp_client.run_pipeline = mock.Mock()
-    kfp_client.get_run = mock.Mock()
-
+    # When code calls utils.get_client(...), hand back our prepared client
     monkeypatch.setattr(
-        mlrun_pipelines.utils.ExtendedKfpClient,
-        "__new__",
-        lambda cls, *args, **kwargs: kfp_client,
+        mlrun_pipelines.utils,
+        "get_client",
+        lambda *unused_args, **unused_kwargs: kfp_client,
     )
 
     return kfp_client
@@ -204,16 +185,41 @@ def api_url() -> str:
 @pytest.fixture()
 def iguazio_client(
     request: pytest.FixtureRequest,
-) -> framework.utils.clients.iguazio.Client:
-    if request.param == "async":
-        client = framework.utils.clients.iguazio.AsyncClient()
-    else:
-        client = framework.utils.clients.iguazio.Client()
+):
+    """
+    A parameterized fixture to return either an IG3 or IG4 client (sync or async)
+    based on request parameters.
 
-    # force running init again so the configured api url will be used
-    client.__init__()
+    Usage:
+        @pytest.mark.parametrize(
+            "iguazio_client",
+            [("v3", "async"), ("v4", "sync")],
+            indirect=True
+        )
+    """
+    version, mode = request.param
+
+    if version == "v3":
+        module = framework.utils.clients.iguazio.v3
+        client_cls = module.Client if mode == "sync" else module.AsyncClient
+        client = client_cls()
+    elif version == "v4":
+        module = framework.utils.clients.iguazio.v4
+        client_cls = module.Client if mode == "sync" else module.AsyncClient
+
+        # PATCH iguazio.Client before instantiation
+        with unittest.mock.patch(
+            "framework.utils.clients.iguazio.v4.iguazio.Client"
+        ) as mock_iguazio_cls:
+            mock_instance = unittest.mock.MagicMock()
+            mock_iguazio_cls.return_value = mock_instance
+
+            # Now when Client.__init__ runs, self._client is assigned to mock_instance
+            client = client_cls()
+    else:
+        raise ValueError(f"Unsupported client version: {version}")
+
     client._wait_for_job_completion_retry_interval = 0
-    client._wait_for_project_terminal_state_retry_interval = 0
 
     # inject the request param into client, so we can use it in tests
     setattr(client, "mode", request.param)
@@ -321,6 +327,7 @@ class MockedProjectFollowerIguazioClient(
         self,
         session: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
         wait_for_completion: bool = True,
     ) -> bool:
         services.api.crud.Projects().create_project(self._db_session, project)
@@ -331,6 +338,7 @@ class MockedProjectFollowerIguazioClient(
         session: str,
         name: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         pass
 
@@ -338,6 +346,7 @@ class MockedProjectFollowerIguazioClient(
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
         deletion_strategy: mlrun.common.schemas.DeletionStrategy = mlrun.common.schemas.DeletionStrategy.default(),
         wait_for_completion: bool = True,
     ) -> bool:
@@ -360,14 +369,16 @@ class MockedProjectFollowerIguazioClient(
     def list_projects(
         self,
         session: str,
-        updated_after: typing.Optional[datetime] = None,
-    ) -> tuple[list[mlrun.common.schemas.Project], typing.Optional[datetime]]:
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        updated_after: datetime | None = None,
+    ) -> tuple[list[mlrun.common.schemas.Project], datetime | None]:
         return [], None
 
     def get_project(
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.Project:
         pass
 
@@ -380,6 +391,7 @@ class MockedProjectFollowerIguazioClient(
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.ProjectOwner:
         pass
 
@@ -393,8 +405,8 @@ def mock_project_follower_iguazio_client(
     """
     mlrun.mlconf.httpdb.projects.leader = "iguazio"
     mlrun.mlconf.httpdb.projects.iguazio_access_key = "access_key"
-    old_iguazio_client = framework.utils.clients.iguazio.Client
-    framework.utils.clients.iguazio.Client = MockedProjectFollowerIguazioClient
+    old_iguazio_client = framework.utils.clients.iguazio.v3.Client
+    framework.utils.clients.iguazio.v3.Client = MockedProjectFollowerIguazioClient
     framework.utils.singletons.project_member.initialize_project_member()
     iguazio_client = MockedProjectFollowerIguazioClient()
     iguazio_client._db_session = db
@@ -402,4 +414,4 @@ def mock_project_follower_iguazio_client(
 
     yield iguazio_client
 
-    framework.utils.clients.iguazio.Client = old_iguazio_client
+    framework.utils.clients.iguazio.v3.Client = old_iguazio_client

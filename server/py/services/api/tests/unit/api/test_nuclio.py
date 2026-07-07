@@ -11,23 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import unittest
-from unittest.mock import patch
 
+import unittest
+from http import HTTPStatus
+from unittest.mock import MagicMock, patch
+
+import fastapi
 import fastapi.testclient
 import pytest
 import sqlalchemy.orm
 
 import mlrun
 import mlrun.common.schemas
+import mlrun.errors
+import mlrun.runtimes
 import mlrun.runtimes.nuclio
 from mlrun.common.constants import MLRUN_FUNCTIONS_ANNOTATION
+from mlrun.common.types import AuthenticationMode
 
 import framework.utils.clients.async_nuclio
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
 import services.api.crud
+import services.api.crud.runtimes.nuclio.function
 import services.api.tests.unit.api.utils
+from services.api.api.endpoints.nuclio import _deploy_function, _deploy_nuclio_runtime
 
 PROJECT = "project-name"
 
@@ -57,8 +64,8 @@ async def test_deploy_function(
 def test_list_api_gateways(
     list_api_gateway_mocked, client: fastapi.testclient.TestClient
 ):
-    mlrun.mlconf.httpdb.authentication.mode = "iguazio"
-    framework.utils.clients.iguazio.AsyncClient().verify_request_session = (
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO
+    framework.utils.clients.iguazio.v3.AsyncClient().verify_request_session = (
         unittest.mock.AsyncMock(
             return_value=(
                 mlrun.common.schemas.AuthInfo(
@@ -129,8 +136,8 @@ def test_store_api_gateway(
     get_api_gateway_mocked,
     client: fastapi.testclient.TestClient,
 ):
-    mlrun.mlconf.httpdb.authentication.mode = "iguazio"
-    framework.utils.clients.iguazio.AsyncClient().verify_request_session = (
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO
+    framework.utils.clients.iguazio.v3.AsyncClient().verify_request_session = (
         unittest.mock.AsyncMock(
             return_value=(
                 mlrun.common.schemas.AuthInfo(
@@ -236,3 +243,250 @@ def test_mlrun_function_translation_to_nuclio(
         api_gateway_with_replaced_nuclio_names_to_mlrun.get_function_names()
         == api_gateway_client_side.spec.functions
     )
+
+
+@pytest.mark.parametrize(
+    "async_spec, expected_mode, expected_async_struct, expected_workers",
+    [
+        # None case - sync mode with default workers
+        (None, "sync", None, 8),
+        # Async enabled with default max_connections
+        (
+            mlrun.runtimes.nuclio.function.AsyncSpec(enabled=True),
+            "async",
+            {"maxConnectionsNumber": None, "connectionAvailabilityTimeout": None},
+            1,
+        ),
+        # Async enabled with custom settings
+        (
+            mlrun.runtimes.nuclio.function.AsyncSpec(
+                enabled=True, max_connections=500, connection_availability_timeout=30
+            ),
+            "async",
+            {"maxConnectionsNumber": 500, "connectionAvailabilityTimeout": 30},
+            1,
+        ),
+        # Async explicitly disabled
+        (
+            mlrun.runtimes.nuclio.function.AsyncSpec(enabled=False),
+            "sync",
+            None,
+            8,
+        ),
+    ],
+)
+@pytest.mark.parametrize("nuclio_support_async", [True, False])
+def test_with_http_async_spec(
+    async_spec,
+    expected_mode,
+    expected_async_struct,
+    expected_workers,
+    nuclio_support_async,
+):
+    """Test with_http method with various async_spec configurations."""
+    func = mlrun.runtimes.nuclio.function.RemoteRuntime()
+
+    with patch(
+        "mlrun.runtimes.nuclio.function.validate_nuclio_version_compatibility",
+        return_value=nuclio_support_async,
+    ):
+        if not nuclio_support_async and async_spec is not None:
+            with pytest.raises(
+                mlrun.errors.MLRunValueError,
+                match="Async spec is only supported from Nuclio 1.15.3",
+            ):
+                func.with_http(async_spec=async_spec)
+        else:
+            func.with_http(async_spec=async_spec)
+            trigger = func.spec.config.get("spec.triggers.http")
+            assert trigger is not None
+            if nuclio_support_async:
+                # Check mode
+                assert trigger.get("mode") == expected_mode
+
+                # Check workers
+                assert trigger.get("maxWorkers") == expected_workers
+            else:
+                assert trigger.get("mode") is None
+                assert (
+                    trigger.get("maxWorkers") == 8
+                )  # Default workers when async is not supported
+
+            # Check async struct
+            if expected_async_struct is not None:
+                assert trigger.get("async") == expected_async_struct
+            else:
+                assert "async" not in trigger
+
+
+@pytest.mark.parametrize(
+    ("nuclio_state", "expected_state"),
+    [
+        # live state kept verbatim (a serving version survives a failed redeploy)
+        ("ready", "ready"),
+        # no function / query fails -> error
+        (None, mlrun.common.schemas.FunctionState.error),
+    ],
+)
+def test_deploy_function_failure_persists_nuclio_state(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    nuclio_state,
+    expected_state,
+):
+    """A deploy failure persists Nuclio's live state, correcting the build phase's
+    premature "ready"; no function / unreachable -> error."""
+    services.api.tests.unit.api.utils.create_project(client, PROJECT)
+    func_name = "test-app"
+
+    fn = mlrun.new_function(name=func_name, kind="application", project=PROJECT)
+    fn.status.state = mlrun.common.schemas.FunctionState.ready
+    services.api.crud.Functions().store_function(
+        db, fn.to_dict(), func_name, PROJECT, tag="latest", versioned=False
+    )
+
+    if nuclio_state is None:
+        deploy_status_mock = patch(
+            "services.api.crud.runtimes.nuclio.function.get_nuclio_deploy_status",
+            side_effect=mlrun.errors.MLRunNotFoundError("function not found"),
+        )
+    else:
+        deploy_status_mock = patch(
+            "services.api.crud.runtimes.nuclio.function.get_nuclio_deploy_status",
+            return_value=(nuclio_state, None, func_name, 0, "", None),
+        )
+
+    with (
+        patch(
+            "services.api.launcher.ServerSideLauncher.enrich_runtime",
+            side_effect=mlrun.errors.MLRunNotFoundError("code artifact not found"),
+        ),
+        deploy_status_mock,
+    ):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            _deploy_function(
+                db_session=db,
+                auth_info=mlrun.common.schemas.AuthInfo(),
+                project=PROJECT,
+                name=func_name,
+                function={
+                    "kind": "application",
+                    "metadata": {"name": func_name, "project": PROJECT},
+                },
+                builder_env=None,
+                client_version=None,
+                client_python_version=None,
+            )
+
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    stored = services.api.crud.Functions().get_function(
+        db, func_name, PROJECT, tag="latest"
+    )
+    assert stored["status"]["state"] == expected_state
+
+
+def test_deploy_function_failure_status_update_error_is_swallowed(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+):
+    """A failed status write must not mask the original deploy error."""
+    services.api.tests.unit.api.utils.create_project(client, PROJECT)
+    func_name = "test-app"
+    fn = mlrun.new_function(name=func_name, kind="application", project=PROJECT)
+    services.api.crud.Functions().store_function(
+        db, fn.to_dict(), func_name, PROJECT, tag="latest", versioned=False
+    )
+
+    with (
+        patch(
+            "services.api.launcher.ServerSideLauncher.enrich_runtime",
+            side_effect=mlrun.errors.MLRunNotFoundError("code artifact not found"),
+        ),
+        patch(
+            "services.api.crud.runtimes.nuclio.function.get_nuclio_deploy_status",
+            side_effect=mlrun.errors.MLRunNotFoundError("function not found"),
+        ),
+        patch(
+            "services.api.crud.Functions.store_function",
+            side_effect=Exception("db unavailable"),
+        ),
+    ):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            _deploy_function(
+                db_session=db,
+                auth_info=mlrun.common.schemas.AuthInfo(),
+                project=PROJECT,
+                name=func_name,
+                function={
+                    "kind": "application",
+                    "metadata": {"name": func_name, "project": PROJECT},
+                },
+                builder_env=None,
+                client_version=None,
+                client_python_version=None,
+            )
+
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "code artifact not found" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [mlrun.runtimes.RuntimeKinds.remote, mlrun.runtimes.RuntimeKinds.application],
+)
+def test_nuclio_app_track_models_raises_on_missing_credentials(kind):
+    """_deploy_nuclio_runtime must reject remote/application functions with track_models when credentials are unset."""
+    fn = mlrun.new_function(name="test-fn", kind=kind, project=PROJECT)
+    fn.spec.track_models = True
+
+    with (
+        patch(
+            "services.api.api.endpoints.nuclio.process_model_monitoring_secret",
+            return_value=None,
+        ),
+        patch(
+            "services.api.crud.model_monitoring.deployment.MonitoringDeployment.check_if_credentials_are_set",
+            side_effect=mlrun.errors.MLRunBadRequestError("credentials not set"),
+        ),
+    ):
+        with pytest.raises(fastapi.HTTPException) as exc_info:
+            _deploy_nuclio_runtime(
+                auth_info=mlrun.common.schemas.AuthInfo(),
+                builder_env=None,
+                client_python_version=None,
+                client_version=None,
+                db_session=MagicMock(),
+                fn=fn,
+            )
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST.value
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [mlrun.runtimes.RuntimeKinds.remote, mlrun.runtimes.RuntimeKinds.application],
+)
+def test_nuclio_app_track_models_calls_credential_check(kind):
+    """_deploy_nuclio_runtime must call check_if_credentials_are_set for remote/application with track_models."""
+    fn = mlrun.new_function(name="test-fn", kind=kind, project=PROJECT)
+    fn.spec.track_models = True
+
+    with (
+        patch(
+            "services.api.api.endpoints.nuclio.process_model_monitoring_secret",
+            return_value=None,
+        ),
+        patch(
+            "services.api.crud.model_monitoring.deployment.MonitoringDeployment.check_if_credentials_are_set"
+        ) as mock_check,
+        patch("services.api.crud.runtimes.nuclio.function.deploy_nuclio_function"),
+    ):
+        _deploy_nuclio_runtime(
+            auth_info=mlrun.common.schemas.AuthInfo(),
+            builder_env=None,
+            client_python_version=None,
+            client_version=None,
+            db_session=MagicMock(),
+            fn=fn,
+        )
+
+    mock_check.assert_called_once()

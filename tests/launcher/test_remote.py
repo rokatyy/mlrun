@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import pathlib
 import unittest.mock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -67,11 +68,13 @@ def test_validate_inputs():
     )
     run = mlrun.run.RunObject(spec=mlrun.model.RunSpec(inputs={"input1": 1}))
     with pytest.raises(mlrun.errors.MLRunInvalidArgumentTypeError) as exc:
-        launcher._validate_runtime(runtime, run)
-    assert "'Inputs' should be of type Dict[str, str]" in str(exc.value)
+        launcher._validate_run(runtime, run)
+    assert "'Inputs' should be of type Dict[str, Union[str,list,dict]]." in str(
+        exc.value
+    )
 
 
-def test_validate_runtime_success():
+def test_validate_run_success():
     launcher = mlrun.launcher.remote.ClientRemoteLauncher()
     runtime = mlrun.code_to_function(
         name="test", kind="local", filename=str(func_path), handler=handler
@@ -79,7 +82,7 @@ def test_validate_runtime_success():
     run = mlrun.run.RunObject(
         spec=mlrun.model.RunSpec(inputs={"input1": ""}, output_path="./some_path")
     )
-    launcher._validate_runtime(runtime, run)
+    launcher._validate_run(runtime, run)
 
 
 @pytest.mark.parametrize(
@@ -106,6 +109,58 @@ def test_prepare_image_for_deploy(
     launcher.prepare_image_for_deploy(runtime)
     assert runtime.spec.build.base_image == expected_base_image
     assert runtime.spec.image == expected_image
+
+
+def test_enrich_runtime_resolves_code_artifact_and_shifts_image(rundb_mock):
+    """image=X + code-artifact with reqs must shift image->base_image."""
+    launcher = mlrun.launcher.remote.ClientRemoteLauncher()
+    runtime = mlrun.new_function(name="test", kind="job", image="some/image:tag")
+    runtime.metadata.project = "proj"
+    runtime.spec.build.source = "store://artifacts/proj/my_code"
+
+    artifact = MagicMock()
+    artifact.kind = "code"
+    artifact.spec.requirements = ["opentelemetry-api"]
+
+    with patch("mlrun.datastore.get_store_resource", return_value=artifact):
+        launcher.enrich_runtime(runtime, project_name="proj")
+
+    assert runtime.spec.build.requirements == ["opentelemetry-api"]
+    assert runtime.spec.build.base_image == "some/image:tag"
+    assert runtime.spec.image == ""
+    assert runtime.requires_build() is True
+
+
+def test_enrich_runtime_no_store_source_skips_artifact_resolution(rundb_mock):
+    launcher = mlrun.launcher.remote.ClientRemoteLauncher()
+    runtime = mlrun.new_function(name="test", kind="job", image="some/image:tag")
+    runtime.metadata.project = "proj"
+    runtime.spec.build.source = ""
+
+    with patch("mlrun.datastore.get_store_resource") as mock_get:
+        launcher.enrich_runtime(runtime, project_name="proj")
+        mock_get.assert_not_called()
+
+    assert runtime.spec.image == "some/image:tag"
+    assert runtime.spec.build.base_image is None
+
+
+def test_enrich_runtime_artifact_without_requirements_keeps_image(rundb_mock):
+    launcher = mlrun.launcher.remote.ClientRemoteLauncher()
+    runtime = mlrun.new_function(name="test", kind="job", image="some/image:tag")
+    runtime.metadata.project = "proj"
+    runtime.spec.build.source = "store://artifacts/proj/my_code"
+
+    artifact = MagicMock()
+    artifact.kind = "code"
+    artifact.spec.requirements = None
+
+    with patch("mlrun.datastore.get_store_resource", return_value=artifact):
+        launcher.enrich_runtime(runtime, project_name="proj")
+
+    assert not runtime.spec.build.requirements
+    assert runtime.spec.image == "some/image:tag"
+    assert runtime.spec.build.base_image is None
 
 
 def test_run_error_status(rundb_mock):
@@ -135,3 +190,24 @@ def test_run_error_status(rundb_mock):
     with pytest.raises(mlrun.runtimes.utils.RunError) as exc:
         launcher.launch(runtime, run, watch=True)
     assert "some error" in str(exc.value)
+
+
+def test_store_function_set_token_name():
+    launcher = mlrun.launcher.remote.ClientRemoteLauncher()
+    runtime = mlrun.code_to_function(
+        name="test",
+        kind="job",
+        filename=str(func_path),
+        handler=handler,
+    )
+    runtime.kind = "handler"
+    db = mlrun.get_run_db()
+    db.token_provider = unittest.mock.MagicMock(token_name="provider-run-token")
+    run = mlrun.run.RunObject(spec=mlrun.model.RunSpec())
+
+    launcher._store_function(runtime, run)
+    assert run.spec.auth["token_name"] == "provider-run-token"
+
+    with mlrun.RuntimeConfigurationContext(auth_token_name="context-run-token"):
+        launcher._store_function(runtime, run)
+        assert run.spec.auth["token_name"] == "context-run-token"

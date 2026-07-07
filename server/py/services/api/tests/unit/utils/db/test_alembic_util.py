@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import os.path
 import pathlib
 import typing
@@ -70,7 +70,7 @@ def mock_database(
     monkeypatch, mock_alembic, mock_db_file_name
 ) -> typing.Callable[[list[str], str, bool, bool], None]:
     def _mock_database(
-        revision_history: typing.Optional[list[str]] = None,
+        revision_history: list[str] | None = None,
         current_revision: str = "",
         db_file_exists: bool = True,
         db_backup_exists: bool = True,

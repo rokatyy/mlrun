@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import json
+
 import typing
 from time import sleep
 
 import pandas as pd
-import pytz
-from dateutil import parser
-from kfp import Client
 
 import mlrun
+import mlrun.common.schemas
+import mlrun.utils
 import mlrun_pipelines
-from mlrun_pipelines.models import PipelineRun
+import mlrun_pipelines.client
+import mlrun_pipelines.mixins
+import mlrun_pipelines.models
+import mlrun_pipelines.utils
 
 # Interval for logging deletion progress
 DELETION_LOG_INTERVAL = 100
@@ -53,14 +54,23 @@ def delete_project_old_pipelines(
 
     """
     # Validate and convert dates
-    end_date = _validate_and_convert_date(end_date)
-    start_date = "" if not start_date else _validate_and_convert_date(start_date)
+    end_date = mlrun.utils.validate_and_convert_date(end_date)
+    start_date = (
+        "" if not start_date else mlrun.utils.validate_and_convert_date(start_date)
+    )
 
     # get KFP client
     kfp_client = _get_kfp_client()
-
+    experiments = kfp_client.get_candidate_experiments_for_projects(
+        project_names=[project_name],
+    )
+    experiment_ids = [experiment.id for experiment in experiments]
     # Generate filter and query runs
-    query_filter = _get_list_runs_filter(project_name, end_date, start_date)
+    query_filter = mlrun_pipelines.client.create_list_runs_filter(
+        experiment_ids=experiment_ids,
+        end_date=end_date,
+        start_date=start_date,
+    )
 
     # Query and filter runs
     runs, experiments_ids = _query_and_filter_runs(
@@ -71,80 +81,23 @@ def delete_project_old_pipelines(
     _delete_runs_and_empty_experiments(
         context, kfp_client, runs, experiments_ids, dry_run
     )
-    _delete_runs(context, kfp_client, runs, dry_run)
+    _delete_runs(context, kfp_client, runs)
 
     # Find and delete empty experiments
     _delete_empty_experiments(context, kfp_client, experiments_ids)
 
 
-def _validate_and_convert_date(date_input: str) -> str:
-    """
-    Converts any recognizable date string into a standardized RFC 3339 format.
-    :param date_input: A date string in a recognizable format.
-    """
-    try:
-        dt_object = parser.parse(date_input)
-        if dt_object.tzinfo is not None:
-            # Convert to UTC if it's in a different timezone
-            dt_object = dt_object.astimezone(pytz.utc)
-        else:
-            # If no timezone info is present, assume it's in local time
-            local_tz = pytz.timezone("UTC")
-            dt_object = local_tz.localize(dt_object)
-
-        # Convert the datetime object to an RFC 3339-compliant string.
-        # RFC 3339 requires timestamps to be in ISO 8601 format with a 'Z' suffix for UTC time.
-        # The isoformat() method adds a "+00:00" suffix for UTC by default,
-        # so we replace it with "Z" to ensure compliance.
-        formatted_date = dt_object.isoformat().replace("+00:00", "Z")
-        formatted_date = formatted_date.rstrip("Z") + "Z"
-
-        return formatted_date
-    except (ValueError, OverflowError) as e:
-        raise ValueError(
-            f"Invalid date format: {date_input}."
-            f" Date format must adhere to the RFC 3339 standard (e.g., 'YYYY-MM-DDTHH:MM:SSZ' for UTC)."
-        ) from e
-
-
 def _get_kfp_client(
     kfp_url=mlrun.mlconf.kfp_url, namespace: str = mlrun.mlconf.namespace
-) -> Client:
-    kfp_client = mlrun_pipelines.utils.get_client(kfp_url, namespace)
+) -> mlrun_pipelines.client.Client:
+    kfp_client = mlrun_pipelines.utils.get_client(
+        mlrun.utils.logger, kfp_url, namespace
+    )
     return kfp_client
 
 
-def _get_list_runs_filter(project_name: str, end_date: str, start_date: str) -> str:
-    filters = {
-        "predicates": [
-            {
-                "key": "created_at",
-                "op": 7,  # Operation 7 corresponds to '<=' (less than or equal)
-                "timestamp_value": end_date,
-            },
-        ]
-    }
-    if project_name != "*":
-        filters["predicates"].append(
-            {
-                "key": "name",
-                "op": 9,  # Operation 9 corresponds to substring matching
-                "string_value": project_name,
-            }
-        )
-    if start_date:
-        filters["predicates"].append(
-            {
-                "key": "created_at",
-                "op": 5,  # Operation 5 corresponds to '>=' (greater than or equal)
-                "timestamp_value": start_date,
-            }
-        )
-    return json.dumps(filters)
-
-
 def _query_and_filter_runs(
-    kfp_client: Client, project_name: str, query_filter: str
+    kfp_client: mlrun_pipelines.client.Client, project_name: str, query_filter: str
 ) -> tuple[list[tuple[str, str]], set]:
     """
     Query the pipeline runs and filter them based on the project name.
@@ -181,12 +134,12 @@ def _query_and_filter_runs(
 
 
 def _list_pipelines_runs(
-    kfp_client: Client,
+    kfp_client: mlrun_pipelines.client.Client,
     query_filter: str,
     page_token: str = "",
     sort_by: str = "",
     batch_size: int = 1000,
-) -> list[PipelineRun]:
+) -> list[mlrun_pipelines.models.PipelineRun]:
     runs = []
     while page_token:
         # kfp doesn't allow us to pass both a page_token and the `filter` and `sort_by` params.
@@ -198,7 +151,9 @@ def _list_pipelines_runs(
             sort_by=sort_by if page_token == "" else "",
             filter=query_filter if page_token == "" else "",
         )
-        runs.extend([PipelineRun(run) for run in response.runs or []])
+        runs.extend(
+            [mlrun_pipelines.models.PipelineRun(run) for run in response.runs or []]
+        )
         page_token = response.next_page_token
 
         if len(runs) % batch_size == 0:
@@ -207,8 +162,8 @@ def _list_pipelines_runs(
 
 
 def _filter_project_runs(
-    project_name: str, runs: list[PipelineRun]
-) -> list[PipelineRun]:
+    project_name: str, runs: list[mlrun_pipelines.models.PipelineRun]
+) -> list[mlrun_pipelines.models.PipelineRun]:
     # If project_name is "*", return all runs without filtering
     if project_name == "*":
         return runs
@@ -225,7 +180,7 @@ def _filter_project_runs(
 
 def _delete_runs_and_empty_experiments(
     context: mlrun.MLClientCtx,
-    kfp_client: Client,
+    kfp_client: mlrun_pipelines.client.Client,
     runs: list[tuple[str, str]],
     experiments_ids: set[str],
     dry_run: bool,
@@ -258,7 +213,7 @@ def _delete_runs_and_empty_experiments(
 
 def _delete_runs(
     context: mlrun.MLClientCtx,
-    kfp_client: Client,
+    kfp_client: mlrun_pipelines.client.Client,
     runs: list[tuple[str, str]],
 ) -> None:
     """
@@ -277,7 +232,7 @@ def _delete_runs(
 
 def _delete_empty_experiments(
     context: mlrun.MLClientCtx,
-    kfp_client: Client,
+    kfp_client: mlrun_pipelines.client.Client,
     experiments_ids: set[str],
 ) -> None:
     """
@@ -300,7 +255,7 @@ def _delete_empty_experiments(
 
 
 def _find_empty_experiments(
-    kfp_client: Client, experiments_ids: set
+    kfp_client: mlrun_pipelines.client.Client, experiments_ids: set
 ) -> list[tuple[str, str]]:
     # Find empty experiments
     empty_experiment_ids = []
@@ -313,7 +268,9 @@ def _find_empty_experiments(
     return empty_experiment_ids
 
 
-def _get_experiment_name(kfp_client: Client, experiment_id: str) -> str:
+def _get_experiment_name(
+    kfp_client: mlrun_pipelines.client.Client, experiment_id: str
+) -> str:
     experiment = kfp_client.get_experiment(experiment_id=experiment_id)
     return experiment.name if experiment else ""
 

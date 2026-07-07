@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import fastapi
 import sqlalchemy.orm
 from fastapi.concurrency import run_in_threadpool
@@ -25,13 +25,6 @@ import services.api.crud
 router = fastapi.APIRouter()
 
 
-# TODO: remove /log/{project}/{uid} in 1.8.0
-@router.post(
-    "/log/{project}/{uid}",
-    deprecated=True,
-    description="/log/{project}/{uid} is deprecated in 1.5.0 and will be removed in 1.8.0, "
-    "use /projects/{project}/logs/{uid} instead",
-)
 @router.post("/projects/{project}/logs/{uid}")
 async def store_log(
     request: fastapi.Request,
@@ -62,19 +55,13 @@ async def store_log(
     return {}
 
 
-# TODO: remove /log/{project}/{uid} in 1.8.0
-@router.get(
-    "/log/{project}/{uid}",
-    deprecated=True,
-    description="/log/{project}/{uid} is deprecated in 1.5.0 and will be removed in 1.8.0, "
-    "use /projects/{project}/logs/{uid} instead",
-)
 @router.get("/projects/{project}/logs/{uid}")
 async def get_log(
     project: str,
     uid: str,
     size: int = -1,
     offset: int = 0,
+    attempt: int = 0,
     auth_info: mlrun.common.schemas.AuthInfo = fastapi.Depends(
         framework.api.deps.authenticate_request
     ),
@@ -95,8 +82,9 @@ async def get_log(
             auth_info,
         )
     )
+
     run_state, log_stream = await services.api.crud.Logs().get_logs(
-        db_session, project, uid, size, offset
+        db_session, project, uid, size, offset, attempt=attempt
     )
     headers = {
         "x-mlrun-run-state": run_state,
@@ -112,8 +100,12 @@ async def get_log(
 async def get_log_size(
     project: str,
     uid: str,
+    attempt: int = 0,
     auth_info: mlrun.common.schemas.AuthInfo = fastapi.Depends(
         framework.api.deps.authenticate_request
+    ),
+    db_session: sqlalchemy.orm.Session = fastapi.Depends(
+        framework.api.deps.get_db_session
     ),
 ):
     await (
@@ -125,7 +117,10 @@ async def get_log_size(
             auth_info,
         )
     )
-    log_file_size = await services.api.crud.Logs().get_log_size(project, uid)
+
+    log_file_size = await services.api.crud.Logs().get_log_size(
+        db_session, project, uid, attempt=attempt
+    )
     return {
         "size": log_file_size,
     }

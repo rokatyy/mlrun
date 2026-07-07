@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import copy
 import pathlib
 
@@ -47,6 +47,7 @@ def _get_runtime():
             "tolerations": None,
             "node_selector": "",
             "state_thresholds": mlrun.mlconf.function.spec.state_thresholds.default.to_dict(),
+            "mount_otlp_secret": False,
         },
         "verbose": False,
     }

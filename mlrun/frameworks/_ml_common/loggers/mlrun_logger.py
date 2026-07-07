@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import re
 
 import numpy as np
@@ -73,7 +73,7 @@ class MLRunLogger(Logger):
         """
         for parameter_name, parameter_value in self._context.parameters.items():
             # Check if the parameter is a trackable value:
-            if isinstance(parameter_value, (str, bool, float, int)):
+            if isinstance(parameter_value, str | bool | float | int):
                 self.log_static_hyperparameter(
                     parameter_name=parameter_name, value=parameter_value
                 )

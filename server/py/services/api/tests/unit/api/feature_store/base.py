@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from http import HTTPStatus
 
 from deepdiff import DeepDiff
@@ -21,10 +21,19 @@ import mlrun.common.schemas
 
 
 def _list_and_assert_objects(
-    client: TestClient, entity_name, project, query, expected_number_of_entities
+    client: TestClient,
+    entity_name,
+    project,
+    query,
+    expected_number_of_entities,
+    version=None,
 ):
     entity_url_name = entity_name.replace("_", "-")
-    url = f"projects/{project}/{entity_url_name}"
+    url = (
+        f"{version}/projects/{project}/{entity_url_name}"
+        if version
+        else f"projects/{project}/{entity_url_name}"
+    )
     if query:
         url = url + f"?{query}"
     response = client.get(url)
@@ -32,9 +41,9 @@ def _list_and_assert_objects(
     response_body = response.json()
     assert entity_name in response_body
     number_of_entities = len(response_body[entity_name])
-    assert (
-        number_of_entities == expected_number_of_entities
-    ), f"wrong number of {entity_name} in response - {number_of_entities} instead of {expected_number_of_entities}"
+    assert number_of_entities == expected_number_of_entities, (
+        f"wrong number of {entity_name} in response - {number_of_entities} instead of {expected_number_of_entities}"
+    )
     return response_body
 
 

@@ -11,7 +11,47 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pickle
+import typing
+from typing import Any
+
+import fsspec
+import numpy as np
+import pandas as pd
+from cloudpickle import load
+
+import mlrun.artifacts
 import mlrun.serving
+
+
+class BatchedModel(mlrun.serving.states.Model):
+    def __init__(self, model_path: str, **kwargs):
+        super().__init__(**kwargs)
+        self.model_path = model_path
+        self.model = None
+
+    def load(self) -> None:
+        with fsspec.open(self.model_path, "rb") as f:
+            self.model = pickle.load(f)
+
+    def predict(self, body, **kwargs):
+        invocation_body = body.get("input")
+        if isinstance(invocation_body, dict):
+            # example of single invocation
+            x = pd.DataFrame([invocation_body])
+        elif isinstance(invocation_body, list):
+            x = pd.DataFrame(invocation_body)
+        else:
+            x = invocation_body
+        predictions = self.model.predict(x).tolist()
+        return [round(v, 6) for v in predictions]
+
+    @staticmethod
+    def format_batch(body: typing.Any):
+        batched_body = {"input": []}
+        for item in body:
+            batched_body["input"].append(item.get("input", item))
+        return batched_body
 
 
 class OneToOne(mlrun.serving.V2ModelServer):
@@ -55,3 +95,208 @@ class OneToMany(mlrun.serving.V2ModelServer):
         else:
             outputs = [inputs[0], inputs[0], 3.0, "a", 5]
         return outputs
+
+
+class IncModel(mlrun.serving.states.Model):
+    def __init__(self, *args, inc: int, gpu_number: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.inc = inc
+        self.gpu_number = gpu_number
+
+    def predict(self, body, **kwargs):
+        body["n"] += self.inc
+        body.pop("models", None)
+        if self.gpu_number is not None:
+            body["gpu"] = self.gpu_number
+        return body
+
+    async def predict_async(self, body):
+        return self.predict(body)
+
+
+class MyRemoteModel(mlrun.serving.states.Model):
+    def predict(self, body, **kwargs):
+        body["url"] = self.model_artifact.model_url
+        body["default_config"] = self.model_artifact.default_config
+        return body
+
+
+class Echo:
+    def __init__(self, name=None):
+        self.name = name
+
+    def do(self, x):
+        print("Echo:", self.name, x)
+        return x
+
+
+class MyModel(mlrun.serving.Model):
+    def __init__(
+        self,
+        *args,
+        artifact_uri: str | None = None,
+        raise_exception: bool = False,
+        gpu_number: int | None = None,
+        **kwargs,
+    ):
+        super().__init__(
+            *args, artifact_uri=artifact_uri, raise_exception=raise_exception, **kwargs
+        )
+        self.gpu_number = gpu_number
+        self.model_spec = None
+        self.model = None
+        self._params = {}
+
+    def get_model(self, suffix=""):
+        """get the model file(s) and metadata from model store
+
+        the method returns a path to the model file and the extra data (dict of dataitem objects)
+        it also loads the model metadata into the self.model_spec attribute, allowing direct access
+        to all the model metadata attributes.
+
+        get_model is usually used in the model .load() method to init the model
+        Examples
+        --------
+        ::
+
+            def load(self):
+                model_file, extra_data = self.get_model(suffix=".pkl")
+                self.model = load(open(model_file, "rb"))
+                categories = extra_data["categories"].as_df()
+
+        Parameters
+        ----------
+        suffix : str
+            optional, model file suffix (when the model_path is a directory)
+
+        Returns
+        -------
+        str
+            (local) model file
+        dict
+            extra dataitems dictionary
+
+        """
+        if self.artifact_uri:
+            model_file, self.model_spec, extra_dataitems = mlrun.artifacts.get_model(
+                self.artifact_uri, suffix
+            )
+            if self.model_spec and self.model_spec.parameters:
+                for key, value in self.model_spec.parameters.items():
+                    self._params[key] = value
+            return model_file, extra_dataitems
+        return None, None
+
+    def load(self):
+        """load and initialize the model and/or other elements"""
+        model_file, extra_data = self.get_model(".pkl")
+        self.model = load(open(model_file, "rb"))
+
+    def predict(self, body: dict, **kwargs) -> dict:
+        """Generate model predictions from sample."""
+        feats = np.asarray(body["inputs"])
+        start = mlrun.utils.now_date().isoformat(sep=" ", timespec="microseconds")
+        result: np.ndarray = self.model.predict(feats)
+        body["outputs"] = result.tolist()
+        body["timestamp"] = start
+        return body
+
+    def format_batch(self, body: Any):
+        if isinstance(body, list):
+            batched_body = {"inputs": []}
+            for item in body:
+                batched_body["inputs"].append(item.get("inputs", item))
+            return batched_body
+        return body
+
+    async def predict_async(self, body):
+        return self.predict(body)
+
+
+class StreamingModel(mlrun.serving.Model):
+    """Model that yields streaming chunks for monitoring test.
+
+    This model simulates a streaming LLM-like response by yielding
+    multiple chunks from predict(). Used to test model monitoring
+    with streaming ModelRunnerStep.
+    """
+
+    def __init__(self, *args, num_chunks: int = 3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.num_chunks = num_chunks
+
+    def predict(self, body, **kwargs):
+        """Yield streaming chunks for aggregation testing."""
+        prompt = body.get("prompt", "default") if isinstance(body, dict) else str(body)
+        for i in range(self.num_chunks):
+            yield f"{prompt}_chunk_{i}"
+
+
+class MyModelSelector(mlrun.serving.states.ModelRunnerSelector):
+    """Selector that reads a 'models' key (comma-separated string) from the
+    event body to choose which models to run. Falls back to all models when
+    the key is absent."""
+
+    def select_models(self, event, available_models):
+        body = event.body if hasattr(event, "body") else event
+        if isinstance(body, dict) and "models" in body:
+            return body.pop("models").split(",")
+        return None
+
+
+class MyDictModel(mlrun.serving.Model):
+    def __init__(self, *args, artifact_uri: str, **kwargs):
+        super().__init__(*args, artifact_uri=artifact_uri, **kwargs)
+        self.model = None
+
+    def get_model(self, suffix=""):
+        """get the model file(s) and metadata from model store
+
+        the method returns a path to the model file and the extra data (dict of dataitem objects)
+        it also loads the model metadata into the self.model_spec attribute, allowing direct access
+        to all the model metadata attributes.
+
+        get_model is usually used in the model .load() method to init the model
+        Examples
+        --------
+        ::
+
+            def load(self):
+                model_file, extra_data = self.get_model(suffix=".pkl")
+                self.model = load(open(model_file, "rb"))
+                categories = extra_data["categories"].as_df()
+
+        Parameters
+        ----------
+        suffix : str
+            optional, model file suffix (when the model_path is a directory)
+
+        Returns
+        -------
+        str
+            (local) model file
+        dict
+            extra dataitems dictionary
+
+        """
+        if self.artifact_uri:
+            model_file, self.model_spec, extra_dataitems = mlrun.artifacts.get_model(
+                self.artifact_uri, suffix
+            )
+            return model_file, extra_dataitems
+        return None, None
+
+    def load(self):
+        """load and initialize the model and/or other elements"""
+        model_file, _ = self.get_model(".pkl")
+        self.model = load(open(model_file, "rb"))
+
+    def predict(self, body: dict, **kwargs) -> dict:
+        """Generate model predictions from sample."""
+        if "dict_inputs" in body and isinstance(body["dict_inputs"], dict):
+            feats = np.asarray([list(body["dict_inputs"].values())])
+        else:
+            feats = np.asarray(body["dict_inputs"])
+        result: np.ndarray = self.model.predict(feats)
+        body["dict_outputs"] = {"label": result.tolist()}
+        return body

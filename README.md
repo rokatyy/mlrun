@@ -4,11 +4,23 @@
 [![PyPI version fury.io](https://badge.fury.io/py/mlrun.svg)](https://pypi.python.org/pypi/mlrun/)
 [![Documentation](https://readthedocs.org/projects/mlrun/badge/?version=latest)](https://mlrun.readthedocs.io/en/latest/?badge=latest)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-![GitHub commit activity](https://img.shields.io/github/commit-activity/w/mlrun/mlrun)
-![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/mlrun/mlrun?sort=semver)
+[![GitHub commit activity](https://img.shields.io/github/commit-activity/w/mlrun/mlrun)](https://github.com/mlrun/mlrun/commits/main)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/mlrun/mlrun?sort=semver)](https://github.com/mlrun/mlrun/releases)
 [![Join MLOps Live](https://img.shields.io/badge/slack-join_chat-white.svg?logo=slack&style=social)](https://mlopslive.slack.com)
 
-<p align="left"><img src="https://github.com/mlrun/mlrun/raw/development/docs/_static/images/MLRun-logo.png" alt="MLRun logo" width="150"/></p>
+<div>
+  <span>
+    <picture>
+      <img img align="left" src="./docs/_static/images/MLRun-logo.png" alt="MLRun logo" width="150"/>
+    </picture>
+  </span>
+  <span>
+    <picture>
+      <img img align="right" src="./docs/_static/images/maintenance_logo.svg" alt="Maintenance logo" width="250"/>
+    </picture>
+  </span>
+  <br clear="all"/>
+</div>
 
 # Using MLRun 
 
@@ -16,7 +28,7 @@ MLRun is an open source AI orchestration platform for quickly building and manag
 MLRun significantly reduces engineering efforts, time to production, and computation resources. 
 With MLRun, you can choose any IDE on your local machine or on the cloud. MLRun breaks the silos between data, ML, software, and DevOps/MLOps teams, enabling collaboration and fast continuous improvements.
 
-Get started with the MLRun [**Tutorials and Examples**](https://docs.mlrun.org/en/stable/tutorials/index.html) and the [**Installation and setup guide**](https://docs.mlrun.org/en/stable/install.html), or read about the [**MLRun Architecture**](https://docs.mlrun.org/en/stable/architecture.html).
+Get started with the MLRun [**Tutorials and Examples**](https://docs.mlrun.org/en/stable/tutorials/index.html) and the [**Set up your client environment**](https://docs.mlrun.org/en/stable/setup-guide.md), or read about the [**MLRun Architecture**](https://docs.mlrun.org/en/stable/architecture.html).
 
 This page explains how MLRun addresses the [**gen AI tasks**](#genai-tasks), [**MLOps tasks**](#mlops-tasks), and presents the [**MLRun core components**](#core-components).
 
@@ -24,7 +36,7 @@ See the supported data stores, development tools, services, platforms, etc., sup
 
 ## Gen AI tasks
 
-<p align="center"><img src="https://github.com/mlrun/mlrun/raw/development/docs/_static/images/ai-tasks.png" alt="ai-tasks" width="800"/></p><br>
+<p align="center"><img src="./docs/_static/images/ai-tasks.png" alt="ai-tasks" width="800"/></p><br>
 
 Use MLRun to develop, scale, deploy, and monitor your AI model across your enterprise. The [**gen AI development workflow**](https://docs.mlrun.org/en/stable/genai/genai-flow.html) 
 section describes the different tasks and stages in detail.
@@ -37,13 +49,13 @@ Removing inappropriate data at an early stage saves resources that would otherwi
 
 
 **Docs:**
-[Using LLMs to process unstructured data](https://docs.mlrun.org/en/stable/genai/data-mgmt/unstructured-data.html)
-[Vector databases](https://docs.mlrun.org/en/stable/genai/data-mgmt/vector-databases.html)
+[Using LLMs to process unstructured data](https://docs.mlrun.org/en/stable/genai/data-mgmt/unstructured-data.html),
+[Vector databases](https://docs.mlrun.org/en/stable/genai/data-mgmt/vector-databases.html),
 [Guardrails for data management](https://docs.mlrun.org/en/stable/genai/data-mgmt/guardrails-data.html)
 **Demo:**
-[Call center demo](https://github.com/mlrun/demo-call-center>`
+[Call center demo](https://github.com/mlrun/demo-call-center)
 **Video:**
-[Call center](https://youtu.be/YycMbxRgLBA>`
+[Call center](https://youtu.be/YycMbxRgLBA)
 
 ### Development
 Use MLRun to build an automated ML pipeline to: collect data, 
@@ -52,7 +64,8 @@ preprocess (prepare) the data, run the training pipeline, and evaluate the model
 **Docs:**
 [Working with RAG](https://docs.mlrun.org/en/stable/genai/development/working-with-rag.html), [Evalating LLMs](https://docs.mlrun.org/en/stable/genai/development/evaluating-llms.html), [Fine tuning LLMS](https://docs.mlrun.org/en/stable/genai/development/fine-tuning-llms.html)
 **Demos:**
-[Call center demo](https://github.com/mlrun/demo-call-center), [Build & deploy custom (fine-tuned) LLM models and applications](https://github.com/mlrun/demo-llm-tuning/blob/main), [Interactive bot demo using LLMs](https://github.com/mlrun/demo-llm-bot/blob/main)
+[Call center demo](https://github.com/mlrun/demo-call-center),
+[Banking agent demo](https://github.com/mlrun/demo-banking-agent)
 **Video:**
 [Call center](https://youtu.be/YycMbxRgLBA)
 
@@ -64,13 +77,14 @@ inferring results using one or more models, and driving actions.
 
 
 **Docs:**
-[Serving gen AI models](https://docs.mlrun.org/en/stable/genai/deployment/genai_serving.html), GPU utilization](https://docs.mlrun.org/en/stable/genai/deployment/gpu_utilization.html), [Gen AI realtime serving graph](https://docs.mlrun.org/en/stable/genai/deployment/genai_serving_graph.html)
+[Serving gen AI models](https://docs.mlrun.org/en/stable/genai/deployment/genai_serving.html), [GPU utilization](https://docs.mlrun.org/en/stable/genai/deployment/gpu_utilization.html), [Gen AI realtime serving graph](https://docs.mlrun.org/en/stable/genai/deployment/genai_serving_graph.html)
 **Tutorial:**
-[Deploy LLM using MLRun](https://docs.mlrun.org/en/stable/tutorials/genai_01_basic_tutorial.html)
+[Deploy LLM using MLRun](https://docs.mlrun.org/en/stable/tutorials/genai-01-basic-tutorial.html)
 **Demos:**
-[Call center demo](https://github.com/mlrun/demo-call-center), [Build & deploy custom(fine-tuned)]LLM models and applications <https://github.com/mlrun/demo-llm-tuning/blob/main), [Interactive bot demo using LLMs]<https://github.com/mlrun/demo-llm-bot/blob/main)
+[Call center demo](https://github.com/mlrun/demo-call-center),
+[Banking agent demo](https://github.com/mlrun/demo-banking-agent)
 **Video:**
-[Call center]<https://youtu.be/YycMbxRgLBA)
+[Call center](https://youtu.be/YycMbxRgLBA)
 
 
 ### Live Ops
@@ -81,15 +95,15 @@ Collect production data, metadata, and metrics to tune the model and application
 **Docs:**
 [Model monitoring <monitoring](https://docs.mlrun.org/en/stable/concepts/monitoring.html), [Alerts and notifications](https://docs.mlrun.org/en/stable/concepts/alerts-notifications.html)
 **Tutorials:**
-[Deploy LLM using MLRun](https://docs.mlrun.org/en/stable/tutorials/genai_01_basic_tutorial.html), [Model monitoring using LLM](https://docs.mlrun.org/en/stable/tutorials/genai-02-monitoring-llm.html)
+[Deploy LLM using MLRun](https://docs.mlrun.org/en/stable/tutorials/genai-01-basic-tutorial.html), [Model monitoring using LLM](https://docs.mlrun.org/en/stable/tutorials/genai-02-monitoring-llm.html)
 **Demo:**
-[Build & deploy custom (fine-tuned) LLM models and applications](https://github.com/mlrun/demo-llm-tuning/blob/main)
+[Banking agent demo](https://github.com/mlrun/demo-banking-agent)
 
 
 <a id="mlops-tasks"></a>
 ## MLOps tasks
 
-<p align="center"><img src="https://github.com/mlrun/mlrun/raw/development/docs/_static/images/mlops-task.png" alt="mlrun-tasks" width="800"/></p><br>
+<p align="center"><img src="./docs/_static/images/mlops-task.png" alt="mlrun-tasks" width="800"/></p><br>
 
 The [**MLOps development workflow**](https://docs.mlrun.org/en/stable/mlops-dev-flow.html) section describes the different tasks and stages in detail.
 MLRun can be used to automate and orchestrate all the different tasks or just specific tasks (and integrate them with what you have already deployed).
@@ -139,7 +153,7 @@ Observability is built into the different MLRun objects (data, functions, jobs, 
 <a id="core-components"></a>
 ## MLRun core components
 
-<p align="center"><img src="https://github.com/mlrun/mlrun/raw/development/docs/_static/images/mlops-core.png" alt="mlrun-core" width="800"/></p><br>
+<p align="center"><img src="./docs/_static/images/mlops-core.png" alt="mlrun-core" width="800"/></p><br>
 
 
 MLRun includes the following major components:

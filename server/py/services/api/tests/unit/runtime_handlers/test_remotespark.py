@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from services.api.tests.unit.runtime_handlers.test_kubejob import (
-    TestKubejobRuntimeHandler,
+    TestKubejobRuntimeHandler as _TestKubejobRuntimeHandler,
 )
 
 
-class TestRemoteSparkjobRuntimeHandler(TestKubejobRuntimeHandler):
+class TestRemoteSparkjobRuntimeHandler(_TestKubejobRuntimeHandler):
     """
     Remote Spark runtime behaving pretty much like the kubejob runtime just with few modifications (several automations
     we want to do for the user) so we're simply running the same tests as the ones of the job runtime

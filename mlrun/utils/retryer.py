@@ -77,7 +77,17 @@ def create_exponential_backoff(base=2, max_value=120, scale_factor=1):
 
 
 class Retryer:
-    def __init__(self, backoff, timeout, logger, verbose, function, *args, **kwargs):
+    def __init__(
+        self,
+        backoff,
+        timeout,
+        logger,
+        verbose,
+        function,
+        *args,
+        fatal_exceptions=(),
+        **kwargs,
+    ):
         """
         Initialize function retryer with given *args and **kwargs.
         Tries to run it until success or timeout reached (timeout is optional)
@@ -89,6 +99,7 @@ class Retryer:
         :param verbose: whether to log the failure on each retry
         :param _function: function to run
         :param args: functions args
+        :param fatal_exceptions: exception types that should not be retried
         :param kwargs: functions kwargs
         """
         self.backoff = backoff
@@ -96,6 +107,7 @@ class Retryer:
         self.logger = logger
         self.verbose = verbose
         self.function = function
+        self.fatal_exceptions = tuple(fatal_exceptions or ())
         self.args = args
         self.kwargs = kwargs
         self.start_time = None
@@ -106,8 +118,10 @@ class Retryer:
         self._prepare()
         while not self._timeout_exceeded():
             next_interval = self.first_interval or next(self.backoff)
+            self.first_interval = None
             result, exc, retry = self._perform_call(next_interval)
-            if retry:
+
+            if retry and type(exc) not in self.fatal_exceptions:
                 time.sleep(next_interval)
             elif not exc:
                 return result
@@ -184,8 +198,9 @@ class AsyncRetryer(Retryer):
         self._prepare()
         while not self._timeout_exceeded():
             next_interval = self.first_interval or next(self.backoff)
+            self.first_interval = None
             result, exc, retry = await self._perform_call(next_interval)
-            if retry:
+            if retry and type(exc) not in self.fatal_exceptions:
                 await asyncio.sleep(next_interval)
             elif not exc:
                 return result
@@ -201,6 +216,7 @@ class AsyncRetryer(Retryer):
         except mlrun.errors.MLRunFatalFailureError as exc:
             raise exc.original_exception
         except Exception as exc:
+            self.last_exception = exc
             return (
                 None,
                 self.last_exception,

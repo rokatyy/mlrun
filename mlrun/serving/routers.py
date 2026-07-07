@@ -17,8 +17,8 @@ import concurrent.futures
 import copy
 import json
 import traceback
-import typing
-from enum import Enum
+from datetime import timedelta
+from enum import StrEnum
 from io import BytesIO
 from typing import Union
 
@@ -30,6 +30,9 @@ import mlrun.common.model_monitoring
 import mlrun.common.schemas.model_monitoring
 from mlrun.utils import logger, now_date
 
+from ..common.model_monitoring.helpers import (
+    get_model_endpoints_creation_task_status,
+)
 from .utils import RouterToDict, _extract_input_data, _update_result_body
 from .v2_serving import _ModelLogPusher
 
@@ -43,13 +46,13 @@ class BaseModelRouter(RouterToDict):
     def __init__(
         self,
         context=None,
-        name: typing.Optional[str] = None,
+        name: str | None = None,
         routes=None,
-        protocol: typing.Optional[str] = None,
-        url_prefix: typing.Optional[str] = None,
-        health_prefix: typing.Optional[str] = None,
-        input_path: typing.Optional[str] = None,
-        result_path: typing.Optional[str] = None,
+        protocol: str | None = None,
+        url_prefix: str | None = None,
+        health_prefix: str | None = None,
+        input_path: str | None = None,
+        result_path: str | None = None,
         **kwargs,
     ):
         """Model Serving Router, route between child models
@@ -78,7 +81,16 @@ class BaseModelRouter(RouterToDict):
         self.inputs_key = "instances" if self.protocol == "v1" else "inputs"
         self._input_path = input_path
         self._result_path = result_path
+        self._background_task_check_timestamp = None
+        self._background_task_current_state = None
         self.kwargs = kwargs
+
+    @property
+    def background_task_reached_terminal_state(self):
+        return (
+            self._background_task_current_state
+            and self._background_task_current_state != "running"
+        )
 
     def parse_event(self, event):
         parsed_event = {}
@@ -135,6 +147,7 @@ class BaseModelRouter(RouterToDict):
             raise ValueError(
                 f"illegal path prefix {urlpath}, must start with {self.url_prefix}"
             )
+        self._update_background_task_state(event)
         return event
 
     def do_event(self, event, *args, **kwargs):
@@ -159,6 +172,40 @@ class BaseModelRouter(RouterToDict):
     def postprocess(self, event):
         """run tasks after processing the event"""
         return event
+
+    def _update_background_task_state(self, event):
+        if not self.background_task_reached_terminal_state and (
+            self._background_task_check_timestamp is None
+            or now_date() - self._background_task_check_timestamp
+            >= timedelta(
+                seconds=mlrun.mlconf.model_endpoint_monitoring.model_endpoint_creation_check_period
+            )
+        ):
+            server: mlrun.serving.GraphServer = getattr(
+                self.context, "_server", None
+            ) or getattr(self.context, "server", None)
+            if not self.context.is_mock:
+                (
+                    self._background_task_current_state,
+                    self._background_task_check_timestamp,
+                    _,
+                ) = get_model_endpoints_creation_task_status(server)
+            elif self.context.monitoring_mock:
+                self._background_task_current_state = (
+                    mlrun.common.schemas.BackgroundTaskState.succeeded
+                )
+                self._background_task_check_timestamp = mlrun.utils.now_date()
+            else:
+                self._background_task_current_state = (
+                    mlrun.common.schemas.BackgroundTaskState.failed
+                )
+                self._background_task_check_timestamp = mlrun.utils.now_date()
+
+        if event.body:
+            event.body["background_task_state"] = (
+                self._background_task_current_state
+                or mlrun.common.schemas.BackgroundTaskState.running
+            )
 
 
 class ModelRouter(BaseModelRouter):
@@ -208,7 +255,7 @@ class ModelRouter(BaseModelRouter):
         return event
 
 
-class ParallelRunnerModes(str, Enum):
+class ParallelRunnerModes(StrEnum):
     """Supported parallel running modes for VotingEnsemble"""
 
     array = "array"  # running one by one
@@ -224,14 +271,14 @@ class ParallelRunnerModes(str, Enum):
         ]
 
 
-class VotingTypes(str, Enum):
+class VotingTypes(StrEnum):
     """Supported voting types for VotingEnsemble"""
 
     classification = "classification"
     regression = "regression"
 
 
-class OperationTypes(str, Enum):
+class OperationTypes(StrEnum):
     """Supported opreations for VotingEnsemble"""
 
     infer = "infer"
@@ -246,11 +293,11 @@ class ParallelRun(BaseModelRouter):
     def __init__(
         self,
         context=None,
-        name: typing.Optional[str] = None,
+        name: str | None = None,
         routes=None,
-        protocol: typing.Optional[str] = None,
-        url_prefix: typing.Optional[str] = None,
-        health_prefix: typing.Optional[str] = None,
+        protocol: str | None = None,
+        url_prefix: str | None = None,
+        health_prefix: str | None = None,
         extend_event=None,
         executor_type: Union[ParallelRunnerModes, str] = ParallelRunnerModes.thread,
         **kwargs,
@@ -305,12 +352,13 @@ class ParallelRun(BaseModelRouter):
         self.name = name or "ParallelRun"
         self.extend_event = extend_event
         self.executor_type = ParallelRunnerModes(executor_type)
-        self._pool: typing.Optional[
+        self._pool: (
             Union[
                 concurrent.futures.ProcessPoolExecutor,
                 concurrent.futures.ThreadPoolExecutor,
             ]
-        ] = None
+            | None
+        ) = None
 
     def _apply_logic(self, results: dict, event=None):
         """
@@ -478,17 +526,17 @@ class VotingEnsemble(ParallelRun):
     def __init__(
         self,
         context=None,
-        name: typing.Optional[str] = None,
+        name: str | None = None,
         routes=None,
-        protocol: typing.Optional[str] = None,
-        url_prefix: typing.Optional[str] = None,
-        health_prefix: typing.Optional[str] = None,
-        vote_type: typing.Optional[str] = None,
-        weights: typing.Optional[dict[str, float]] = None,
+        protocol: str | None = None,
+        url_prefix: str | None = None,
+        health_prefix: str | None = None,
+        vote_type: str | None = None,
+        weights: dict[str, float] | None = None,
         executor_type: Union[ParallelRunnerModes, str] = ParallelRunnerModes.thread,
         format_response_with_col_name_flag: bool = False,
         prediction_col_name: str = "prediction",
-        shard_by_endpoint: typing.Optional[bool] = None,
+        shard_by_endpoint: bool | None = None,
         **kwargs,
     ):
         """Voting Ensemble
@@ -599,75 +647,29 @@ class VotingEnsemble(ParallelRun):
         self.log_router = True
         self.prediction_col_name = prediction_col_name or "prediction"
         self.format_response_with_col_name_flag = format_response_with_col_name_flag
-        self.model_endpoint_uid = None
-        self.model_endpoint = None
+        self.model_endpoint_uid = kwargs.get("model_endpoint_uid", None)
         self.shard_by_endpoint = shard_by_endpoint
+        self._model_logger = None
         self.initialized = False
 
     def post_init(self, mode="sync", **kwargs):
         self._update_weights(self.weights)
 
-    def _lazy_init(self, event_id):
-        server: mlrun.serving.GraphServer = getattr(
-            self.context, "_server", None
-        ) or getattr(self.context, "server", None)
-        if not server:
-            logger.warn("GraphServer not initialized for VotingEnsemble instance")
-            return
-        if not self.context.is_mock or self.context.monitoring_mock:
-            if server.model_endpoint_creation_task_name:
-                background_task = mlrun.get_run_db().get_project_background_task(
-                    server.project, server.model_endpoint_creation_task_name
+    def _lazy_init(self, event):
+        if event and isinstance(event, dict):
+            background_task_state = event.get("background_task_state", None)
+            if (
+                background_task_state
+                == mlrun.common.schemas.BackgroundTaskState.succeeded
+            ):
+                self._model_logger = (
+                    _ModelLogPusher(self, self.context)
+                    if self.context
+                    and self.context.stream.enabled
+                    and self.model_endpoint_uid
+                    else None
                 )
-                logger.info(
-                    "Checking model endpoint creation task status",
-                    task_name=server.model_endpoint_creation_task_name,
-                )
-                if (
-                    background_task.status.state
-                    in mlrun.common.schemas.BackgroundTaskState.terminal_states()
-                ):
-                    logger.info(
-                        f"Model endpoint creation task completed with state {background_task.status.state}"
-                    )
-                else:  # in progress
-                    logger.debug(
-                        f"Model endpoint creation task is still in progress with the current state: "
-                        f"{background_task.status.state}. This event will not be monitored.",
-                        name=self.name,
-                        event_id=event_id,
-                    )
-                    self.initialized = False
-                    return
-            else:
-                logger.info(
-                    "Model endpoint creation task name not provided",
-                )
-            try:
-                self.model_endpoint_uid = (
-                    mlrun.get_run_db()
-                    .get_model_endpoint(
-                        project=server.project,
-                        name=self.name,
-                        function_name=server.function_name,
-                        function_tag=server.function_tag or "latest",
-                        tsdb_metrics=False,
-                    )
-                    .metadata.uid
-                )
-            except mlrun.errors.MLRunNotFoundError:
-                logger.info(
-                    "Model endpoint not found for this step; monitoring for this model will not be performed",
-                    function_name=server.function_name,
-                    name=self.name,
-                )
-                self.model_endpoint_uid = None
-        self._model_logger = (
-            _ModelLogPusher(self, self.context)
-            if self.context and self.context.stream.enabled and self.model_endpoint_uid
-            else None
-        )
-        self.initialized = True
+                self.initialized = True
 
     def _resolve_route(self, body, urlpath):
         """Resolves the appropriate model to send the event to.
@@ -872,14 +874,14 @@ class VotingEnsemble(ParallelRun):
         Response
             Event response after running the requested logic
         """
-        if not self.initialized:
-            self._lazy_init(event.id)
         start = now_date()
         # Handle and verify the request
         original_body = event.body
         event.body = _extract_input_data(self._input_path, event.body)
         event = self.preprocess(event)
         event = self._pre_handle_event(event)
+        if not self.initialized:
+            self._lazy_init(event.body)
 
         # Should we terminate the event?
         if hasattr(event, "terminated") and event.terminated:
@@ -984,7 +986,7 @@ class VotingEnsemble(ParallelRun):
         List
             The model's predictions
         """
-        if isinstance(response, (list, numpy.ndarray)):
+        if isinstance(response, list | numpy.ndarray):
             return response
         try:
             self.format_response_with_col_name_flag = True
@@ -1055,13 +1057,13 @@ class EnrichmentModelRouter(ModelRouter):
     def __init__(
         self,
         context=None,
-        name: typing.Optional[str] = None,
+        name: str | None = None,
         routes=None,
-        protocol: typing.Optional[str] = None,
-        url_prefix: typing.Optional[str] = None,
-        health_prefix: typing.Optional[str] = None,
+        protocol: str | None = None,
+        url_prefix: str | None = None,
+        health_prefix: str | None = None,
         feature_vector_uri: str = "",
-        impute_policy: typing.Optional[dict] = None,
+        impute_policy: dict | None = None,
         **kwargs,
     ):
         """
@@ -1121,7 +1123,7 @@ class EnrichmentModelRouter(ModelRouter):
 
     def preprocess(self, event):
         """Turn an entity identifier (source) to a Feature Vector"""
-        if isinstance(event.body, (str, bytes)):
+        if isinstance(event.body, str | bytes):
             event.body = json.loads(event.body)
         event.body["inputs"] = self._feature_service.get(
             event.body["inputs"], as_list=True
@@ -1137,16 +1139,16 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
     def __init__(
         self,
         context=None,
-        name: typing.Optional[str] = None,
+        name: str | None = None,
         routes=None,
         protocol=None,
-        url_prefix: typing.Optional[str] = None,
-        health_prefix: typing.Optional[str] = None,
-        vote_type: typing.Optional[str] = None,
+        url_prefix: str | None = None,
+        health_prefix: str | None = None,
+        vote_type: str | None = None,
         executor_type: Union[ParallelRunnerModes, str] = ParallelRunnerModes.thread,
-        prediction_col_name: typing.Optional[str] = None,
+        prediction_col_name: str | None = None,
         feature_vector_uri: str = "",
-        impute_policy: typing.Optional[dict] = None,
+        impute_policy: dict | None = None,
         **kwargs,
     ):
         """
@@ -1199,7 +1201,7 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
             fn.add_model(<model_name>, <model_path>, <model_class_name>)
 
         How to extend the VotingEnsemble
-        --------------------------------
+
         The VotingEnsemble applies its logic using the `logic(predictions)` function.
         The `logic()` function receives an array of (# samples, # predictors) which you
         can then use to apply whatever logic you may need.
@@ -1273,7 +1275,7 @@ class EnrichmentVotingEnsemble(VotingEnsemble):
         """
         Turn an entity identifier (source) to a Feature Vector
         """
-        if isinstance(event.body, (str, bytes)):
+        if isinstance(event.body, str | bytes):
             event.body = json.loads(event.body)
         event.body["inputs"] = self._feature_service.get(
             event.body["inputs"], as_list=True

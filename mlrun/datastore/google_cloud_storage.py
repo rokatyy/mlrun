@@ -14,7 +14,6 @@
 import json
 import os
 from pathlib import Path
-from typing import Optional
 
 from fsspec.registry import get_filesystem_class
 from google.auth.credentials import Credentials
@@ -34,9 +33,7 @@ class GoogleCloudStorageStore(DataStore):
     workers = 8
     chunk_size = 32 * 1024 * 1024
 
-    def __init__(
-        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
-    ):
+    def __init__(self, parent, schema, name, endpoint="", secrets: dict | None = None):
         super().__init__(parent, name, schema, endpoint, secrets=secrets)
         self._storage_client = None
         self._storage_options = None
@@ -105,12 +102,12 @@ class GoogleCloudStorageStore(DataStore):
             except json.JSONDecodeError:
                 # If it's not json, handle it as a filename
                 token = credentials
-            return self._sanitize_storage_options(dict(token=token))
+            return self._sanitize_options(dict(token=token))
         else:
             logger.info(
                 "No GCS credentials available - auth will rely on auto-discovery of credentials"
             )
-            return self._sanitize_storage_options(None)
+            return self._sanitize_options(None)
 
     def get_storage_options(self):
         return self.storage_options
@@ -134,9 +131,11 @@ class GoogleCloudStorageStore(DataStore):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "Append mode not supported for Google cloud storage datastore"
             )
-        data, mode = self._prepare_put_data(data, append)
-        with self.filesystem.open(path, mode) as f:
-            f.write(data)
+        data, _ = self._prepare_put_data(data, append)
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        # pipe_file streams in chunks; write() buffers the whole body.
+        self.filesystem.pipe_file(path, data)
 
     def upload(self, key, src_path):
         file_size = os.path.getsize(src_path)
@@ -194,7 +193,7 @@ class GoogleCloudStorageStore(DataStore):
         self.filesystem.exists(path)
         super().rm(path, recursive=recursive, maxdepth=maxdepth)
 
-    def get_spark_options(self):
+    def get_spark_options(self, path=None):
         res = {}
         st = self._get_credentials()
         if "token" in st:

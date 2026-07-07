@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import tempfile
 from pathlib import Path
-from typing import Union
 
 import pytest
 
@@ -33,7 +32,7 @@ from mlrun.package.utils import StructFileSupportedFormat
     "file_format",
     StructFileSupportedFormat.get_all_formats(),
 )
-def test_formatter(obj: Union[list, dict], file_format: str):
+def test_formatter(obj: list | dict, file_format: str):
     """
     Test the formatters for writing and reading python objects.
 

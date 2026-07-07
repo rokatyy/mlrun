@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from abc import ABC
-from typing import Generic, TypeVar, Union
+from typing import Generic, TypeVar
 
 # A generic type for a supported format handler class type:
 FileHandlerType = TypeVar("FileHandlerType")
@@ -56,7 +56,7 @@ class SupportedFormat(ABC, Generic[FileHandlerType]):
         return cls._FORMAT_HANDLERS_MAP[fmt]
 
     @classmethod
-    def match_format(cls, path: str) -> Union[str, None]:
+    def match_format(cls, path: str) -> str | None:
         """
         Try to match one of the available formats this class holds to a given path.
 

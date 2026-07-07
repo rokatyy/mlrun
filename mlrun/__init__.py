@@ -17,33 +17,41 @@ __all__ = [
     "set_environment",
     "code_to_function",
     "import_function",
-    "handler",
     "ArtifactType",
     "get_secret_or_env",
     "mount_v3io",
     "v3io_cred",
     "auto_mount",
     "VolumeMount",
+    "sync_secret_tokens",
+    "RuntimeConfigurationContext",
+    "Client",
+    "Credentials",
 ]
 
-import collections
 from os import environ, path
 from typing import Optional
 
 import dotenv
 
+import mlrun.runtime_configuration_context
+
+from .client import Client, Credentials
+from .common.constants import MLRUN_ACTIVE_PROJECT
 from .config import config as mlconf
-from .datastore import DataItem, store_manager
+from .datastore import DataItem, ModelProvider, store_manager
 from .db import get_run_db
 from .errors import MLRunInvalidArgumentError, MLRunNotFoundError
 from .execution import MLClientCtx
+from .hub import get_hub_item, get_hub_module, get_hub_step, import_module
 from .model import RunObject, RunTemplate, new_task
-from .package import ArtifactType, DefaultPackager, Packager, handler
+from .package import ArtifactType, DefaultPackager, LogHint, Packager
 from .projects import (
     MlrunProject,
     ProjectMetadata,
     build_function,
     deploy_function,
+    get_model_monitoring_url,
     get_or_create_project,
     load_project,
     new_project,
@@ -56,16 +64,18 @@ from .run import (
     code_to_function,
     function_to_module,
     get_dataitem,
+    get_model_provider,
     get_object,
     get_or_create_ctx,
     get_pipeline,
     import_function,
     new_function,
     retry_pipeline,
+    terminate_pipeline,
     wait_for_pipeline_completion,
 )
 from .runtimes import mounts, new_model_server
-from .secrets import get_secret_or_env
+from .secrets import get_secret_or_env, sync_secret_tokens
 from .utils.version import Version
 
 __version__ = Version().get()["version"]
@@ -74,6 +84,33 @@ VolumeMount = mounts.VolumeMount
 mount_v3io = mounts.mount_v3io
 v3io_cred = mounts.v3io_cred
 auto_mount = mounts.auto_mount
+RuntimeConfigurationContext = (
+    mlrun.runtime_configuration_context.RuntimeConfigurationContext
+)
+
+
+# TODO: Remove in MLRun 1.13.0.
+def __getattr__(name):
+    """handler decorator property"""
+
+    if name == "handler":
+        import warnings
+
+        warnings.warn(
+            message=(
+                "The `mlrun.handler` decorator is applied automatically if `mlrun.mlconf.packagers.enabled` is set to "
+                "True (by default its True). It should not be used manually in that case."
+                "If you still need to use it manually, please import it from `mlrun.package.handler` instead. Usage of "
+                "the decorator directly from `mlrun.handler` will be removed in MLRun 1.13.0."
+            ),
+            category=FutureWarning,
+            stacklevel=2,
+        )
+        from mlrun.package import handler
+
+        return handler
+
+    raise AttributeError(f"module {__name__} has no attribute {name}")
 
 
 def get_version():
@@ -89,12 +126,12 @@ if "IGZ_NAMESPACE_DOMAIN" in environ:
 
 
 def set_environment(
-    api_path: Optional[str] = None,
+    api_path: str | None = None,
     artifact_path: str = "",
-    access_key: Optional[str] = None,
-    username: Optional[str] = None,
-    env_file: Optional[str] = None,
-    mock_functions: Optional[str] = None,
+    access_key: str | None = None,
+    username: str | None = None,
+    env_file: str | None = None,
+    mock_functions: str | None = None,
 ):
     """set and test default config for: api path, artifact_path and project
 
@@ -121,7 +158,7 @@ def set_environment(
     :param mock_functions: set to True to create local/mock functions instead of real containers,
                            set to "auto" to auto determine based on the presence of k8s/Nuclio
     :returns:
-        default project name
+        active project name
         actual artifact path/url, can be used to create subpaths per task or group of artifacts
     """
     if env_file:
@@ -158,19 +195,37 @@ def set_environment(
             artifact_path = path.abspath(artifact_path)
         elif not artifact_path.startswith("/") and "://" not in artifact_path:
             raise ValueError(
-                "artifact_path must refer to an absolute path" " or a valid url"
+                "artifact_path must refer to an absolute path or a valid url"
             )
         mlconf.artifact_path = artifact_path
 
-    return mlconf.default_project, mlconf.artifact_path
+    return mlconf.active_project, mlconf.artifact_path
 
 
-def get_current_project(silent: bool = False) -> Optional[MlrunProject]:
-    if not pipeline_context.project and not silent:
+def get_current_project(silent: bool = False) -> MlrunProject | None:
+    if pipeline_context.project:
+        return pipeline_context.project
+
+    project_name = environ.get(MLRUN_ACTIVE_PROJECT, None)
+    if not project_name:
+        if not silent:
+            raise MLRunInvalidArgumentError(
+                "No current project is initialized. Use new, get or load project functions first."
+            )
+        return None
+
+    project = load_project(
+        name=project_name,
+        url=project_name,
+        save=False,
+        sync_functions=False,
+    )
+
+    if not project and not silent:
         raise MLRunInvalidArgumentError(
             "No current project is initialized. Use new, get or load project functions first."
         )
-    return pipeline_context.project
+    return project
 
 
 def get_sample_path(subpath=""):
@@ -185,7 +240,7 @@ def get_sample_path(subpath=""):
     return samples_path
 
 
-def set_env_from_file(env_file: str, return_dict: bool = False) -> Optional[dict]:
+def set_env_from_file(env_file: str, return_dict: bool = False) -> dict | None:
     """Read and set and/or return environment variables from a file
     the env file should have lines in the form KEY=VALUE, comment line start with "#"
 
@@ -215,40 +270,10 @@ def set_env_from_file(env_file: str, return_dict: bool = False) -> Optional[dict
     if None in env_vars.values():
         raise MLRunInvalidArgumentError("env file lines must be in the form key=value")
 
-    ordered_env_vars = order_env_vars(env_vars)
-    for key, value in ordered_env_vars.items():
+    for key, value in env_vars.items():
         environ[key] = value
 
-    mlconf.reload()  # reload mlrun configuration
-    return ordered_env_vars if return_dict else None
-
-
-def order_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
-    """
-    Order and process environment variables by first handling specific ordered keys,
-    then processing the remaining keys in the given dictionary.
-
-    The function ensures that environment variables defined in the `ordered_keys` list
-    are added to the result dictionary first. Any other environment variables from
-    `env_vars` are then added in the order they appear in the input dictionary.
-
-    :param env_vars: A dictionary where each key is the name of an environment variable (str),
-                      and each value is the corresponding environment variable value (str).
-    :return: A dictionary with the processed environment variables, ordered with the specific
-             keys first, followed by the rest in their original order.
-    """
-    ordered_keys = mlconf.get_ordered_keys()
-
-    ordered_env_vars = collections.OrderedDict()
-
-    # First, add the ordered keys to the dictionary
-    for key in ordered_keys:
-        if key in env_vars:
-            ordered_env_vars[key] = env_vars[key]
-
-    # Then, add the remaining keys (those not in ordered_keys)
-    for key, value in env_vars.items():
-        if key not in ordered_keys:
-            ordered_env_vars[key] = value
-
-    return ordered_env_vars
+    # reload mlrun configuration, skipping the default env file to prevent
+    # ~/.mlrun.env from overriding the env vars we just set explicitly
+    mlconf.reload(skip_env_file=True)
+    return env_vars if return_dict else None

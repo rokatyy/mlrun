@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import json
 import typing
+from enum import IntEnum
 from typing import Any, Union
 
 from kfp_server_api.models.api_run_detail import ApiRunDetail
 
+from mlrun.common.types import StrEnum
 from mlrun_pipelines.common.helpers import FlexibleMapper
 from mlrun_pipelines.imports import ContainerOp
 
@@ -190,3 +191,21 @@ class PipelineExperiment(FlexibleMapper):
     @property
     def id(self):
         return self._external_data["id"]
+
+
+class FilterOperations(IntEnum):
+    UNKNOWN = 0
+    EQUALS = 1
+    NOT_EQUALS = 2
+    GREATER_THAN = 3
+    GREATER_THAN_EQUALS = 5
+    LESS_THAN = 6
+    LESS_THAN_EQUALS = 7
+    IS_SUBSTRING = 9
+    IN = 8
+    NOT_IN = 10
+
+
+class FilterFields(StrEnum):
+    CREATED_AT = "created_at"
+    EXPERIMENT_ID = "experiment_id"

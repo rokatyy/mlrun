@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import http
 from unittest import mock
 
@@ -102,12 +102,12 @@ def test_raise_for_aiohttp_client_response_status():
     response.reason = "Service Unavailable"
     with pytest.raises(MLRunHTTPError) as exc:
         raise_for_status(response)
-    assert (
-        exc.value.response.status_code == http.HTTPStatus.SERVICE_UNAVAILABLE
-    ), "should have raised 503"
-    assert isinstance(
-        exc.value.response, ClientResponse
-    ), "should have aiohttp client response in exception"
+    assert exc.value.response.status_code == http.HTTPStatus.SERVICE_UNAVAILABLE, (
+        "should have raised 503"
+    )
+    assert isinstance(exc.value.response, ClientResponse), (
+        "should have aiohttp client response in exception"
+    )
 
 
 class TestErrToStatusCodeError(Exception):

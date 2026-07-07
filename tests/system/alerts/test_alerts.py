@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import os
 import time
 import typing
 
@@ -32,19 +31,25 @@ from mlrun.common.schemas.model_monitoring.model_endpoints import (
     ModelEndpointList,
 )
 from mlrun.datastore import get_stream_pusher
-from mlrun.datastore.datastore_profile import DatastoreProfileV3io
+from mlrun.datastore.datastore_profile import (
+    register_temporary_client_datastore_profile,
+)
 from mlrun.model_monitoring.helpers import get_stream_path
 from tests.system.base import TestMLRunSystem
+from tests.system.model_monitoring import TestMLRunSystemModelMonitoring
 
 
 @TestMLRunSystem.skip_test_if_env_not_configured
 class TestAlerts(TestMLRunSystem):
-    project_name = "alerts-test-project"
+    def setup_method(self, method):
+        # unique per-test project name
+        unique_suffix = method.__name__.replace("_", "-")
+        self.project_name = f"alert-{unique_suffix}"
+        super().setup_method(method)
 
     # Set image to "<repo>/mlrun:<tag>" for local testing
-    image: typing.Optional[str] = None
+    image: str | None = None
 
-    @pytest.mark.smoke
     def test_job_failure_alert(self):
         """
         validate that an alert is sent in case a job fails
@@ -159,21 +164,45 @@ class TestAlerts(TestMLRunSystem):
         validate that an alert is sent with different result kind and different detection result
         """
         # enable model monitoring - deploy writer function
-        self.project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
+        tsdb_profile = TestMLRunSystemModelMonitoring.get_tsdb_profile(
+            self.mm_tsdb_profile_data
         )
+        register_temporary_client_datastore_profile(tsdb_profile)
+        self.project.register_datastore_profile(tsdb_profile)
+
+        stream_profile = TestMLRunSystemModelMonitoring.get_stream_profile(
+            self.mm_stream_profile_data
+        )
+        register_temporary_client_datastore_profile(stream_profile)
+        self.project.register_datastore_profile(stream_profile)
+
+        self.project.set_model_monitoring_credentials(
+            tsdb_profile_name=tsdb_profile.name,
+            stream_profile_name=stream_profile.name,
+        )
+
         self.project.enable_model_monitoring(image=self.image or "mlrun/mlrun")
+
         # deploy nuclio func for storing notifications, to validate an alert notifications were sent on drift detection
         nuclio_function_url = notification_helpers.deploy_notification_nuclio(
             self.project, self.image
         )
-        model_endpoint = mlrun.model_monitoring.api.get_or_create_model_endpoint(
-            project=self.project.metadata.name,
-            model_endpoint_name="test-endpoint",
-            context=mlrun.get_or_create_ctx("demo"),
+        # generate a new model-endpoint
+        model_endpoint = mlrun.get_run_db().create_model_endpoint(
+            mlrun.common.schemas.ModelEndpoint(
+                metadata=mlrun.common.schemas.ModelEndpointMetadata(
+                    name="test-endpoint",
+                    project=self.project.metadata.name,
+                    endpoint_type=mlrun.common.schemas.model_monitoring.EndpointType.NODE_EP,
+                ),
+                spec=mlrun.common.schemas.ModelEndpointSpec(
+                    function_name="test-function",
+                    function_tag="latest",
+                ),
+                status=mlrun.common.schemas.ModelEndpointStatus(
+                    monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled,
+                ),
+            )
         )
 
         # waits for the writer function to be deployed
@@ -185,7 +214,7 @@ class TestAlerts(TestMLRunSystem):
         stream_uri = get_stream_path(
             project=self.project.metadata.name,
             function_name=mm_constants.MonitoringFunctionNames.WRITER,
-            profile=DatastoreProfileV3io(name="tmp"),
+            profile=stream_profile,
         )
         output_stream = get_stream_pusher(stream_uri)
 
@@ -197,8 +226,10 @@ class TestAlerts(TestMLRunSystem):
                 model_endpoint.metadata.uid, result_name, model_endpoint.metadata.name
             )
         )
-
-        time.sleep(5)
+        # wait for the event to be processed, changed as part of adding tsdb target (writer) with flush configuration
+        time.sleep(
+            5 + mlconf.model_endpoint_monitoring.writer_graph.flush_after_seconds
+        )
         # generate alerts for the different result kind and return text from the expected notifications that will be
         # used later to validate that the notifications were sent as expected
         expected_notifications = self._generate_alerts(
@@ -227,7 +258,7 @@ class TestAlerts(TestMLRunSystem):
             expected_endpoint_alerts_count=4,
         )
 
-    def test_job_failure_alert_sliding_window(self):
+    def test_sliding_window_alert(self):
         """
 
         This test simulates a scenario where a job is expected to fail twice within a two-minute window,
@@ -256,7 +287,7 @@ class TestAlerts(TestMLRunSystem):
         # create an alert with webhook notification that should trigger when the job fails twice in two minutes
         alert_name = "failure-webhook"
         alert_summary = "Job failed"
-        alert_criteria = alert_objects.AlertCriteria(period="2m", count=2)
+        alert_criteria = alert_objects.AlertCriteria(period="30s", count=2)
         run_id = f"{function_name}-handler"
         notifications = self._generate_failure_notifications(nuclio_function_url)
 
@@ -274,15 +305,13 @@ class TestAlerts(TestMLRunSystem):
         with pytest.raises(Exception):
             self.project.run_function(function_name)
 
-        # Wait for more than two minutes to simulate a delay that is slightly longer than the alert period
-        time.sleep(125)
+        # wait for the periodic monitor runs function to run as it may take up to the maximum events_generation_interval
+        # to detect the event + an extra 40s to simulate a delay that is slightly longer than the alert period
+        time.sleep(mlconf.alerts.events_generation_interval + 40)
 
         # this is the second failure
         with pytest.raises(Exception):
             self.project.run_function(function_name)
-
-        # wait since there is a might be a delay
-        time.sleep(mlconf.alerts.events_generation_interval)
 
         # validate that no notifications were sent yet, as the two failures did not occur within the same period
         expected_notifications = []
@@ -298,7 +327,7 @@ class TestAlerts(TestMLRunSystem):
         # validate that the alert was triggered and the notification was sent
         expected_notifications = ["notification failure"]
 
-        # wait since there is a might be a delay
+        # wait since there might be a delay
         mlrun.utils.retry_until_successful(
             3,
             10 * 3,
@@ -310,6 +339,151 @@ class TestAlerts(TestMLRunSystem):
         )
         mlrun.get_run_db().delete_function(
             name=function_name, project=self.project.name
+        )
+
+    def test_alert_cooldown_auto_reset(self):
+        """
+        Verify that an alert with cooldown_period stays ACTIVE during the cooldown window,
+        then is automatically reset to INACTIVE by the periodic reset task once it expires.
+
+        Also verifies that a second event fired during cooldown does not send a duplicate
+        notification (since the alert is already active).
+        """
+        # must be >= cooldown_reset_interval (enforced by validation); add a margin so
+        # the cooldown outlasts at least one full reset-interval cycle.
+        cooldown_seconds = max(30, int(mlconf.alerts.cooldown_reset_interval) + 15)
+        alert_name = "cooldown-auto-reset"
+        entity_id = "cooldown-auto-reset-job"
+
+        nuclio_function_url = notification_helpers.deploy_notification_nuclio(
+            self.project, self.image
+        )
+        notifications = self._generate_failure_notifications(nuclio_function_url)
+        self._create_custom_alert_config(
+            name=alert_name,
+            entity_kind=alert_objects.EventEntityKind.JOB,
+            entity_id=entity_id,
+            summary="Cooldown auto-reset test alert",
+            event_name=alert_objects.EventKind.FAILED,
+            notifications=notifications,
+            cooldown_period=f"{cooldown_seconds}s",
+        )
+
+        db = mlrun.get_run_db()
+        event = mlrun.common.schemas.Event(
+            kind=alert_objects.EventKind.FAILED,
+            entity=alert_objects.EventEntities(
+                kind=alert_objects.EventEntityKind.JOB,
+                project=self.project_name,
+                ids=[entity_id],
+            ),
+        )
+
+        # trigger first event — alert becomes active and enters cooldown
+        db.generate_event(
+            alert_objects.EventKind.FAILED, event, project=self.project_name
+        )
+
+        # alert should immediately be ACTIVE
+        mlrun.utils.retry_until_successful(
+            2,
+            15,
+            self._logger,
+            True,
+            self._assert_alert_state,
+            alert_name,
+            alert_objects.AlertActiveState.ACTIVE,
+        )
+
+        # validate the notification was sent
+        self._validate_notifications_on_nuclio(
+            nuclio_function_url, ["notification failure"]
+        )
+
+        # trigger second event during cooldown — alert stays ACTIVE, no new notification
+        db.generate_event(
+            alert_objects.EventKind.FAILED, event, project=self.project_name
+        )
+        # wait for the event to be processed before asserting no notification was sent
+        time.sleep(mlconf.alerts.events_generation_interval + 5)
+        self._validate_notifications_on_nuclio(nuclio_function_url, [])
+
+        # wait for cooldown to expire and the periodic reset task to run;
+        # worst case: task just fired when cooldown started, so we need up to
+        # cooldown + 2 * reset_interval before the next run detects the expiry.
+        mlrun.utils.retry_until_successful(
+            5,
+            cooldown_seconds + 2 * int(mlconf.alerts.cooldown_reset_interval) + 10,
+            self._logger,
+            True,
+            self._assert_alert_state,
+            alert_name,
+            alert_objects.AlertActiveState.INACTIVE,
+        )
+
+    def test_alert_cooldown_manual_reset(self):
+        """
+        Verify that a manual reset immediately clears the alert state regardless
+        of the remaining cooldown, and that the alert can be re-triggered afterwards.
+        """
+        alert_name = "cooldown-manual-reset"
+        entity_id = "cooldown-manual-reset-job"
+
+        nuclio_function_url = notification_helpers.deploy_notification_nuclio(
+            self.project, self.image
+        )
+        notifications = self._generate_failure_notifications(nuclio_function_url)
+        self._create_custom_alert_config(
+            name=alert_name,
+            entity_kind=alert_objects.EventEntityKind.JOB,
+            entity_id=entity_id,
+            summary="Cooldown manual reset test alert",
+            event_name=alert_objects.EventKind.FAILED,
+            notifications=notifications,
+            # long enough to not expire during the test
+            cooldown_period="5m",
+        )
+
+        db = mlrun.get_run_db()
+        event = mlrun.common.schemas.Event(
+            kind=alert_objects.EventKind.FAILED,
+            entity=alert_objects.EventEntities(
+                kind=alert_objects.EventEntityKind.JOB,
+                project=self.project_name,
+                ids=[entity_id],
+            ),
+        )
+
+        # trigger event — alert enters cooldown
+        db.generate_event(
+            alert_objects.EventKind.FAILED, event, project=self.project_name
+        )
+        mlrun.utils.retry_until_successful(
+            2,
+            15,
+            self._logger,
+            True,
+            self._assert_alert_state,
+            alert_name,
+            alert_objects.AlertActiveState.ACTIVE,
+        )
+
+        # manually reset — should clear cooldown immediately
+        db.reset_alert_config(alert_name, project=self.project_name)
+        self._assert_alert_state(alert_name, alert_objects.AlertActiveState.INACTIVE)
+
+        # re-trigger — proves the reset was effective and the alert fires again
+        db.generate_event(
+            alert_objects.EventKind.FAILED, event, project=self.project_name
+        )
+        mlrun.utils.retry_until_successful(
+            2,
+            15,
+            self._logger,
+            True,
+            self._assert_alert_state,
+            alert_name,
+            alert_objects.AlertActiveState.ACTIVE,
         )
 
     @staticmethod
@@ -365,6 +539,7 @@ class TestAlerts(TestMLRunSystem):
         event_name,
         notifications,
         criteria=None,
+        cooldown_period=None,
     ):
         alert_data = mlrun.alerts.alert.AlertConfig(
             project=self.project_name,
@@ -376,6 +551,7 @@ class TestAlerts(TestMLRunSystem):
             ),
             trigger=alert_objects.AlertTrigger(events=[event_name]),
             criteria=criteria,
+            cooldown_period=cooldown_period,
             notifications=notifications,
         )
 
@@ -400,20 +576,25 @@ class TestAlerts(TestMLRunSystem):
             severity=alert_objects.AlertSeverity.LOW,
             criteria=criteria,
         )
-        mlrun.get_run_db().store_alert_config(name, alert_data[0])
+        self.project.store_alert_config(alert_data[0])
 
     def _validate_project_alerts_summary(
         self,
         expected_job_alerts_count=0,
         expected_endpoint_alerts_count=0,
-        expected_other_alerts_count=0,
+        expected_application_alerts_count=0,
+        expected_infra_alerts_count=0,
     ):
         project_summary = mlrun.get_run_db().get_project_summary(
             project=self.project_name
         )
         assert project_summary.job_alerts_count == expected_job_alerts_count
         assert project_summary.endpoint_alerts_count == expected_endpoint_alerts_count
-        assert project_summary.other_alerts_count == expected_other_alerts_count
+        assert (
+            project_summary.application_alerts_count
+            == expected_application_alerts_count
+        )
+        assert project_summary.infra_alerts_count == expected_infra_alerts_count
 
     @staticmethod
     def _validate_notifications_on_nuclio(nuclio_function_url, expected_notifications):
@@ -583,3 +764,11 @@ class TestAlerts(TestMLRunSystem):
                 ]
             )
         return expected_notifications
+
+    def _assert_alert_state(self, alert_name, expected_state):
+        alert = mlrun.get_run_db().get_alert_config(
+            alert_name, project=self.project_name
+        )
+        assert alert.state == expected_state, (
+            f"Expected alert '{alert_name}' state={expected_state}, got {alert.state}"
+        )

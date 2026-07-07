@@ -13,7 +13,6 @@
 # limitations under the License.
 import base64
 import typing
-import warnings
 from io import BytesIO
 
 import mlrun
@@ -35,12 +34,6 @@ class PlotArtifact(Artifact):
     def __init__(
         self, key=None, body=None, is_inline=False, target_path=None, title=None
     ):
-        if key or body or is_inline or target_path:
-            warnings.warn(
-                "Artifact constructor parameters are deprecated and will be removed in 1.9.0. "
-                "Use the metadata and spec parameters instead.",
-                DeprecationWarning,
-            )
         super().__init__(key, body, format="html", target_path=target_path)
         self.metadata.description = title
 
@@ -49,7 +42,7 @@ class PlotArtifact(Artifact):
         import matplotlib
 
         if not self.spec.get_body() or not isinstance(
-            self.spec.get_body(), (bytes, matplotlib.figure.Figure)
+            self.spec.get_body(), bytes | matplotlib.figure.Figure
         ):
             raise ValueError(
                 "matplotlib fig or png bytes must be provided as artifact body"
@@ -84,8 +77,8 @@ class PlotlyArtifact(Artifact):
     def __init__(
         self,
         figure: typing.Optional["Figure"] = None,
-        key: typing.Optional[str] = None,
-        target_path: typing.Optional[str] = None,
+        key: str | None = None,
+        target_path: str | None = None,
     ) -> None:
         """
         Initialize a Plotly artifact with the given figure.
@@ -94,12 +87,6 @@ class PlotlyArtifact(Artifact):
         :param key:         Key for the artifact to be stored in the database.
         :param target_path: Path to save the artifact.
         """
-        if key or target_path:
-            warnings.warn(
-                "Artifact constructor parameters are deprecated and will be removed in 1.9.0. "
-                "Use the metadata and spec parameters instead.",
-                DeprecationWarning,
-            )
         # Validate the plotly package:
         try:
             from plotly.graph_objs import Figure

@@ -22,8 +22,10 @@ from .base import (
     DirArtifact,
     get_artifact_meta,
 )
+from .code import CodeArtifact, CodeArtifactCodeType, CodeArtifactSpec
 from .dataset import DatasetArtifact, TableArtifact, update_dataset_meta
 from .document import DocumentArtifact, DocumentLoaderSpec, MLRunLoader
+from .llm_prompt import LLMPromptArtifact, LLMPromptArtifactSpec
 from .manager import (
     ArtifactManager,
     ArtifactProducer,

@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
+import time
 import unittest.mock
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 import mlrun.common.runtimes.constants
 import mlrun.common.schemas
+import mlrun.errors
 import mlrun.model
 from tests.conftest import new_run
 
 import framework.db.sqldb.helpers
-import services.api.initial_data
+import framework.db.sqldb.models
 from framework.tests.unit.db.common_fixtures import TestDatabaseBase
 
 
@@ -185,6 +187,10 @@ class TestRuns(TestDatabaseBase):
         assert len(distinct_runs) == 1
         assert isinstance(distinct_runs[0], dict)
         assert distinct_runs[0]["metadata"]["uid"] == uid
+        # The full record per uid is the representative (highest-id) row, i.e. the last
+        # iteration stored. This is resolved via a portable max(id)+IN query rather than a
+        # MySQL-only loose GROUP BY, so PostgreSQL's strict GROUP BY does not reject it.
+        assert distinct_runs[0]["metadata"]["iter"] == 2
 
         only_uids = self._db.list_distinct_runs_uids(
             self._db_session, project=project_name, only_uids=True
@@ -269,7 +275,7 @@ class TestRuns(TestDatabaseBase):
         )
 
         # Second store - should allow to override the start time
-        run["status"]["start_time"] = datetime.now(timezone.utc).isoformat()
+        run["status"]["start_time"] = datetime.now(UTC).isoformat()
         self._db.store_run(self._db_session, run, uid, project)
 
         # get the start time and verify
@@ -283,64 +289,8 @@ class TestRuns(TestDatabaseBase):
         )
         assert runs[0].struct["status"]["start_time"] == run["status"]["start_time"]
 
-    def test_data_migration_align_runs_table(self):
-        time_before_creation = datetime.now(tz=timezone.utc)
-        # Create runs
-        for project in ["run-project-1", "run-project-2", "run-project-3"]:
-            for name in ["run-name-1", "run-name-2", "run-name-3"]:
-                for index in range(3):
-                    uid = f"{name}-uid-{index}"
-                    for iteration in range(3):
-                        self._create_new_run(
-                            project,
-                            name,
-                            uid,
-                            iteration,
-                            state=mlrun.common.runtimes.constants.RunStates.completed,
-                        )
-        # get all run records, and change to be as they will be in field (before the migration)
-        runs = self._db._find_runs(self._db_session, None, "*", None).all()
-        for run in runs:
-            self._change_run_record_to_before_align_runs_migration(
-                run, time_before_creation
-            )
-            self._db._upsert(self._db_session, [run], ignore=True)
-
-        # run the migration
-        services.api.initial_data._align_runs_table(self._db, self._db_session)
-
-        # assert after migration column start time aligned to the body start time
-        runs = self._db._find_runs(self._db_session, None, "*", None).all()
-        for run in runs:
-            self._ensure_run_after_align_runs_migration(run, time_before_creation)
-
-    def test_data_migration_align_runs_table_with_empty_run_body(self):
-        time_before_creation = datetime.now(tz=timezone.utc)
-        # First store - fills the start_time
-        project, name, uid, iteration, run = self._create_new_run(
-            state=mlrun.common.runtimes.constants.RunStates.completed
-        )
-        # get all run records, and change to be as they will be in field (before the migration)
-        runs = self._db._find_runs(self._db_session, None, "*", None).all()
-        assert len(runs) == 1
-        run = runs[0]
-        # change to be as it will be in field (before the migration) and then empty the body
-        self._change_run_record_to_before_align_runs_migration(
-            run, time_before_creation
-        )
-        run.struct = {}
-        self._db._upsert(self._db_session, [run], ignore=True)
-
-        # run the migration
-        services.api.initial_data._align_runs_table(self._db, self._db_session)
-
-        runs = self._db._find_runs(self._db_session, None, "*", None).all()
-        assert len(runs) == 1
-        run = runs[0]
-        self._ensure_run_after_align_runs_migration(run)
-
     def test_store_run_success(self):
-        project, name, uid, iteration, run = self._create_new_run()
+        project, name, uid, iteration, run_dict = self._create_new_run()
 
         # use to internal function to get the record itself to be able to assert columns
         runs = self._db._find_runs(
@@ -362,6 +312,24 @@ class TestRuns(TestDatabaseBase):
         assert (
             self._db._add_utc_timezone(run.updated).isoformat()
             == run.struct["status"]["last_update"]
+        )
+
+        end_time = datetime.now(UTC)
+        run_dict["status"]["state"] = (
+            mlrun.common.runtimes.constants.RunStates.completed
+        )
+        run_dict["status"]["end_time"] = end_time.isoformat()
+        self._db.store_run(self._db_session, run_dict, uid, project, iter=iteration)
+
+        runs = self._db._find_runs(
+            self._db_session, uid=None, project=project, labels=None
+        ).all()
+        assert len(runs) == 1
+        run = runs[0]
+        assert (
+            self._db._add_utc_timezone(run.end_time).isoformat()
+            == run.struct["status"]["end_time"]
+            == end_time.isoformat()
         )
 
     def test_update_runs_requested_logs(self):
@@ -389,7 +357,11 @@ class TestRuns(TestDatabaseBase):
         ) as update_labels_mock:
             self._db.update_run(
                 self._db_session,
-                {"metadata.some-new-field": "value", "spec.another-new-field": "value"},
+                {
+                    "metadata.some-new-field": "value",
+                    "spec.another-new-field": "value",
+                    "status.state": "completed",
+                },
                 uid,
                 project,
                 iteration,
@@ -399,7 +371,72 @@ class TestRuns(TestDatabaseBase):
             assert run["metadata"]["name"] == name
             assert run["metadata"]["some-new-field"] == "value"
             assert run["spec"]["another-new-field"] == "value"
+            assert run["status"]["state"] == "completed"
+            assert run["status"]["end_time"] is not None
             assert update_labels_mock.call_count == 0
+
+    def test_store_and_update_run_from_terminal_state_to_non_terminal_state(self):
+        project, name, uid, iteration, run = self._create_new_run(
+            state=mlrun.common.runtimes.constants.RunStates.completed
+        )
+        run = self._db.read_run(self._db_session, uid, project, iteration)
+
+        # Store completed expected to fill end time
+        initial_end_time = run["status"]["end_time"]
+        assert initial_end_time is not None
+
+        # Update the run using `store` to running state to test the store flow as well
+        self._create_new_run(state=mlrun.common.runtimes.constants.RunStates.running)
+        run = self._db.read_run(self._db_session, uid, project, iteration)
+
+        # Store running expected to remove end time
+        assert "end_time" not in run["status"]
+
+        # Sleep 1 second to allow next end time to be different
+        time.sleep(1)
+        self._db.update_run(
+            self._db_session,
+            {"status.state": mlrun.common.runtimes.constants.RunStates.completed},
+            uid,
+            project,
+            iteration,
+        )
+        run = self._db.read_run(self._db_session, uid, project, iteration)
+
+        # Update completed expected to fill end time
+        assert run["status"]["end_time"] > initial_end_time
+
+        self._db.update_run(
+            self._db_session,
+            {"status.state": mlrun.common.runtimes.constants.RunStates.running},
+            uid,
+            project,
+            iteration,
+        )
+        run = self._db.read_run(self._db_session, uid, project, iteration)
+
+        # Update running expected to remove end time
+        assert "end_time" not in run["status"]
+
+    def test_consecutive_completed_update_requests(self):
+        project, name, uid, iteration, run = self._create_new_run(
+            state=mlrun.common.runtimes.constants.RunStates.completed
+        )
+        run = self._db.read_run(self._db_session, uid, project, iteration)
+
+        # Store completed expected to fill end time
+        initial_end_time = run["status"]["end_time"]
+        assert initial_end_time is not None
+
+        self._db.update_run(
+            self._db_session,
+            {"status.state": mlrun.common.runtimes.constants.RunStates.completed},
+            uid,
+            project,
+            iteration,
+        )
+        run = self._db.read_run(self._db_session, uid, project, iteration)
+        assert run["status"]["end_time"] == initial_end_time
 
     def test_run_iter(self):
         uid, prj = "uid39", "lemon"
@@ -426,6 +463,22 @@ class TestRuns(TestDatabaseBase):
         with pytest.raises(
             mlrun.errors.MLRunInvalidArgumentError,
             match="Value of `a` label is too long. "
+            "Maximum allowed length is 255 characters.",
+        ):
+            self._db.update_run(
+                self._db_session,
+                run,
+                uid,
+                project,
+                iteration,
+            )
+
+        label_key = "a" * 256
+        run["metadata"]["labels"] = {label_key: "b"}
+        # too long name
+        with pytest.raises(
+            mlrun.errors.MLRunInvalidArgumentError,
+            match=f"Name of `{label_key}` label is too long. "
             "Maximum allowed length is 255 characters.",
         ):
             self._db.update_run(
@@ -464,17 +517,6 @@ class TestRuns(TestDatabaseBase):
                 iteration,
             )
 
-    def test_list_runs_limited_unsorted_failure(self):
-        with pytest.raises(
-            mlrun.errors.MLRunInvalidArgumentError,
-            match="Limiting the number of returned records without sorting will provide non-deterministic results",
-        ):
-            self._db.list_runs(
-                self._db_session,
-                sort=False,
-                last=1,
-            )
-
     def test_list_runs_with_same_names(self):
         run_names = ["run_name_1", "run_name_2"]
         project_names = ["project1", "project2"]
@@ -500,33 +542,78 @@ class TestRuns(TestDatabaseBase):
         )
         assert len(runs) == 4
 
-    def test_list_runs_with_end_time(self):
-        project, name, run_uid, iteration, run = self._create_new_run()
+    def test_list_runs_orders_by_id_when_start_time_is_identical(self):
+        # this test verifies that when start_time date is identical, runs should be ordered by run id
+        project_name = "my-project"
+        t1 = datetime.now()
 
-        assert not run["status"].get("end_time")
+        # Create runs
+        number_of_runs = 10
+        for counter in range(number_of_runs):
+            run_name = f"run-{counter}"
+            self._create_new_run(
+                project=project_name, name=run_name, uid=f"uid-{counter}"
+            )
 
-        # update the run's end_time
-        end_time = datetime.now(timezone.utc)
-        end_time_iso = end_time.isoformat()
-        updates = {"status.end_time": end_time_iso}
-        self._db.update_run(self._db_session, updates, run_uid, project)
+            # Set the same `start_time` timestamp for all runs
+            self._db.update_db_object(
+                self._db_session,
+                framework.db.sqldb.models.Run,
+                filters={"name": run_name},
+                start_time=t1,
+            )
 
-        # fetch the run and verify the end_time
-        run = self._db.read_run(self._db_session, run_uid, project, iteration)
-        assert run["status"].get("end_time")
-        assert run["status"]["end_time"] == end_time_iso
-
-        # list runs with end_time filter
         runs = self._db.list_runs(
             self._db_session,
-            project=project,
-            end_time_from=end_time - timedelta(milliseconds=100),
+            project=project_name,
         )
+        assert len(runs) == number_of_runs, (
+            f"Expected {number_of_runs} results, got {len(runs)}"
+        )
+
+        expected_names = [f"run-{i}" for i in range(number_of_runs - 1, -1, -1)]
+
+        for run, expected_name in zip(runs, expected_names):
+            run_name = run["metadata"]["name"]
+            assert run_name == expected_name, (
+                f"Expected {expected_name}, got {run_name}"
+            )
+
+    def test_list_runs_with_missing_milliseconds_in_timestamp(self):
+        self._create_new_run(project="my-project")
+
+        t1 = datetime.now().replace(microsecond=0)
+
+        # Set the `start_time` and `end_time` timestamps without microseconds
+        self._db.update_db_object(
+            self._db_session, framework.db.sqldb.models.Run, start_time=t1, end_time=t1
+        )
+
+        runs = self._db.list_runs(self._db_session, project="my-project")
         assert len(runs) == 1
-        stored_run = runs[0]
-        assert stored_run["metadata"]["uid"] == run_uid
-        assert stored_run["status"]["end_time"] == end_time_iso
-        assert stored_run["status"]["end_time"] > stored_run["status"]["start_time"]
+
+        assert runs[0]["status"]["start_time"].endswith(".000000+00:00")
+        assert runs[0]["status"]["end_time"].endswith(".000000+00:00")
+
+    def test_list_runs_empty_project_list_returns_empty(self):
+        # Cross-project listing (project="*") for a user with no accessible projects
+        # resolves to an empty project list. That must yield an empty result, not an error.
+        self._create_new_run(project="some-project")
+
+        runs = self._db.list_runs(self._db_session, project=[])
+        assert len(runs) == 0
+
+        # A populated project list still filters normally (the empty-list relaxation doesn't
+        # weaken the list path).
+        runs = self._db.list_runs(self._db_session, project=["some-project"])
+        assert len(runs) == 1
+
+    @pytest.mark.parametrize("project", [None, ""])
+    def test_list_runs_missing_project_raises(self, project):
+        # A truly missing project (None / "") applies no project filter, so it must keep
+        # raising rather than silently listing across all projects.
+        with pytest.raises(mlrun.errors.MLRunMissingProjectError):
+            self._db.list_runs(self._db_session, project=project)
 
     @staticmethod
     def _change_run_record_to_before_align_runs_migration(run, time_before_creation):

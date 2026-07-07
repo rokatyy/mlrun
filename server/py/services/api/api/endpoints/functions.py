@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import traceback
-from distutils.util import strtobool
 from http import HTTPStatus
-from typing import Optional
 
 import kubernetes.client
 from fastapi import (
@@ -60,7 +58,6 @@ from services.api.api.endpoints.nuclio import (
     _get_api_gateways_urls_for_function,
     _handle_nuclio_deploy_status,
 )
-from services.api.utils.singletons.scheduler import get_scheduler
 
 router = APIRouter()
 
@@ -147,78 +144,17 @@ async def get_function(
     }
 
 
-# TODO: Remove in 1.9.0
-@router.delete(
-    "/projects/{project}/functions/{name}",
-    status_code=HTTPStatus.NO_CONTENT.value,
-    deprecated=True,
-    description="'/v1/projects/{project}/functions/{name}' will be removed in 1.9.0, "
-    "use '/v2/projects/{project}/functions/{name}' instead.",
-)
-async def delete_function(
-    request: Request,
-    project: str,
-    name: str,
-    auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
-    db_session: Session = Depends(deps.get_db_session),
-):
-    await (
-        framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
-            mlrun.common.schemas.AuthorizationResourceTypes.function,
-            project,
-            name,
-            mlrun.common.schemas.AuthorizationAction.delete,
-            auth_info,
-        )
-    )
-    #  If the requested function has a schedule, we must delete it before deleting the function
-    try:
-        function_schedule = await run_in_threadpool(
-            get_scheduler().get_schedule,
-            db_session,
-            project,
-            name,
-        )
-    except mlrun.errors.MLRunNotFoundError:
-        function_schedule = None
-
-    if function_schedule:
-        # when deleting a function, we should also delete its schedules if exists
-        # schedules are only supposed to be run by the chief, therefore, if the function has a schedule,
-        # and we are running in worker, we send the request to the chief client
-        if (
-            mlrun.mlconf.httpdb.clusterization.role
-            != mlrun.common.schemas.ClusterizationRole.chief
-        ):
-            logger.info(
-                "Function has a schedule, deleting",
-                function=name,
-                project=project,
-            )
-            chief_client = framework.utils.clients.chief.Client()
-            await chief_client.delete_schedule(
-                project=project, name=name, request=request
-            )
-        else:
-            await run_in_threadpool(
-                get_scheduler().delete_schedule, db_session, project, name
-            )
-    await run_in_threadpool(
-        services.api.crud.Functions().delete_function, db_session, project, name
-    )
-    return Response(status_code=HTTPStatus.NO_CONTENT.value)
-
-
 @router.get("/projects/{project}/functions")
 async def list_functions(
-    project: Optional[str] = None,
-    name: Optional[str] = None,
-    tag: Optional[str] = None,
+    project: str | None = None,
+    name: str | None = None,
+    tag: str | None = None,
     labels: list[str] = Query([], alias="label"),
-    hash_key: Optional[str] = None,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-    kind: Optional[str] = None,
+    hash_key: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    kind: str | None = None,
+    states: list[str] = Query([], alias="state"),
     page: int = Query(None, gt=0),
     page_size: int = Query(None, alias="page-size", gt=0),
     page_token: str = Query(None, alias="page-token"),
@@ -226,6 +162,8 @@ async def list_functions(
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
 ):
+    if not project:
+        raise mlrun.errors.MLRunMissingProjectError()
     allowed_project_names = (
         await services.api.crud.Projects().list_allowed_project_names(
             db_session, auth_info, project=project
@@ -239,9 +177,7 @@ async def list_functions(
             mlrun.common.schemas.AuthorizationResourceTypes.function,
             _functions,
             lambda function: (
-                function.get("metadata", {}).get(
-                    "project", mlrun.mlconf.default_project
-                ),
+                function.get("metadata", {}).get("project"),
                 function["metadata"]["name"],
             ),
             auth_info,
@@ -261,6 +197,7 @@ async def list_functions(
         labels=labels,
         hash_key=hash_key,
         kind=kind,
+        states=states,
         format_=format_,
         since=mlrun.utils.datetime_from_iso(since),
         until=mlrun.utils.datetime_from_iso(until),
@@ -278,10 +215,10 @@ async def build_function(
     request: Request,
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
-    client_version: Optional[str] = Header(
+    client_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.client_version
     ),
-    client_python_version: Optional[str] = Header(
+    client_python_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.python_version
     ),
 ):
@@ -295,7 +232,9 @@ async def build_function(
 
     logger.info("Building function", data=data)
     function = data.get("function")
-    project = function.get("metadata", {}).get("project", mlrun.mlconf.default_project)
+    project = function.get("metadata", {}).get("project")
+    if not project:
+        raise mlrun.errors.MLRunMissingProjectError()
     function_name = function.get("metadata", {}).get("name")
     await run_in_threadpool(
         framework.utils.singletons.project_member.get_project_member().ensure_project,
@@ -335,7 +274,7 @@ async def build_function(
     if isinstance(data.get("with_mlrun"), bool):
         with_mlrun = data.get("with_mlrun")
     else:
-        with_mlrun = strtobool(data.get("with_mlrun", "on"))
+        with_mlrun = mlrun.utils.str_to_bool(data.get("with_mlrun", "on"))
     skip_deployed = data.get("skip_deployed", False)
     force_build = data.get("force_build", False)
     mlrun_version_specifier = data.get("mlrun_version_specifier")
@@ -353,11 +292,7 @@ async def build_function(
         force_build,
     )
 
-    # clone_target_dir is deprecated but needs to remain for backward compatibility
     func_dict = fn.to_dict()
-    func_dict["spec"]["clone_target_dir"] = get_in(
-        func_dict, "spec.build.source_code_target_dir"
-    )
 
     return {
         "data": func_dict,
@@ -372,10 +307,10 @@ async def start_function(
     background_tasks: BackgroundTasks,
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
-    client_version: Optional[str] = Header(
+    client_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.client_version
     ),
-    client_python_version: Optional[str] = Header(
+    client_python_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.python_version
     ),
 ):
@@ -409,6 +344,7 @@ async def start_function(
         background_tasks,
         _start_function_wrapper,
         background_timeout,
+        None,
         None,
         # args for _start_function
         function,
@@ -453,13 +389,15 @@ async def build_status(
     verbose: bool = False,
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
-    client_version: Optional[str] = Header(
+    client_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.client_version
     ),
 ):
+    if not project:
+        raise mlrun.errors.MLRunMissingProjectError()
     await framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
         mlrun.common.schemas.AuthorizationResourceTypes.function,
-        project or mlrun.mlconf.default_project,
+        project,
         name,
         # store since with the current mechanism we update the status (and store the function) in the DB when a client
         # query for the status
@@ -515,11 +453,13 @@ def _handle_job_deploy_status(
     offset: int,
     events_offset: int,
     logs: bool,
-    client_version: Optional[str],
+    client_version: str | None,
 ):
     # job deploy status
     response_headers = {}
-    function_state = get_in(fn, "status.state", "")
+    function_state = (
+        get_in(fn, "status.state", "") or mlrun.common.schemas.FunctionState.initialized
+    )
     pod = get_in(fn, "status.build_pod", "")
     image = get_in(fn, "spec.build.image", "")
     out = b""
@@ -668,13 +608,21 @@ Message: {event.message}
             # begin from the offset number and then encode
             out = resp[offset:].encode()
 
+    # Persist `building` for an in-progress application build instead of `running`/`pending`
+    persisted_function_state = normalized_pod_function_state
+    if fn.get("kind") == RuntimeKinds.application and normalized_pod_function_state in (
+        mlrun.common.schemas.FunctionState.running,
+        mlrun.common.schemas.FunctionState.pending,
+    ):
+        persisted_function_state = mlrun.common.schemas.FunctionState.building
+
     # check if the previous function state is different from the current build pod state, if that is the case then
     # update the function and store to the database
-    if function_state != normalized_pod_function_state:
-        update_in(fn, "status.state", normalized_pod_function_state)
+    if function_state != persisted_function_state:
+        update_in(fn, "status.state", persisted_function_state)
 
         versioned = False
-        if normalized_pod_function_state == mlrun.common.schemas.FunctionState.ready:
+        if persisted_function_state == mlrun.common.schemas.FunctionState.ready:
             update_in(fn, "spec.image", image)
             versioned = True
 
@@ -722,8 +670,8 @@ def _parse_start_function_body(db_session, data):
 async def _start_function_wrapper(
     function,
     auth_info: mlrun.common.schemas.AuthInfo,
-    client_version: Optional[str] = None,
-    client_python_version: Optional[str] = None,
+    client_version: str | None = None,
+    client_python_version: str | None = None,
 ):
     await run_in_threadpool(
         _start_function,
@@ -737,8 +685,8 @@ async def _start_function_wrapper(
 def _start_function(
     function,
     auth_info: mlrun.common.schemas.AuthInfo,
-    client_version: Optional[str] = None,
-    client_python_version: Optional[str] = None,
+    client_version: str | None = None,
+    client_python_version: str | None = None,
 ):
     db_session = framework.db.session.create_session()
     try:

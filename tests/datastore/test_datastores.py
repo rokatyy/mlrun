@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pandas as pd
 import pytest
@@ -24,6 +25,7 @@ import mlrun.errors
 from mlrun.artifacts import ModelArtifact
 from mlrun.artifacts.base import LinkArtifact
 from mlrun.datastore.inmem import InMemoryStore
+from mlrun.datastore.store_resources import ResourceCache
 from tests.conftest import rundb_path
 
 mlrun.mlconf.dbpath = rundb_path
@@ -40,7 +42,7 @@ def in_mem_store() -> InMemoryStore:
     return InMemoryStore()
 
 
-def test_in_memory(in_mem_store: InMemoryStore) -> None:
+def test_in_memory(in_mem_store: InMemoryStore, ensure_project) -> None:
     context = mlrun.get_or_create_ctx("test-in-mem")
     context.artifact_path = "memory://"
     k1 = context.log_artifact("k1", body="abc")
@@ -52,12 +54,12 @@ def test_in_memory(in_mem_store: InMemoryStore) -> None:
     assert len(in_mem_store._items) == 1, "data not written properly to in mem store"
     assert in_mem_store.get("aa") == "123", "in mem store failed to get/put"
     assert len(new_df) == 5, "in mem store failed dataframe test"
-    assert (
-        mlrun.run.get_dataitem(k1.get_target_path()).get() == "abc"
-    ), "failed to log in mem artifact"
+    assert mlrun.run.get_dataitem(k1.get_target_path()).get() == "abc", (
+        "failed to log in mem artifact"
+    )
 
 
-def test_file(rundb_mock, tmpdir: Path) -> None:
+def test_file(rundb_mock, tmpdir: Path, ensure_project) -> None:
     data = mlrun.run.get_dataitem(str(tmpdir / "test1.txt"))
     data.put("abc")
     assert data.get() == b"abc", "failed put/get test"
@@ -71,9 +73,9 @@ def test_file(rundb_mock, tmpdir: Path) -> None:
     # test that we can get the artifact as dataitem
     assert k1.to_dataitem().get(encoding="utf-8") == "abc", "wrong .dataitem result"
 
-    assert (
-        "test1.txt" in mlrun.run.get_dataitem(str(tmpdir)).listdir()
-    ), "failed listdir"
+    assert "test1.txt" in mlrun.run.get_dataitem(str(tmpdir)).listdir(), (
+        "failed listdir"
+    )
 
     expected = [
         str(tmpdir / "test1.txt"),
@@ -81,16 +83,16 @@ def test_file(rundb_mock, tmpdir: Path) -> None:
         k1.get_target_path(),
     ]
     for a in expected:
-        assert os.path.isfile(a) and a.startswith(
-            str(tmpdir)
-        ), f"artifact {a} was not generated"
+        assert os.path.isfile(a) and a.startswith(str(tmpdir)), (
+            f"artifact {a} was not generated"
+        )
 
     new_fd = mlrun.run.get_dataitem(k2.get_target_path()).as_df()
 
     assert len(new_fd) == 5, "failed dataframe test"
-    assert (
-        mlrun.run.get_dataitem(k1.get_target_path()).get() == b"abc"
-    ), "failed to log in file artifact"
+    assert mlrun.run.get_dataitem(k1.get_target_path()).get() == b"abc", (
+        "failed to log in file artifact"
+    )
 
     name = k2.uri
     artifact, _ = mlrun.artifacts.get_artifact_meta(name)
@@ -106,14 +108,14 @@ def test_file(rundb_mock, tmpdir: Path) -> None:
 def test_parse_url_preserve_case():
     url = "store://Hedi/mlrun-dbd7ef-training_mymodel#a5dc8e34a46240bb9a07cd9deb3609c7"
     expected_endpoint = "Hedi"
-    _, endpoint, _ = mlrun.datastore.datastore.parse_url(url)
+    _, endpoint, _ = mlrun.datastore.utils.parse_url(url)
     assert expected_endpoint, endpoint
 
 
 @pytest.mark.parametrize(
     "url,expected_project,expected_key,expected_tag,expected_iter,expected_tree,expected_uid",
     [
-        ("store:///artifact_key", "default", "artifact_key", None, 0, None, None),
+        ("store:///artifact_key", None, "artifact_key", None, 0, None, None),
         (
             "store://project_name/artifact_key",
             "project_name",
@@ -161,7 +163,7 @@ def test_parse_url_preserve_case():
         ),
         (
             "store:///ArtifacT_key#1:some_Tag",
-            "default",
+            None,
             "ArtifacT_key",
             "some_Tag",
             1,
@@ -170,7 +172,7 @@ def test_parse_url_preserve_case():
         ),
         (
             "store:///ArtifacT_key#1@Some_Tree",
-            "default",
+            None,
             "ArtifacT_key",
             None,
             1,
@@ -208,8 +210,12 @@ def test_get_store_artifact_url_parsing(
 ):
     db = Mock()
 
+    active_project = "test-project"
+    mlrun.mlconf.active_project = active_project
+
     def mock_read_artifact(key, tag=None, iter=None, project="", tree=None, uid=None):
-        assert expected_project == project, f"Project mismatch for URL: {url}"
+        expected_proj = expected_project or active_project
+        assert expected_proj == project, f"Project mismatch for URL: {url}"
         assert expected_key == key, f"Key mismatch for URL: {url}"
         assert expected_tag == tag, f"Tag mismatch for URL: {url}"
         assert expected_iter == iter, f"Iteration mismatch for URL: {url}"
@@ -359,9 +365,9 @@ def test_fsspec(tmpdir: Path) -> None:
     files = file_system.ls(tmpdir)
     assert len(files) == 2, "2 test files were not written"
     assert files[0].endswith("x.txt"), "wrong file name"
-    assert (
-        file_system.open(tmpdir / "1x.txt", "r").read() == "123"
-    ), "wrong file content"
+    assert file_system.open(tmpdir / "1x.txt", "r").read() == "123", (
+        "wrong file content"
+    )
 
 
 @pytest.mark.parametrize(
@@ -376,3 +382,67 @@ def test_item_to_real_path_map(virtual_path: str, tmpdir: Path) -> None:
     assert data.get() == b"abc", "failed put/get test"
     assert data.stat().size == 3, "got wrong file size"
     assert os.path.isfile(os.path.join(tmpdir, "test1.txt"))
+
+
+def test_resource_cache_get_table_caches_by_original_uri():
+    """Test that ResourceCache.get_table() caches tables under the original URI."""
+    cache = ResourceCache()
+    test_uri = "v3io://webapi.default-tenant.app.cluster/container/path/to/table"
+    mock_table_instance = MagicMock(name="MockTable")
+
+    with patch("storey.Table", return_value=mock_table_instance) as mock_table_class:
+        with patch("storey.V3ioDriver"):
+            first_result = cache.get_table(test_uri)
+            mock_table_class.assert_called_once()
+            assert first_result is mock_table_instance
+
+            second_result = cache.get_table(test_uri)
+            assert mock_table_class.call_count == 1
+            assert second_result is first_result
+
+
+def test_resource_cache_close_closes_all_tables():
+    """Test that ResourceCache.close() closes all cached tables and clears the cache."""
+    cache = ResourceCache()
+
+    table1 = AsyncMock(name="Table1")
+    table2 = AsyncMock(name="Table2")
+    table3 = MagicMock(name="PlainTable", spec=[])  # no close method
+
+    cache.cache_table("v3io://host/container/t1", table1)
+    cache.cache_table("v3io://host/container/t2", table2)
+    cache.cache_table("in-memory", table3)
+
+    asyncio.run(cache.close())
+
+    table1.close.assert_awaited_once()
+    table2.close.assert_awaited_once()
+    assert len(cache._tables) == 0
+
+
+def test_resource_cache_close_is_idempotent():
+    """Test that calling close() twice doesn't raise."""
+    cache = ResourceCache()
+    table = AsyncMock(name="Table")
+    cache.cache_table("v3io://host/container/t1", table)
+
+    asyncio.run(cache.close())
+    asyncio.run(cache.close())
+
+    table.close.assert_awaited_once()
+
+
+def test_resource_cache_close_sync_within_running_loop():
+    """close_sync() must work when called from within a running event loop
+    (e.g. Jupyter cells, where ingest()/preview() run under a live loop). A bare
+    asyncio.run() here raises 'cannot be called from a running event loop'."""
+
+    async def run_close():
+        cache = ResourceCache()
+        table = AsyncMock(name="Table")
+        cache.cache_table("v3io://host/container/t1", table)
+        cache.close_sync()
+        table.close.assert_awaited_once()
+        assert len(cache._tables) == 0
+
+    asyncio.run(run_close())

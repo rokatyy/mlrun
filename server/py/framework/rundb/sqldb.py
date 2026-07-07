@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import datetime
-from typing import Optional, Union
+from typing import Union
 
 from dependency_injector import containers, providers
 from sqlalchemy.exc import SQLAlchemyError
@@ -25,7 +25,6 @@ import mlrun.common.schemas
 import mlrun.common.schemas.artifact
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
 import mlrun.db.factory
-from mlrun.common.db.sql_session import create_session
 from mlrun.db import RunDBInterface
 
 import framework.db.session
@@ -33,6 +32,7 @@ import services.alerts.crud
 import services.api.crud
 from framework.db.base import DBError
 from framework.db.sqldb.db import SQLDB
+from framework.db.sqldb.sql_session import create_session
 
 # This class is a proxy for the real implementation that sits under services.api.db.sqldb
 # The runtime objects (which manages the resources that do the real logic, like Nuclio functions, Dask jobs, etc...)
@@ -73,15 +73,9 @@ class SQLRunDB(RunDBInterface):
             append,
         )
 
-    def get_log(self, uid, project="", offset=0, size=0):
-        # TODO: this is method which is not being called through the API (only through the SDK), but due to changes in
-        #  the API we changed the get_log method to async so we cannot call it here, and in this PR we won't change the
-        #  SDK to run async, we will use the legacy method for now, and later when we will have a better solution
-        #  we will change it.
+    def get_log(self, uid, project="", offset=0, size=0, attempt=None):
         raise NotImplementedError(
-            "This should be changed to async call, if you are running in the API, use `services.api.crud.get_log`"
-            " method directly instead and not through the get_db().get_log() method. "
-            "This will be removed in 1.5.0",
+            "Use `services.api.crud.get_log` method directly instead, and not through the get_db().get_log() method."
         )
 
     def store_run(self, struct, uid, project="", iter=0):
@@ -102,6 +96,17 @@ class SQLRunDB(RunDBInterface):
             uid,
             iter,
             updates,
+        )
+
+    def set_run_retrying_status(
+        self, project: str, name: str, run_id: str, retrying: bool
+    ):
+        return self._transform_db_error(
+            services.api.crud.RerunRunner().set_run_retrying_status,
+            self.session,
+            project,
+            run_id,
+            retrying,
         )
 
     def abort_run(self, uid, project="", iter=0, timeout=45, status_text=""):
@@ -130,8 +135,8 @@ class SQLRunDB(RunDBInterface):
     def read_run(
         self,
         uid: str,
-        project: Optional[str] = None,
-        iter: Optional[int] = None,
+        project: str | None = None,
+        iter: int | None = None,
         format_: mlrun.common.formatters.RunFormat = mlrun.common.formatters.RunFormat.full,
     ):
         return self._transform_db_error(
@@ -145,21 +150,19 @@ class SQLRunDB(RunDBInterface):
 
     def list_runs(
         self,
-        name: Optional[str] = None,
-        uid: Optional[Union[str, list[str]]] = None,
-        project: Optional[Union[str, list[str]]] = None,
-        labels: Optional[Union[str, list[str]]] = None,
-        state: Optional[mlrun.common.runtimes.constants.RunStates] = None,
-        states: Optional[list[mlrun.common.runtimes.constants.RunStates]] = None,
+        name: str | None = None,
+        uid: Union[str, list[str]] | None = None,
+        project: Union[str, list[str]] | None = None,
+        labels: Union[str, list[str]] | None = None,
+        states: list[mlrun.common.runtimes.constants.RunStates] | None = None,
         sort: bool = True,
-        last: int = 0,
         iter: bool = False,
-        start_time_from: Optional[datetime.datetime] = None,
-        start_time_to: Optional[datetime.datetime] = None,
-        last_update_time_from: Optional[datetime.datetime] = None,
-        last_update_time_to: Optional[datetime.datetime] = None,
-        end_time_from: Optional[datetime.datetime] = None,
-        end_time_to: Optional[datetime.datetime] = None,
+        start_time_from: datetime.datetime | None = None,
+        start_time_to: datetime.datetime | None = None,
+        last_update_time_from: datetime.datetime | None = None,
+        last_update_time_to: datetime.datetime | None = None,
+        end_time_from: datetime.datetime | None = None,
+        end_time_to: datetime.datetime | None = None,
         partition_by: Union[mlrun.common.schemas.RunPartitionByField, str] = None,
         rows_per_partition: int = 1,
         partition_sort_by: Union[mlrun.common.schemas.SortField, str] = None,
@@ -176,11 +179,8 @@ class SQLRunDB(RunDBInterface):
             uid=uid,
             project=project,
             labels=labels,
-            states=mlrun.utils.helpers.as_list(state)
-            if state is not None
-            else states or None,
+            states=states or None,
             sort=sort,
-            last=last,
             iter=iter,
             start_time_from=start_time_from,
             start_time_to=start_time_to,
@@ -199,9 +199,9 @@ class SQLRunDB(RunDBInterface):
     def paginated_list_runs(
         self,
         *args,
-        page: Optional[int] = None,
-        page_size: Optional[int] = None,
-        page_token: Optional[str] = None,
+        page: int | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
         **kwargs,
     ):
         raise NotImplementedError()
@@ -229,18 +229,23 @@ class SQLRunDB(RunDBInterface):
         )
 
     def store_artifact(
-        self, key, artifact, uid=None, iter=None, tag="", project="", tree=None
+        self,
+        key,
+        artifact,
+        iter=None,
+        tag="",
+        project="",
+        tree=None,
     ):
         return self._transform_db_error(
             services.api.crud.Artifacts().store_artifact,
             self.session,
             key,
             artifact,
-            uid,
-            iter,
-            tag,
-            project,
-            tree,
+            tag=tag,
+            iter=iter,
+            project=project,
+            producer_id=tree,
         )
 
     def read_artifact(
@@ -273,20 +278,18 @@ class SQLRunDB(RunDBInterface):
         labels=None,
         since=None,
         until=None,
-        iter: Optional[int] = None,
+        iter: int | None = None,
         best_iteration: bool = False,
-        kind: Optional[str] = None,
+        kind: str | None = None,
         category: Union[str, mlrun.common.schemas.ArtifactCategories] = None,
-        tree: Optional[str] = None,
+        tree: str | None = None,
+        parent: str | None = None,
         format_: mlrun.common.formatters.ArtifactFormat = mlrun.common.formatters.ArtifactFormat.full,
-        limit: Optional[int] = None,
-        partition_by: Optional[
-            Union[mlrun.common.schemas.ArtifactPartitionByField, str]
-        ] = None,
+        partition_by: Union[mlrun.common.schemas.ArtifactPartitionByField, str]
+        | None = None,
         rows_per_partition: int = 1,
-        partition_sort_by: Optional[
-            Union[mlrun.common.schemas.SortField, str]
-        ] = mlrun.common.schemas.SortField.updated,
+        partition_sort_by: Union[mlrun.common.schemas.SortField, str]
+        | None = mlrun.common.schemas.SortField.updated,
         partition_order: Union[
             mlrun.common.schemas.OrderType, str
         ] = mlrun.common.schemas.OrderType.desc,
@@ -309,15 +312,14 @@ class SQLRunDB(RunDBInterface):
             category=category,
             producer_id=tree,
             format_=format_,
-            limit=limit,
         )
 
     def paginated_list_artifacts(
         self,
         *args,
-        page: Optional[int] = None,
-        page_size: Optional[int] = None,
-        page_token: Optional[str] = None,
+        page: int | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
         **kwargs,
     ):
         raise NotImplementedError()
@@ -332,7 +334,7 @@ class SQLRunDB(RunDBInterface):
         deletion_strategy: mlrun.common.schemas.artifact.ArtifactsDeletionStrategies = (
             mlrun.common.schemas.artifact.ArtifactsDeletionStrategies.metadata_only
         ),
-        secrets: Optional[dict] = None,
+        secrets: dict | None = None,
         iter=None,
     ):
         return self._transform_db_error(
@@ -387,14 +389,15 @@ class SQLRunDB(RunDBInterface):
 
     def list_functions(
         self,
-        name: Optional[str] = None,
-        project: Optional[Union[str, list[str]]] = None,
-        tag: Optional[str] = None,
-        kind: Optional[str] = None,
-        labels: Optional[Union[str, dict[str, Optional[str]], list[str]]] = None,
+        name: str | None = None,
+        project: Union[str, list[str]] | None = None,
+        tag: str | None = None,
+        kind: str | None = None,
+        labels: Union[str, dict[str, str | None], list[str]] | None = None,
+        states: list[mlrun.common.schemas.FunctionState] | None = None,
         format_: mlrun.common.formatters.FunctionFormat = mlrun.common.formatters.FunctionFormat.full,
-        since: Optional[datetime.datetime] = None,
-        until: Optional[datetime.datetime] = None,
+        since: datetime.datetime | None = None,
+        until: datetime.datetime | None = None,
     ):
         return self._transform_db_error(
             services.api.crud.Functions().list_functions,
@@ -404,6 +407,7 @@ class SQLRunDB(RunDBInterface):
             tag=tag,
             kind=kind,
             labels=labels,
+            states=states,
             since=since,
             until=until,
             format_=format_,
@@ -412,9 +416,9 @@ class SQLRunDB(RunDBInterface):
     def paginated_list_functions(
         self,
         *args,
-        page: Optional[int] = None,
-        page_size: Optional[int] = None,
-        page_token: Optional[str] = None,
+        page: int | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
         **kwargs,
     ):
         raise NotImplementedError()
@@ -552,7 +556,7 @@ class SQLRunDB(RunDBInterface):
         )
 
     def get_project(
-        self, name: Optional[str] = None, project_id: Optional[int] = None
+        self, name: str | None = None, project_id: int | None = None
     ) -> mlrun.common.schemas.Project:
         return self._transform_db_error(
             services.api.crud.Projects().get_project,
@@ -562,9 +566,9 @@ class SQLRunDB(RunDBInterface):
 
     def list_projects(
         self,
-        owner: Optional[str] = None,
+        owner: str | None = None,
         format_: mlrun.common.formatters.ProjectFormat = mlrun.common.formatters.ProjectFormat.name_only,
-        labels: Optional[list[str]] = None,
+        labels: list[str] | None = None,
         state: mlrun.common.schemas.ProjectState = None,
     ) -> mlrun.common.schemas.ProjectsOutput:
         return self._transform_db_error(
@@ -589,8 +593,8 @@ class SQLRunDB(RunDBInterface):
         self,
         name: str,
         project: str = "",
-        tag: Optional[str] = None,
-        uid: Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ):
         feature_set = self._transform_db_error(
             services.api.crud.FeatureStore().get_feature_set,
@@ -602,31 +606,13 @@ class SQLRunDB(RunDBInterface):
         )
         return feature_set.dict()
 
-    def list_features(
-        self,
-        project: str,
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        entities: Optional[list[str]] = None,
-        labels: Optional[list[str]] = None,
-    ):
-        return self._transform_db_error(
-            services.api.crud.FeatureStore().list_features,
-            self.session,
-            project,
-            name,
-            tag,
-            entities,
-            labels,
-        )
-
     def list_features_v2(
         self,
         project: str,
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        entities: Optional[list[str]] = None,
-        labels: Optional[list[str]] = None,
+        name: str | None = None,
+        tag: str | None = None,
+        entities: list[str] | None = None,
+        labels: list[str] | None = None,
     ):
         return self._transform_db_error(
             services.api.crud.FeatureStore().list_features_v2,
@@ -638,28 +624,12 @@ class SQLRunDB(RunDBInterface):
             labels,
         )
 
-    def list_entities(
-        self,
-        project: str,
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        labels: Optional[list[str]] = None,
-    ):
-        return self._transform_db_error(
-            services.api.crud.FeatureStore().list_entities,
-            self.session,
-            project,
-            name,
-            tag,
-            labels,
-        )
-
     def list_entities_v2(
         self,
         project: str,
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        labels: Optional[list[str]] = None,
+        name: str | None = None,
+        tag: str | None = None,
+        labels: list[str] | None = None,
     ):
         return self._transform_db_error(
             services.api.crud.FeatureStore().list_entities_v2,
@@ -673,12 +643,12 @@ class SQLRunDB(RunDBInterface):
     def list_feature_sets(
         self,
         project: str = "",
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        state: Optional[str] = None,
-        entities: Optional[list[str]] = None,
-        features: Optional[list[str]] = None,
-        labels: Optional[list[str]] = None,
+        name: str | None = None,
+        tag: str | None = None,
+        state: str | None = None,
+        entities: list[str] | None = None,
+        features: list[str] | None = None,
+        labels: list[str] | None = None,
         partition_by: mlrun.common.schemas.FeatureStorePartitionByField = None,
         rows_per_partition: int = 1,
         partition_sort_by: mlrun.common.schemas.SortField = None,
@@ -766,8 +736,8 @@ class SQLRunDB(RunDBInterface):
         self,
         name: str,
         project: str = "",
-        tag: Optional[str] = None,
-        uid: Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ):
         return self._transform_db_error(
             services.api.crud.FeatureStore().get_feature_vector,
@@ -781,10 +751,10 @@ class SQLRunDB(RunDBInterface):
     def list_feature_vectors(
         self,
         project: str = "",
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        state: Optional[str] = None,
-        labels: Optional[list[str]] = None,
+        name: str | None = None,
+        tag: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
         partition_by: mlrun.common.schemas.FeatureStorePartitionByField = None,
         rows_per_partition: int = 1,
         partition_sort_by: mlrun.common.schemas.SortField = None,
@@ -858,7 +828,7 @@ class SQLRunDB(RunDBInterface):
         self,
         notification_objects: list[mlrun.model.Notification],
         run_uid: str,
-        project: Optional[str] = None,
+        project: str | None = None,
         mask_params: bool = True,
     ):
         # We run this function with a new session because it may run concurrently.
@@ -877,7 +847,7 @@ class SQLRunDB(RunDBInterface):
         session,
         notification_objects: list[mlrun.model.Notification],
         alert_id: str,
-        project: Optional[str] = None,
+        project: str | None = None,
         mask_params: bool = True,
     ):
         # We run this function with a new session because it may run concurrently.
@@ -907,7 +877,7 @@ class SQLRunDB(RunDBInterface):
 
     def start_function(
         self,
-        func_url: Optional[str] = None,
+        func_url: str | None = None,
         function: "mlrun.runtimes.BaseRuntime" = None,
     ):
         """Execute a function remotely, Used for ``dask`` functions.
@@ -921,11 +891,19 @@ class SQLRunDB(RunDBInterface):
             function,
         )
 
+    def get_project_background_task(
+        self,
+        project: str,
+        name: str,
+    ) -> mlrun.common.schemas.BackgroundTask:
+        raise NotImplementedError()
+
     def list_hub_sources(
         self,
-        item_name: Optional[str] = None,
-        tag: Optional[str] = None,
-        version: Optional[str] = None,
+        item_name: str | None = None,
+        tag: str | None = None,
+        version: str | None = None,
+        item_type: mlrun.common.schemas.hub.HubSourceType = mlrun.common.schemas.hub.HubSourceType.functions,
     ):
         return self._transform_db_error(
             framework.db.session.run_function_with_new_db_session,
@@ -933,31 +911,41 @@ class SQLRunDB(RunDBInterface):
             item_name,
             tag,
             version,
+            item_type,
         )
 
     def get_pipeline(
         self,
         run_id: str,
-        namespace: Optional[str] = None,
+        namespace: str | None = None,
         timeout: int = 30,
         format_: Union[
             str, mlrun.common.formatters.PipelineFormat
         ] = mlrun.common.formatters.PipelineFormat.summary,
-        project: Optional[str] = None,
+        project: str | None = None,
+    ):
+        raise NotImplementedError()
+
+    def retry_pipeline(
+        self,
+        run_id: str,
+        project: str,
+        namespace: str | None = None,
+        timeout: int = 30,
     ):
         raise NotImplementedError()
 
     def list_pipelines(
         self,
         project: str,
-        namespace: Optional[str] = None,
+        namespace: str | None = None,
         sort_by: str = "",
         page_token: str = "",
         filter_: str = "",
         format_: Union[
             str, mlrun.common.formatters.PipelineFormat
         ] = mlrun.common.formatters.PipelineFormat.metadata_only,
-        page_size: Optional[int] = None,
+        page_size: int | None = None,
     ) -> mlrun.common.schemas.PipelinesOutput:
         raise NotImplementedError()
 
@@ -967,8 +955,13 @@ class SQLRunDB(RunDBInterface):
         provider: Union[
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
-        secrets: Optional[dict] = None,
+        secrets: dict | None = None,
     ):
+        raise NotImplementedError()
+
+    def wait_for_background_task_to_reach_terminal_state(
+        self, name: str, project: str = ""
+    ) -> mlrun.common.schemas.BackgroundTask:
         raise NotImplementedError()
 
     def store_api_gateway(
@@ -977,7 +970,7 @@ class SQLRunDB(RunDBInterface):
             mlrun.common.schemas.APIGateway,
             mlrun.runtimes.nuclio.api_gateway.APIGateway,
         ],
-        project: Optional[str] = None,
+        project: str | None = None,
     ):
         raise NotImplementedError()
 
@@ -997,7 +990,7 @@ class SQLRunDB(RunDBInterface):
         provider: Union[
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
-        secrets: Optional[list[str]] = None,
+        secrets: list[str] | None = None,
     ) -> mlrun.common.schemas.SecretsData:
         raise NotImplementedError()
 
@@ -1007,7 +1000,7 @@ class SQLRunDB(RunDBInterface):
         provider: Union[
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
-        token: Optional[str] = None,
+        token: str | None = None,
     ) -> mlrun.common.schemas.SecretKeysData:
         raise NotImplementedError()
 
@@ -1017,26 +1010,15 @@ class SQLRunDB(RunDBInterface):
         provider: Union[
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
-        secrets: Optional[list[str]] = None,
-    ):
-        raise NotImplementedError()
-
-    def create_user_secrets(
-        self,
-        user: str,
-        provider: Union[
-            str, mlrun.common.schemas.SecretProviderName
-        ] = mlrun.common.schemas.SecretProviderName.vault,
-        secrets: Optional[dict] = None,
+        secrets: list[str] | None = None,
     ):
         raise NotImplementedError()
 
     def create_model_endpoint(
         self,
         model_endpoint: mlrun.common.schemas.ModelEndpoint,
-        creation_strategy: Optional[
-            mm_constants.ModelEndpointCreationStrategy
-        ] = mm_constants.ModelEndpointCreationStrategy.INPLACE,
+        creation_strategy: mm_constants.ModelEndpointCreationStrategy
+        | None = mm_constants.ModelEndpointCreationStrategy.INPLACE,
     ) -> mlrun.common.schemas.ModelEndpoint:
         raise NotImplementedError()
 
@@ -1044,38 +1026,42 @@ class SQLRunDB(RunDBInterface):
         self,
         name: str,
         project: str,
-        function_name: Optional[str] = None,
-        function_tag: Optional[str] = None,
-        endpoint_id: Optional[str] = None,
+        function_name: str | None = None,
+        function_tag: str | None = None,
+        endpoint_id: str | None = None,
     ):
         raise NotImplementedError()
 
     def list_model_endpoints(
         self,
         project: str,
-        name: Optional[str] = None,
-        function_name: Optional[str] = None,
-        function_tag: Optional[str] = None,
-        model_name: Optional[str] = None,
-        model_tag: Optional[str] = None,
-        labels: Optional[Union[str, dict[str, Optional[str]], list[str]]] = None,
-        start: Optional[datetime.datetime] = None,
-        end: Optional[datetime.datetime] = None,
-        tsdb_metrics: bool = True,
+        names: str | None = None,
+        function_name: str | None = None,
+        function_tag: str | None = None,
+        model_name: str | None = None,
+        model_tag: str | None = None,
+        labels: Union[str, dict[str, str | None], list[str]] | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        tsdb_metrics: bool = False,
+        metric_list: list[str] | None = None,
         top_level: bool = False,
-        uids: Optional[list[str]] = None,
+        modes: Union[mm_constants.EndpointMode, list[mm_constants.EndpointMode]]
+        | None = None,
+        uids: list[str] | None = None,
         latest_only: bool = False,
     ) -> mlrun.common.schemas.ModelEndpointList:
         raise NotImplementedError()
 
     def get_model_endpoint(
         self,
-        name: str,
+        name: Union[str, list[str]] | None,
         project: str,
-        function_name: Optional[str] = None,
-        function_tag: Optional[str] = None,
-        endpoint_id: Optional[str] = None,
+        function_name: str | None = None,
+        function_tag: str | None = None,
+        endpoint_id: str | None = None,
         tsdb_metrics: bool = True,
+        metric_list: list[str] | None = None,
         feature_analysis: bool = False,
     ) -> mlrun.common.schemas.ModelEndpoint:
         raise NotImplementedError()
@@ -1085,9 +1071,9 @@ class SQLRunDB(RunDBInterface):
         name: str,
         project: str,
         attributes: dict,
-        function_name: Optional[str] = None,
-        function_tag: Optional[str] = None,
-        endpoint_id: Optional[str] = None,
+        function_name: str | None = None,
+        function_tag: str | None = None,
+        endpoint_id: str | None = None,
     ) -> mlrun.common.schemas.ModelEndpoint:
         raise NotImplementedError()
 
@@ -1112,9 +1098,10 @@ class SQLRunDB(RunDBInterface):
     def get_hub_catalog(
         self,
         source_name: str,
-        version: Optional[str] = None,
-        tag: Optional[str] = None,
+        version: str | None = None,
+        tag: str | None = None,
         force_refresh: bool = False,
+        object_type: mlrun.common.schemas.hub.HubSourceType = mlrun.common.schemas.hub.HubSourceType.functions,
     ):
         raise NotImplementedError()
 
@@ -1122,9 +1109,21 @@ class SQLRunDB(RunDBInterface):
         self,
         source_name: str,
         item_name: str,
-        version: Optional[str] = None,
+        version: str | None = None,
         tag: str = "latest",
         force_refresh: bool = False,
+        item_type: mlrun.common.schemas.hub.HubSourceType = mlrun.common.schemas.hub.HubSourceType.functions,
+    ):
+        raise NotImplementedError()
+
+    def get_hub_asset(
+        self,
+        source_name: str,
+        item_name: str,
+        asset_name: str,
+        version: str | None = None,
+        tag: str = "latest",
+        item_type: mlrun.common.schemas.hub.HubSourceType = mlrun.common.schemas.hub.HubSourceType.functions,
     ):
         raise NotImplementedError()
 
@@ -1144,7 +1143,7 @@ class SQLRunDB(RunDBInterface):
 
     def get_datastore_profile(
         self, name: str, project: str
-    ) -> Optional[mlrun.common.schemas.DatastoreProfile]:
+    ) -> mlrun.common.schemas.DatastoreProfile | None:
         return self._transform_db_error(
             framework.db.session.run_function_with_new_db_session,
             services.api.crud.DatastoreProfiles().get_datastore_profile,
@@ -1174,12 +1173,12 @@ class SQLRunDB(RunDBInterface):
             mlrun.common.schemas.WorkflowSpec,
             dict,
         ],
-        arguments: Optional[dict] = None,
-        artifact_path: Optional[str] = None,
-        source: Optional[str] = None,
-        run_name: Optional[str] = None,
-        namespace: Optional[str] = None,
-        notifications: Optional[list[mlrun.model.Notification]] = None,
+        arguments: dict | None = None,
+        artifact_path: str | None = None,
+        source: str | None = None,
+        run_name: str | None = None,
+        namespace: str | None = None,
+        notifications: list[mlrun.model.Notification] | None = None,
     ) -> "mlrun.common.schemas.WorkflowResponse":
         raise NotImplementedError()
 
@@ -1187,9 +1186,9 @@ class SQLRunDB(RunDBInterface):
         self,
         func: "mlrun.runtimes.BaseRuntime",
         with_mlrun: bool,
-        mlrun_version_specifier: Optional[str] = None,
+        mlrun_version_specifier: str | None = None,
         skip_deployed: bool = False,
-        builder_env: Optional[dict] = None,
+        builder_env: dict | None = None,
         force_build: bool = False,
     ):
         raise NotImplementedError()
@@ -1197,7 +1196,7 @@ class SQLRunDB(RunDBInterface):
     def deploy_nuclio_function(
         self,
         func: mlrun.runtimes.RemoteRuntime,
-        builder_env: Optional[dict] = None,
+        builder_env: dict | None = None,
     ):
         raise NotImplementedError()
 
@@ -1242,7 +1241,8 @@ class SQLRunDB(RunDBInterface):
         base_period: int = 10,
         image: str = "mlrun/mlrun",
         deploy_histogram_data_drift_app: bool = True,
-        fetch_credentials_from_sys_config: bool = False,
+        lag_threshold: int | None = None,
+        lag_event_cooldown: int | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -1253,7 +1253,7 @@ class SQLRunDB(RunDBInterface):
         delete_stream_function: bool = False,
         delete_histogram_data_drift_app: bool = True,
         delete_user_applications: bool = False,
-        user_application_list: Optional[list[str]] = None,
+        user_application_list: list[str] | None = None,
     ) -> bool:
         raise NotImplementedError
 
@@ -1262,17 +1262,45 @@ class SQLRunDB(RunDBInterface):
     ) -> bool:
         raise NotImplementedError
 
-    def deploy_histogram_data_drift_app(
-        self, project: str, image: str = "mlrun/mlrun"
-    ) -> None:
-        raise NotImplementedError
-
     def set_model_monitoring_credentials(
         self,
         project: str,
-        credentials: dict[str, Optional[str]],
+        credentials: dict[str, str | None],
         replace_creds: bool = False,
     ) -> None:
+        raise NotImplementedError
+
+    def delete_model_monitoring_metrics(
+        self,
+        project: str,
+        application_name: str,
+        endpoint_ids: list[str] | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def get_model_monitoring_url(self, project: str) -> str | None:
+        raise NotImplementedError
+
+    def get_monitoring_function_summaries(
+        self,
+        project: str,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        names: Union[list[str], str] | None = None,
+        labels: Union[str, dict[str, str | None], list[str]] | None = None,
+        include_stats: bool = False,
+        include_infra: bool = True,
+    ) -> [mlrun.common.schemas.model_monitoring.FunctionSummary]:
+        raise NotImplementedError
+
+    def get_monitoring_function_summary(
+        self,
+        project: str,
+        function_name: str,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        include_latest_metrics: bool = False,
+    ) -> mlrun.common.schemas.model_monitoring.FunctionSummary:
         raise NotImplementedError
 
     def _transform_db_error(self, func, *args, **kwargs):
@@ -1305,7 +1333,9 @@ class SQLRunDB(RunDBInterface):
     def get_alert_config(self, alert_name: str, project=""):
         pass
 
-    def list_alerts_configs(self, project=""):
+    def list_alerts_configs(
+        self, project="", limit: int | None = None, offset: int | None = None
+    ):
         pass
 
     def delete_alert_config(self, alert_name, project=""):
@@ -1322,14 +1352,14 @@ class SQLRunDB(RunDBInterface):
 
     def list_alert_activations(
         self,
-        project: Optional[str] = None,
-        name: Optional[str] = None,
-        since: Optional[datetime.datetime] = None,
-        until: Optional[datetime.datetime] = None,
-        entity: Optional[str] = None,
-        severity: Optional[list[str]] = None,
-        entity_kind: Optional[str] = None,
-        event_kind: Optional[str] = None,
+        project: str | None = None,
+        name: str | None = None,
+        since: datetime.datetime | None = None,
+        until: datetime.datetime | None = None,
+        entity: str | None = None,
+        severity: list[str] | None = None,
+        entity_kind: str | None = None,
+        event_kind: str | None = None,
     ):
         raise NotImplementedError
 
@@ -1352,9 +1382,9 @@ class SQLRunDB(RunDBInterface):
     def paginated_list_alert_activations(
         self,
         *args,
-        page: Optional[int] = None,
-        page_size: Optional[int] = None,
-        page_token: Optional[str] = None,
+        page: int | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
         **kwargs,
     ):
         raise NotImplementedError
@@ -1368,6 +1398,52 @@ class SQLRunDB(RunDBInterface):
 
     def get_project_summary(self, project: str):
         raise NotImplementedError
+
+    def get_drift_over_time(
+        self,
+        project: str,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+    ) -> mlrun.common.schemas.model_monitoring.ModelEndpointDriftValues:
+        raise NotImplementedError
+
+    def store_secret_token(
+        self,
+        secret_token: mlrun.common.schemas.SecretToken,
+        log_warning: bool = True,
+        force: bool = False,
+    ) -> mlrun.common.schemas.StoreSecretTokensResponse:
+        raise NotImplementedError
+
+    def store_secret_tokens(
+        self,
+        secret_tokens: list[mlrun.common.schemas.SecretToken],
+        log_warning: bool = True,
+        force: bool = False,
+    ) -> mlrun.common.schemas.StoreSecretTokensResponse:
+        raise NotImplementedError
+
+    def delete_secret_token(
+        self, token_name: str, username: str | None = None
+    ) -> mlrun.common.schemas.DeleteSecretTokenResponse:
+        raise NotImplementedError
+
+    def list_secret_tokens(
+        self,
+        username: str | None = None,
+    ) -> mlrun.common.schemas.ListSecretTokensResponse:
+        raise NotImplementedError
+
+    def get_secret_token(
+        self,
+        token_name: str,
+        username: str | None = None,
+    ) -> mlrun.common.schemas.SecretToken:
+        return self._transform_db_error(
+            services.api.crud.Secrets().get_secret_token,
+            token_name=token_name,
+            authenticated_username=username,
+        )
 
 
 # Once this file is imported it will override the default RunDB implementation (RunDBContainer)

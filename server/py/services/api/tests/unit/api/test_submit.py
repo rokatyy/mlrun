@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import http
 import json
 import unittest.mock
@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 import mlrun
 import mlrun.common.constants as mlrun_constants
 from mlrun.common.schemas import AuthInfo
+from mlrun.common.types import AuthenticationMode
 from mlrun.config import config as mlconf
 
 import framework.utils.auth.verifier
@@ -154,7 +155,7 @@ def test_submit_job_auto_mount(
 def test_submit_job_ensure_function_has_auth_set(
     db: Session, client: TestClient, pod_create_mock, k8s_secrets_mock
 ) -> None:
-    mlrun.mlconf.httpdb.authentication.mode = "iguazio"
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO
     project = "my-proj1"
     services.api.tests.unit.api.utils.create_project(client, project)
 
@@ -281,10 +282,6 @@ def test_submit_job_service_accounts(
 ):
     project = "my-proj1"
     services.api.tests.unit.api.utils.create_project(client, project)
-
-    # must set the default project since new_function creates the function object and ignores the project parameter.
-    # Instead, the function always gets the default project name. This may be a bug, need to check.
-    mlconf.default_project = project
 
     function_name = "test-function"
     function_tag = "latest"
@@ -569,7 +566,7 @@ def test_submit_job_failure_params_exceed_int64(
     assert resp.status_code == HTTPStatus.BAD_REQUEST.value
     assert "exceeds int64" in resp.json()["detail"]
 
-    resp = client.get("runs", params={"project": project_name})
+    resp = client.get(f"projects/{project_name}/runs")
     # assert the run wasn't saved to the DB
     assert len(resp.json()["runs"]) == 0
 
@@ -603,20 +600,45 @@ def _assert_pod_env_vars(pod_create_mock, expected_env_vars):
 def _get_pod_env_vars_as_dict(pod_create_mock, assert_called=True):
     if assert_called:
         pod_create_mock.assert_called_once()
+
     args, _ = pod_create_mock.call_args
     pod_env = args[0].spec.containers[0].env
+
     pod_env_dict = {}
+
     for env_item in pod_env:
-        name = mlrun.runtimes.utils.get_item_name(env_item)
+        name = mlrun.runtimes.utils.get_item_name(env_item, "name")
         value = mlrun.runtimes.utils.get_item_name(env_item, "value")
-        value_from = mlrun.runtimes.utils.get_item_name(env_item, "value_from")
-        if value:
+        value_from = mlrun.runtimes.utils.get_item_name(
+            env_item, "value_from"
+        ) or mlrun.runtimes.utils.get_item_name(env_item, "valueFrom")
+
+        if value is not None:
             pod_env_dict[name] = value
-        else:
+            continue
+
+        if not value_from:
+            raise AssertionError(f"Env var {name} has neither value nor valueFrom")
+
+        # secretKeyRef
+        secret_ref = mlrun.runtimes.utils.get_item_name(value_from, "secret_key_ref")
+        if secret_ref:
             pod_env_dict[name] = (
-                value_from.secret_key_ref.name,
-                value_from.secret_key_ref.key,
+                mlrun.runtimes.utils.get_item_name(secret_ref, "name"),
+                mlrun.runtimes.utils.get_item_name(secret_ref, "key"),
             )
+            continue
+
+        # fieldRef
+        field_ref = mlrun.runtimes.utils.get_item_name(value_from, "fieldRef")
+        if field_ref:
+            pod_env_dict[name] = mlrun.runtimes.utils.get_item_name(
+                field_ref, "fieldPath"
+            )
+            continue
+
+        raise AssertionError(f"Unsupported valueFrom type for env var {name}")
+
     return pod_env_dict
 
 

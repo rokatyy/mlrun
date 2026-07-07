@@ -16,7 +16,6 @@ import random
 import threading
 import time
 import traceback
-from typing import Optional
 
 import mlrun.artifacts
 import mlrun.common.model_monitoring.helpers
@@ -24,6 +23,9 @@ import mlrun.common.schemas.model_monitoring
 import mlrun.model_monitoring
 from mlrun.utils import logger, now_date
 
+from ..common.model_monitoring.helpers import (
+    get_model_endpoints_creation_task_status,
+)
 from .utils import StepToDict, _extract_input_data, _update_result_body
 
 
@@ -31,13 +33,13 @@ class V2ModelServer(StepToDict):
     def __init__(
         self,
         context=None,
-        name: Optional[str] = None,
-        model_path: Optional[str] = None,
+        name: str | None = None,
+        model_path: str | None = None,
         model=None,
         protocol=None,
-        input_path: Optional[str] = None,
-        result_path: Optional[str] = None,
-        shard_by_endpoint: Optional[bool] = None,
+        input_path: str | None = None,
+        result_path: str | None = None,
+        shard_by_endpoint: bool | None = None,
         **kwargs,
     ):
         """base model serving class (v2), using similar API to KFServing v2 and Triton
@@ -76,7 +78,9 @@ class V2ModelServer(StepToDict):
             # adding a model to a serving graph using the subclass MyClass
             # MyClass will be initialized with the name "my", the model_path, and an arg called my_param
             graph = fn.set_topology("router")
-            fn.add_model("my", class_name="MyClass", model_path="<model-uri>>", my_param=5)
+            fn.add_model(
+                "my", class_name="MyClass", model_path="<model-uri>>", my_param=5
+            )
 
         :param context:    for internal use (passed in init)
         :param name:       step name
@@ -100,7 +104,7 @@ class V2ModelServer(StepToDict):
         self.error = ""
         self.protocol = protocol or "v2"
         self.model_path = model_path
-        self.model_spec: Optional[mlrun.artifacts.ModelArtifact] = None
+        self.model_spec: mlrun.artifacts.ModelArtifact | None = None
         self._input_path = input_path
         self._result_path = result_path
         self._kwargs = kwargs  # for to_dict()
@@ -111,10 +115,11 @@ class V2ModelServer(StepToDict):
         if model:
             self.model = model
             self.ready = True
-        self.model_endpoint_uid = None
+        self.model_endpoint_uid = kwargs.get("model_endpoint_uid", None)
         self.shard_by_endpoint = shard_by_endpoint
         self._model_logger = None
         self.initialized = False
+        self.output_schema = kwargs.get("outputs", [])
 
     def _load_and_update_state(self):
         try:
@@ -136,69 +141,35 @@ class V2ModelServer(StepToDict):
             else:
                 self._load_and_update_state()
 
-    def _lazy_init(self, event_id):
-        server: mlrun.serving.GraphServer = getattr(
-            self.context, "_server", None
-        ) or getattr(self.context, "server", None)
-        if not server:
-            logger.warn("GraphServer not initialized for VotingEnsemble instance")
-            return
-        if not self.context.is_mock and not self.model_spec:
+        if self.ready and not self.context.is_mock and not self.model_spec:
             self.get_model()
-        if not self.context.is_mock or self.context.monitoring_mock:
-            if server.model_endpoint_creation_task_name:
-                background_task = mlrun.get_run_db().get_project_background_task(
-                    server.project, server.model_endpoint_creation_task_name
+
+        if self.model_spec:
+            self.output_schema = self.output_schema or [
+                feature.name for feature in self.model_spec.outputs
+            ]
+
+        if (
+            kwargs.get("endpoint_type", mlrun.common.schemas.EndpointType.LEAF_EP)
+            == mlrun.common.schemas.EndpointType.NODE_EP
+        ):
+            self._initialize_model_logger()
+
+    def _lazy_init(self, event):
+        if event and isinstance(event, dict) and not self.initialized:
+            background_task_state = event.get("background_task_state", None)
+            if (
+                background_task_state
+                == mlrun.common.schemas.BackgroundTaskState.succeeded
+            ):
+                self._model_logger = (
+                    _ModelLogPusher(self, self.context)
+                    if self.context
+                    and self.context.stream.enabled
+                    and self.model_endpoint_uid
+                    else None
                 )
-                logger.debug(
-                    "Checking model endpoint creation task status",
-                    task_name=server.model_endpoint_creation_task_name,
-                )
-                if (
-                    background_task.status.state
-                    in mlrun.common.schemas.BackgroundTaskState.terminal_states()
-                ):
-                    logger.debug(
-                        f"Model endpoint creation task completed with state {background_task.status.state}"
-                    )
-                else:  # in progress
-                    logger.debug(
-                        f"Model endpoint creation task is still in progress with the current state: "
-                        f"{background_task.status.state}. This event will not be monitored.",
-                        name=self.name,
-                        event_id=event_id,
-                    )
-                    self.initialized = False
-                    return
-            else:
-                logger.debug(
-                    "Model endpoint creation task name not provided",
-                )
-            try:
-                self.model_endpoint_uid = (
-                    mlrun.get_run_db()
-                    .get_model_endpoint(
-                        project=server.project,
-                        name=self.name,
-                        function_name=server.function_name,
-                        function_tag=server.function_tag or "latest",
-                        tsdb_metrics=False,
-                    )
-                    .metadata.uid
-                )
-            except mlrun.errors.MLRunNotFoundError:
-                logger.info(
-                    "Model endpoint not found for this step; monitoring for this model will not be performed",
-                    function_name=server.function_name,
-                    name=self.name,
-                )
-                self.model_endpoint_uid = None
-        self._model_logger = (
-            _ModelLogPusher(self, self.context)
-            if self.context and self.context.stream.enabled and self.model_endpoint_uid
-            else None
-        )
-        self.initialized = True
+                self.initialized = True
 
     def get_param(self, key: str, default=None):
         """get param by key (specified in the model or the function)"""
@@ -210,7 +181,7 @@ class V2ModelServer(StepToDict):
         """set real time metric (for model monitoring)"""
         self.metrics[name] = value
 
-    def get_model(self, suffix=""):
+    def get_model(self, suffix="") -> (str, dict):
         """get the model file(s) and metadata from model store
 
         the method returns a path to the model file and the extra data (dict of dataitem objects)
@@ -277,7 +248,7 @@ class V2ModelServer(StepToDict):
     def do_event(self, event, *args, **kwargs):
         """main model event handler method"""
         if not self.initialized:
-            self._lazy_init(event.id)
+            self._lazy_init(event.body)
         start = now_date()
         original_body = event.body
         event_body = _extract_input_data(self._input_path, event.body)
@@ -417,15 +388,15 @@ class V2ModelServer(StepToDict):
         return event
 
     def logged_results(self, request: dict, response: dict, op: str):
-        """hook for controlling which results are tracked by the model monitoring
+        """Hook for controlling which results are tracked by the model monitoring
 
-        this hook allows controlling which input/output data is logged by the model monitoring
-        allow filtering out columns or adding custom values, can also be used to monitor derived metrics
-        for example in image classification calculate and track the RGB values vs the image bitmap
+        This hook allows controlling which input/output data is logged by the model monitoring.
+        It allows filtering out columns or adding custom values, and can also be used to monitor derived metrics,
+        for example in image classification to calculate and track the RGB values vs the image bitmap.
 
-        the request["inputs"] holds a list of input values/arrays, the response["outputs"] holds a list of
-        corresponding output values/arrays (the schema of the input/output fields is stored in the model object),
-        this method should return lists of alternative inputs and outputs which will be monitored
+        The request ["inputs"] holds a list of input values/arrays, the response ["outputs"] holds a list of
+        corresponding output values/arrays (the schema of the input/output fields is stored in the model object).
+        This method should return lists of alternative inputs and outputs which will be monitored.
 
         :param request:   predict/explain request, see model serving docs for details
         :param response:  result from the model predict/explain (after postprocess())
@@ -455,6 +426,7 @@ class V2ModelServer(StepToDict):
 
     def predict(self, request: dict) -> list:
         """model prediction operation
+
         :return: list with the model prediction results (can be multi-port) or list of lists for multiple predictions
         """
         raise NotImplementedError()
@@ -469,7 +441,7 @@ class V2ModelServer(StepToDict):
         where the internal list order is according to the ArtifactModel inputs.
 
         :param request: event
-        :return: evnet body converting the inputs to be list of lists
+        :return: event body converting the inputs to be list of lists
         """
         if self.model_spec and self.model_spec.inputs:
             input_order = [feature.name for feature in self.model_spec.inputs]
@@ -499,6 +471,46 @@ class V2ModelServer(StepToDict):
             )
         request["inputs"] = new_inputs
         return request
+
+    def _initialize_model_logger(self):
+        server: mlrun.serving.GraphServer = getattr(
+            self.context, "_server", None
+        ) or getattr(self.context, "server", None)
+        if not self.context.is_mock or self.context.monitoring_mock:
+            if server.model_endpoint_creation_task_name:
+                background_task_state, _, _ = get_model_endpoints_creation_task_status(
+                    server
+                )
+                if (
+                    background_task_state
+                    in mlrun.common.schemas.BackgroundTaskState.terminal_states()
+                ):
+                    logger.debug(
+                        f"Model endpoint creation task completed with state {background_task_state}"
+                    )
+                    if (
+                        background_task_state
+                        == mlrun.common.schemas.BackgroundTaskState.succeeded
+                    ):
+                        self._model_logger = (
+                            _ModelLogPusher(self, self.context)
+                            if self.context
+                            and self.context.stream.enabled
+                            and self.model_endpoint_uid
+                            else None
+                        )
+                        self.initialized = True
+
+                else:  # in progress
+                    logger.debug(
+                        f"Model endpoint creation task is still in progress with the current state: "
+                        f"{background_task_state}.",
+                        name=self.name,
+                    )
+            else:
+                logger.error(
+                    "Model endpoint creation task name not provided. This function is not being monitored.",
+                )
 
 
 class _ModelLogPusher:
@@ -566,6 +578,17 @@ class _ModelLogPusher:
                     resp["outputs"] = [
                         resp["outputs"][i] for i in sampled_requests_indices
                     ]
+                if self.model.output_schema and len(self.model.output_schema) != len(
+                    resp["outputs"][0]
+                ):
+                    logger.info(
+                        "The number of outputs returned by the model does not match the number of outputs "
+                        "specified in the model endpoint.",
+                        model_endpoint=self.model.name,
+                        model_endpoint_id=self.model.model_endpoint_uid,
+                        output_len=len(resp["outputs"][0]),
+                        schema_len=len(self.model.output_schema),
+                    )
 
             data = self.base_data()
             data["request"] = request

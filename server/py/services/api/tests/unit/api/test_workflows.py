@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import random
 import unittest.mock
 from http import HTTPStatus
@@ -102,9 +102,9 @@ def test_get_workflow_bad_id(db: Session, client: TestClient):
         f"projects/{PROJECT_NAME}/workflows/{WORKFLOW_NAME}/runs/{right_id}"
     ).json()
 
-    assert (
-        good_resp.get("workflow_id", "") == expected_workflow_id
-    ), f"response: {good_resp}"
+    assert good_resp.get("workflow_id", "") == expected_workflow_id, (
+        f"response: {good_resp}"
+    )
     bad_resp = client.get(
         f"projects/{PROJECT_NAME}/workflows/{WORKFLOW_NAME}/runs/{wrong_id}"
     )

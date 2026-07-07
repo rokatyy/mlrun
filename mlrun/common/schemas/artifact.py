@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import typing
 
 import pydantic.v1
-from deprecated import deprecated
 
 import mlrun.common.types
 
@@ -26,6 +25,7 @@ class ArtifactCategories(mlrun.common.types.StrEnum):
     model = "model"
     dataset = "dataset"
     document = "document"
+    llm_prompt = "llm-prompt"
     other = "other"
 
     # we define the link as a category to prevent import cycles, but it's not a real category
@@ -41,64 +41,73 @@ class ArtifactCategories(mlrun.common.types.StrEnum):
             return [ArtifactCategories.dataset.value, link_kind], False
         if self.value == ArtifactCategories.document.value:
             return [ArtifactCategories.document.value, link_kind], False
+        if self.value == ArtifactCategories.llm_prompt.value:
+            return [ArtifactCategories.llm_prompt.value, link_kind], False
         if self.value == ArtifactCategories.other.value:
             return (
                 [
                     ArtifactCategories.model.value,
                     ArtifactCategories.dataset.value,
                     ArtifactCategories.document.value,
+                    ArtifactCategories.llm_prompt.value,
                 ],
                 True,
             )
 
     @classmethod
     def from_kind(cls, kind: str) -> "ArtifactCategories":
-        if kind in [cls.model.value, cls.dataset.value, cls.document.value]:
+        if kind in [
+            cls.model.value,
+            cls.dataset.value,
+            cls.document.value,
+            cls.llm_prompt.value,
+        ]:
             return cls(kind)
         return cls.other
+
+    @staticmethod
+    def all():
+        """Return all applicable artifact categories"""
+        return [
+            ArtifactCategories.model,
+            ArtifactCategories.dataset,
+            ArtifactCategories.document,
+            ArtifactCategories.llm_prompt,
+        ]
 
 
 class ArtifactIdentifier(pydantic.v1.BaseModel):
     # artifact kind
-    kind: typing.Optional[str]
-    key: typing.Optional[str]
-    iter: typing.Optional[int]
-    uid: typing.Optional[str]
-    producer_id: typing.Optional[str]
+    kind: str | None
+    key: str | None
+    iter: int | None
+    uid: str | None
+    producer_id: str | None
     # TODO support hash once saved as a column in the artifacts table
     # hash: typing.Optional[str]
-
-
-@deprecated(
-    version="1.7.0",
-    reason="mlrun.common.schemas.ArtifactsFormat is deprecated and will be removed in 1.9.0. "
-    "Use mlrun.common.formatters.ArtifactFormat instead.",
-    category=FutureWarning,
-)
-class ArtifactsFormat(mlrun.common.types.StrEnum):
-    full = "full"
 
 
 class ArtifactMetadata(pydantic.v1.BaseModel):
     key: str
     project: str
-    iter: typing.Optional[int]
-    tree: typing.Optional[str]
-    tag: typing.Optional[str]
+    iter: int | None
+    tree: str | None
+    tag: str | None
 
     class Config:
         extra = pydantic.v1.Extra.allow
 
 
 class ArtifactSpec(pydantic.v1.BaseModel):
-    src_path: typing.Optional[str]
-    target_path: typing.Optional[str]
-    viewer: typing.Optional[str]
-    inline: typing.Optional[str]
-    size: typing.Optional[int]
-    db_key: typing.Optional[str]
-    extra_data: typing.Optional[dict[str, typing.Any]]
-    unpackaging_instructions: typing.Optional[dict[str, typing.Any]]
+    src_path: str | None
+    target_path: str | None
+    viewer: str | None
+    inline: str | None
+    size: int | None
+    db_key: str | None
+    extra_data: dict[str, typing.Any] | None
+    unpackaging_instructions: dict[str, typing.Any] | None
+    parent_uri: str | None
 
     class Config:
         extra = pydantic.v1.Extra.allow

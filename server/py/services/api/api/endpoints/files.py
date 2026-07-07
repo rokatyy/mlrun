@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import mimetypes
 from http import HTTPStatus
-from typing import Optional
 
 import fastapi
 from fastapi.concurrency import run_in_threadpool
@@ -108,7 +107,7 @@ def _get_files(
     size: int,
     offset: int,
     auth_info: mlrun.common.schemas.AuthInfo,
-    secrets: Optional[dict] = None,
+    secrets: dict | None = None,
     project: str = "",
 ):
     if size > mlrun.mlconf.artifacts.limits.max_chunk_size:

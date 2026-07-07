@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import json
 import os
 import tempfile
@@ -185,7 +185,7 @@ class TestGoogleCloudStorage(TestMLRunSystem):
         )
 
         gcs_path = (
-            f"{self._bucket_name}/{target_path[target_path.index(self.test_dir):]}"
+            f"{self._bucket_name}/{target_path[target_path.index(self.test_dir) :]}"
         )
         # Check for ML-6587 regression
         assert self._gcs_fs.exists(gcs_path)

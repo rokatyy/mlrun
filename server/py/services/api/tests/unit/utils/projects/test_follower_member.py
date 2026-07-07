@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import datetime
 import typing
 import unittest.mock
+from typing import get_args, get_type_hints
 
 import deepdiff
 import pytest
@@ -26,6 +27,7 @@ import mlrun.config
 import mlrun.errors
 import mlrun.utils
 
+import framework.db.sqldb.models
 import framework.utils.background_tasks
 import framework.utils.projects.follower
 import framework.utils.projects.remotes.leader
@@ -220,6 +222,71 @@ def test_patch_project(
     expected_patched_project.status.state = mlrun.common.schemas.ProjectState.online
     _assert_projects_equal(expected_patched_project, patched_project)
     _assert_project_in_follower(db, projects_follower, expected_patched_project)
+
+
+@pytest.mark.parametrize("field", ["source", "description", "owner"])
+def test_store_project_field_at_max_length(
+    db: sqlalchemy.orm.Session,
+    projects_follower: framework.utils.projects.follower.Member,
+    nop_leader: framework.utils.projects.remotes.leader.Member,
+    field: str,
+):
+    max_length = getattr(framework.db.sqldb.models.Project, field).type.max_length
+    max_value = "a" * max_length
+    project = _generate_project()
+    setattr(project.spec, field, max_value)
+    stored_project, _ = projects_follower.store_project(
+        db, project.metadata.name, project
+    )
+    assert getattr(stored_project.spec, field) == max_value
+
+
+@pytest.mark.parametrize("field", ["source", "description", "owner"])
+def test_store_project_field_too_long_is_rejected(
+    db: sqlalchemy.orm.Session,
+    projects_follower: framework.utils.projects.follower.Member,
+    nop_leader: framework.utils.projects.remotes.leader.Member,
+    field: str,
+):
+    # A project text field longer than its VARCHAR(255) column used to reach the DB and fail with a 500.
+    # Each such field must be rejected with a 400 (MLRunInvalidArgumentError) before the write.
+    max_length = getattr(framework.db.sqldb.models.Project, field).type.max_length
+    too_long_value = "a" * (max_length + 1)
+    project = _generate_project()
+    setattr(project.spec, field, too_long_value)
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+        projects_follower.store_project(db, project.metadata.name, project)
+
+
+@pytest.mark.parametrize("write_path", ["create", "store", "patch"])
+def test_project_over_long_field_rejected_on_all_write_paths(
+    db: sqlalchemy.orm.Session,
+    projects_follower: framework.utils.projects.follower.Member,
+    nop_leader: framework.utils.projects.remotes.leader.Member,
+    write_path: str,
+):
+    # Every API write path must reject an over-long field before the write.
+    max_length = framework.db.sqldb.models.Project.source.type.max_length
+    too_long_source = "a" * (max_length + 1)
+
+    if write_path == "create":
+        project = _generate_project()
+        project.spec.source = too_long_source
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            projects_follower.create_project(db, project)
+    elif write_path == "store":
+        project = _generate_project()
+        project.spec.source = too_long_source
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            projects_follower.store_project(db, project.metadata.name, project)
+    else:
+        # patch an existing, valid project with an over-long source
+        project = _generate_project()
+        projects_follower.store_project(db, project.metadata.name, project)
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            projects_follower.patch_project(
+                db, project.metadata.name, {"spec": {"source": too_long_source}}
+            )
 
 
 def test_delete_project(
@@ -430,7 +497,7 @@ async def test_list_project_summaries(
 
     # cannot compare exact datetime objects, so assert that the difference from now is less than 10 seconds
     # and then remove the updated field for comparison.
-    assert datetime.datetime.now(tz=datetime.timezone.utc) - db_project_summary[
+    assert datetime.datetime.now(tz=datetime.UTC) - db_project_summary[
         "updated"
     ] < datetime.timedelta(seconds=10)
     db_project_summary["updated"] = None
@@ -466,9 +533,20 @@ async def test_list_project_summaries_fails_to_list_pipeline_runs(
         project_name,
         project,
     )
+
+    # Resolve the function's return type hints to discover how many counter dicts are expected.
+    hints = get_type_hints(
+        framework.utils.singletons.db.get_db().get_project_resources_counters
+    )
+    # Retrieve the resolved return type (a fixed-length Tuple of dict[str,int] entries),
+    # defaulting to an empty tuple if the annotation is missing
+    ret_ann = hints.get("return", tuple())
+
+    # Mock get_project_resources_counters to return a tuple with one dict per annotated slot,
+    # where each dict maps the project_name to its sequential index (0..N-1)
     framework.utils.singletons.db.get_db().get_project_resources_counters = (
         unittest.mock.AsyncMock(
-            return_value=tuple({project_name: i} for i in range(12))
+            return_value=tuple({project_name: i} for i in range(len(get_args(ret_ann))))
         )
     )
     await services.api.crud.Projects().refresh_project_resources_counters_cache(db)
@@ -491,7 +569,9 @@ def test_list_project_leader_format(
     projects = projects_follower.list_projects(
         db,
         format_=mlrun.common.formatters.ProjectFormat.leader,
-        projects_role=mlrun.common.schemas.ProjectsRole.nop,
+        auth_info=mlrun.common.schemas.AuthInfo(
+            projects_role=mlrun.common.schemas.ProjectsRole.nop
+        ),
     )
     assert (
         deepdiff.DeepDiff(
@@ -537,7 +617,7 @@ def _generate_project(
     description="some description",
     desired_state=mlrun.common.schemas.ProjectDesiredState.online,
     state=mlrun.common.schemas.ProjectState.online,
-    labels: typing.Optional[dict] = None,
+    labels: dict | None = None,
     owner="some-owner",
 ):
     return mlrun.common.schemas.Project(

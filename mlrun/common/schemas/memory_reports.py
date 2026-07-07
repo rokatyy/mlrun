@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import typing
 
@@ -25,6 +24,6 @@ class MostCommonObjectTypesReport(pydantic.v1.BaseModel):
 class ObjectTypeReport(pydantic.v1.BaseModel):
     object_type: str
     sample_size: int
-    start_index: typing.Optional[int]
+    start_index: int | None
     max_depth: int
     object_report: list[dict[str, typing.Any]]

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Optional, Union
+from typing import Union
 
 import pandas as pd
 import requests
@@ -34,32 +34,31 @@ class ClientRemoteLauncher(launcher.ClientBaseLauncher):
     def launch(
         self,
         runtime: "mlrun.runtimes.KubejobRuntime",
-        task: Optional[
-            Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict]
-        ] = None,
-        handler: Optional[str] = None,
-        name: Optional[str] = "",
-        project: Optional[str] = "",
-        params: Optional[dict] = None,
-        inputs: Optional[dict[str, str]] = None,
-        out_path: Optional[str] = "",
-        workdir: Optional[str] = "",
-        artifact_path: Optional[str] = "",
-        watch: Optional[bool] = True,
-        schedule: Optional[
-            Union[str, mlrun.common.schemas.schedule.ScheduleCronTrigger]
-        ] = None,
-        hyperparams: Optional[dict[str, list]] = None,
-        hyper_param_options: Optional[mlrun.model.HyperParamOptions] = None,
-        verbose: Optional[bool] = None,
-        scrape_metrics: Optional[bool] = None,
-        local_code_path: Optional[str] = None,
-        auto_build: Optional[bool] = None,
-        param_file_secrets: Optional[dict[str, str]] = None,
-        notifications: Optional[list[mlrun.model.Notification]] = None,
-        returns: Optional[list[Union[str, dict[str, str]]]] = None,
-        state_thresholds: Optional[dict[str, int]] = None,
-        reset_on_run: Optional[bool] = None,
+        task: Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict] | None = None,
+        handler: str | None = None,
+        name: str | None = "",
+        project: str | None = "",
+        params: dict | None = None,
+        inputs: dict[str, str | list | dict] | None = None,
+        out_path: str | None = "",
+        workdir: str | None = "",
+        artifact_path: str | None = "",
+        output_path: str | None = "",
+        watch: bool | None = True,
+        schedule: Union[str, mlrun.common.schemas.schedule.ScheduleCronTrigger]
+        | None = None,
+        hyperparams: dict[str, list] | None = None,
+        hyper_param_options: mlrun.model.HyperParamOptions | None = None,
+        verbose: bool | None = None,
+        scrape_metrics: bool | None = None,
+        local_code_path: str | None = None,
+        auto_build: bool | None = None,
+        param_file_secrets: dict[str, str] | None = None,
+        notifications: list[mlrun.model.Notification] | None = None,
+        returns: list[Union[str, dict[str, str]]] | None = None,
+        state_thresholds: dict[str, int] | None = None,
+        reset_on_run: bool | None = None,
+        retry: Union[mlrun.model.Retry, dict] | None = None,
     ) -> "mlrun.run.RunObject":
         self.enrich_runtime(runtime, project)
         run = self._create_run_object(task)
@@ -77,13 +76,13 @@ class ClientRemoteLauncher(launcher.ClientBaseLauncher):
             hyper_param_options=hyper_param_options,
             verbose=verbose,
             scrape_metrics=scrape_metrics,
-            out_path=out_path,
-            artifact_path=artifact_path,
+            output_path=output_path,
             workdir=workdir,
             notifications=notifications,
             state_thresholds=state_thresholds,
+            retry=retry,
         )
-        self._validate_runtime(runtime, run)
+        self._validate_run(runtime, run)
 
         if not runtime.is_deployed():
             if runtime.spec.build.auto_build or auto_build:
@@ -124,8 +123,8 @@ class ClientRemoteLauncher(launcher.ClientBaseLauncher):
         self,
         runtime: "mlrun.runtimes.KubejobRuntime",
         run: "mlrun.run.RunObject",
-        schedule: Optional[mlrun.common.schemas.ScheduleCronTrigger] = None,
-        watch: Optional[bool] = None,
+        schedule: mlrun.common.schemas.ScheduleCronTrigger | None = None,
+        watch: bool | None = None,
     ):
         if runtime._secrets:
             run.spec.secret_sources = runtime._secrets.to_serial()
@@ -190,7 +189,7 @@ class ClientRemoteLauncher(launcher.ClientBaseLauncher):
         return self._wrap_run_result(runtime, resp, run, schedule=schedule)
 
     @classmethod
-    def _validate_run_single_param(cls, param_name, param_value):
+    def _validate_run_single_param(cls, param_name: str, param_value: int):
         if isinstance(param_value, pd.DataFrame):
             raise mlrun.errors.MLRunInvalidArgumentTypeError(
                 f"Parameter '{param_name}' has an unsupported value of type"

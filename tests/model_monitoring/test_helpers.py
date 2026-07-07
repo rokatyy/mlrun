@@ -14,8 +14,8 @@
 
 import datetime
 from collections.abc import Iterator
-from typing import NamedTuple, Optional, Union
-from unittest.mock import patch
+from typing import NamedTuple, Union
+from unittest.mock import Mock, patch
 
 import nuclio
 import numpy as np
@@ -25,28 +25,30 @@ import pytest
 import mlrun
 from mlrun.common.model_monitoring.helpers import (
     _MAX_FLOAT,
+    TIMESCALEDB_DEFAULT_DB_PREFIX,
     FeatureStats,
     Histogram,
     get_kafka_topic,
+    get_tsdb_database_name,
     pad_features_hist,
     pad_hist,
 )
-from mlrun.common.schemas import EndpointType, ModelEndpoint
-from mlrun.common.schemas.model_monitoring.constants import EventFieldType
+from mlrun.common.schemas import EndpointMode
 from mlrun.datastore import KafkaOutputStream, OutputStream
 from mlrun.datastore.datastore_profile import (
     DatastoreProfile,
-    DatastoreProfileKafkaSource,
-    DatastoreProfileKafkaTarget,
+    DatastoreProfileKafkaStream,
+    DatastoreProfileS3,
     DatastoreProfileV3io,
 )
 from mlrun.db.nopdb import NopDB
 from mlrun.model_monitoring.controller import (
+    MonitoringApplicationController,
     _BatchWindow,
     _BatchWindowGenerator,
     _Interval,
 )
-from mlrun.model_monitoring.db._schedules import ModelMonitoringSchedulesFile
+from mlrun.model_monitoring.db._schedules import ModelMonitoringSchedulesFileEndpoint
 from mlrun.model_monitoring.helpers import (
     _BatchDict,
     _get_monitoring_time_window_from_controller_run,
@@ -54,9 +56,10 @@ from mlrun.model_monitoring.helpers import (
     filter_results_by_regex,
     get_invocations_fqn,
     get_output_stream,
-    update_model_endpoint_last_request,
+    get_start_end,
 )
-from mlrun.utils import datetime_now
+
+TIMESTAMP_RESOLUTION_MICRO = 1e-6  # 0.000001 seconds or 1 microsecond
 
 
 class _HistLen(NamedTuple):
@@ -213,9 +216,7 @@ class TestBatchInterval:
         ):
             return marker.args[0]
         return int(
-            datetime.datetime(
-                2021, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc
-            ).timestamp()
+            datetime.datetime(2021, 1, 1, 12, 0, 0, tzinfo=datetime.UTC).timestamp()
         )
 
     @staticmethod
@@ -226,9 +227,7 @@ class TestBatchInterval:
         ):
             return marker.args[0]
         return int(
-            datetime.datetime(
-                2021, 1, 1, 13, 1, 0, tzinfo=datetime.timezone.utc
-            ).timestamp()
+            datetime.datetime(2021, 1, 1, 13, 1, 0, tzinfo=datetime.UTC).timestamp()
         )
 
     @staticmethod
@@ -242,8 +241,10 @@ class TestBatchInterval:
 
     @staticmethod
     @pytest.fixture
-    def schedules_file() -> Iterator[ModelMonitoringSchedulesFile]:
-        file = ModelMonitoringSchedulesFile(project="test-intervals", endpoint_id="ep")
+    def schedules_file() -> Iterator[ModelMonitoringSchedulesFileEndpoint]:
+        file = ModelMonitoringSchedulesFileEndpoint(
+            project="test-intervals", endpoint_id="ep"
+        )
         file.create()
         yield file
         file.delete()
@@ -251,7 +252,7 @@ class TestBatchInterval:
     @staticmethod
     @pytest.fixture
     def intervals(
-        schedules_file: ModelMonitoringSchedulesFile,
+        schedules_file: ModelMonitoringSchedulesFileEndpoint,
         timedelta_seconds: int,
         first_request: int,
         last_updated: int,
@@ -271,9 +272,7 @@ class TestBatchInterval:
     @pytest.fixture
     def expected_intervals() -> list[_Interval]:
         def dt(hour: int, minute: int) -> datetime.datetime:
-            return datetime.datetime(
-                2021, 1, 1, hour, minute, tzinfo=datetime.timezone.utc
-            )
+            return datetime.datetime(2021, 1, 1, hour, minute, tzinfo=datetime.UTC)
 
         def interval(start: tuple[int, int], end: tuple[int, int]) -> _Interval:
             return _Interval(dt(*start), dt(*end))
@@ -295,24 +294,29 @@ class TestBatchInterval:
     def test_touching_intervals(intervals: list[_Interval]) -> None:
         assert len(intervals) > 1, "There should be more than one interval"
         for prev, curr in zip(intervals[:-1], intervals[1:]):
-            assert prev[1] == curr[0], "The intervals should be touching"
+            assert prev[1] == curr[0] - datetime.timedelta(microseconds=1), (
+                "The intervals should be touching"
+            )
 
     @staticmethod
     def test_intervals(
         intervals: list[_Interval], expected_intervals: list[_Interval]
     ) -> None:
-        assert len(intervals) == len(
-            expected_intervals
-        ), "The number of intervals is not as expected"
-        assert intervals == expected_intervals, "The intervals are not as expected"
+        assert len(intervals) == len(expected_intervals), (
+            "The number of intervals is not as expected"
+        )
+        assert intervals == [
+            _Interval(interval.start, interval.end - datetime.timedelta(microseconds=1))
+            for interval in expected_intervals
+        ], "The intervals are not as expected"
 
     @staticmethod
     def test_last_interval_does_not_overflow(
         intervals: list[_Interval], last_updated: int
     ) -> None:
-        assert (
-            intervals[-1][1].timestamp() <= last_updated
-        ), "The last interval should be after last_updated"
+        assert intervals[-1][1].timestamp() <= last_updated, (
+            "The last interval should be after last_updated"
+        )
 
     @staticmethod
     @pytest.mark.parametrize(
@@ -333,7 +337,7 @@ class TestBatchInterval:
         last_updated: int,
         first_request: int,
         expected_last_analyzed: int,
-        schedules_file: ModelMonitoringSchedulesFile,
+        schedules_file: ModelMonitoringSchedulesFileEndpoint,
     ) -> None:
         with schedules_file as f:
             assert (
@@ -350,27 +354,22 @@ class TestBatchInterval:
     @staticmethod
     @pytest.mark.timedelta_seconds(int(datetime.timedelta(days=6).total_seconds()))
     @pytest.mark.first_request(
-        int(
-            datetime.datetime(
-                2020, 12, 25, 23, 0, 0, tzinfo=datetime.timezone.utc
-            ).timestamp()
-        )
+        int(datetime.datetime(2020, 12, 25, 23, 0, 0, tzinfo=datetime.UTC).timestamp())
     )
     @pytest.mark.last_updated(
-        int(
-            datetime.datetime(
-                2021, 1, 1, 3, 1, 0, tzinfo=datetime.timezone.utc
-            ).timestamp()
-        )
+        int(datetime.datetime(2021, 1, 1, 3, 1, 0, tzinfo=datetime.UTC).timestamp())
     )
     def test_large_base_period(
         timedelta_seconds: int, intervals: list[_Interval]
     ) -> None:
         assert len(intervals) == 1, "There should be exactly one interval"
-        assert timedelta_seconds == datetime.datetime.timestamp(
-            intervals[0][1]
-        ) - datetime.datetime.timestamp(
-            intervals[0][0]
+        assert (
+            abs(
+                datetime.datetime.timestamp(intervals[0][1])
+                - datetime.datetime.timestamp(intervals[0][0])
+                - timedelta_seconds
+            )
+            <= TIMESTAMP_RESOLUTION_MICRO
         ), "The time slot should be equal to timedelta_seconds (6 days)"
 
 
@@ -379,15 +378,63 @@ class TestBatchWindowGenerator:
     def test_last_updated_is_in_the_past() -> None:
         last_request = datetime.datetime(2023, 11, 16, 12, 0, 0)
         last_updated = _BatchWindowGenerator._get_last_updated_time(
-            last_request=last_request, not_batch_endpoint=True
+            last_request=last_request,
+            endpoint_mode=EndpointMode.REAL_TIME,
         )
         assert last_updated
-        assert (
-            last_updated < last_request.timestamp()
-        ), "The last updated time should be before the last request"
+        assert last_updated < last_request.timestamp(), (
+            "The last updated time should be before the last request"
+        )
+
+        last_updated = _BatchWindowGenerator._get_last_updated_time(
+            last_request=last_request,
+            endpoint_mode=EndpointMode.BATCH,
+        )
+
+        assert last_updated
+        assert last_updated == last_request.timestamp(), (
+            "The last updated time should similar to the last request time for batch endpoints"
+        )
 
 
-class TestBumpModelEndpointLastRequest:
+class TestControllerLegacyEndpoints:
+    @staticmethod
+    def test_legacy_batch_endpoints_warn_and_are_not_processed(monkeypatch) -> None:
+        controller = MonitoringApplicationController.__new__(
+            MonitoringApplicationController
+        )
+        controller.project = "test-project"
+        controller._legacy_endpoints_warned = False
+
+        legacy_endpoint = Mock()
+        legacy_endpoint.metadata.mode = EndpointMode.BATCH_LEGACY
+        controller.project_obj = Mock()
+        controller.project_obj.list_model_endpoints.return_value = Mock(
+            endpoints=[legacy_endpoint]
+        )
+
+        warnings_seen: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            mlrun.model_monitoring.controller.logger,
+            "warning",
+            lambda msg, *args, **kwargs: warnings_seen.append((msg, kwargs)),
+        )
+
+        # The warning is throttled to once per controller process, so running
+        # multiple cycles still produces a single warning.
+        controller.push_regular_event_to_controller_stream()
+        controller.push_regular_event_to_controller_stream()
+
+        assert len(warnings_seen) == 1
+        message, fields = warnings_seen[0]
+        assert "no longer monitored" in message
+        assert fields["count"] == 1
+        assert controller._legacy_endpoints_warned is True
+        # No real-time endpoints -> the scan returns before processing any endpoint
+        controller.project_obj.list_model_monitoring_functions.assert_not_called()
+
+
+class TestGetMonitoringTimeWindow:
     @staticmethod
     @pytest.fixture
     def project() -> str:
@@ -400,90 +447,8 @@ class TestBumpModelEndpointLastRequest:
 
     @staticmethod
     @pytest.fixture
-    def empty_model_endpoint() -> ModelEndpoint:
-        return ModelEndpoint(
-            metadata=mlrun.common.schemas.ModelEndpointMetadata(
-                name="test", project="test-project"
-            ),
-            spec=mlrun.common.schemas.ModelEndpointSpec(),
-            status=mlrun.common.schemas.ModelEndpointStatus(),
-        )
-
-    @staticmethod
-    @pytest.fixture
-    def last_request() -> str:
-        return "2023-12-05 18:17:50.255143"
-
-    @staticmethod
-    @pytest.fixture
-    def model_endpoint(
-        empty_model_endpoint: ModelEndpoint, last_request: str
-    ) -> ModelEndpoint:
-        empty_model_endpoint.status.last_request = last_request
-        return empty_model_endpoint
-
-    @staticmethod
-    @pytest.fixture
     def function() -> mlrun.runtimes.ServingRuntime:
         return TemplateFunction()
-
-    @staticmethod
-    def test_update_last_request(
-        project: str,
-        model_endpoint: ModelEndpoint,
-        db: NopDB,
-        last_request: str,
-        function: mlrun.runtimes.ServingRuntime,
-    ) -> None:
-        with patch.object(db, "patch_model_endpoint") as patch_patch_model_endpoint:
-            with patch.object(db, "get_function", return_value=function):
-                update_model_endpoint_last_request(
-                    project=project,
-                    model_endpoint=model_endpoint,
-                    current_request=datetime.datetime.fromisoformat(last_request),
-                    db=db,
-                )
-        patch_patch_model_endpoint.assert_called_once()
-        assert patch_patch_model_endpoint.call_args.kwargs["attributes"][
-            EventFieldType.LAST_REQUEST
-        ] == datetime.datetime.fromisoformat(last_request)
-        model_endpoint.metadata.endpoint_type = EndpointType.BATCH_EP
-
-        with patch.object(db, "patch_model_endpoint") as patch_patch_model_endpoint:
-            with patch.object(db, "get_function", return_value=function):
-                update_model_endpoint_last_request(
-                    project=project,
-                    model_endpoint=model_endpoint,
-                    current_request=datetime.datetime.fromisoformat(last_request),
-                    db=db,
-                )
-        patch_patch_model_endpoint.assert_called_once()
-        assert patch_patch_model_endpoint.call_args.kwargs["attributes"][
-            EventFieldType.LAST_REQUEST
-        ] == datetime.datetime.fromisoformat(last_request) + datetime.timedelta(
-            minutes=1
-        ) + datetime.timedelta(
-            seconds=mlrun.mlconf.model_endpoint_monitoring.parquet_batching_timeout_secs
-        ), "The patched last request time should be bumped by the given delta"
-
-    @staticmethod
-    def test_no_bump(
-        project: str,
-        model_endpoint: ModelEndpoint,
-        db: NopDB,
-    ) -> None:
-        with patch.object(db, "patch_model_endpoint") as patch_patch_model_endpoint:
-            with patch.object(
-                db, "get_function", side_effect=mlrun.errors.MLRunNotFoundError
-            ):
-                model_endpoint.metadata.endpoint_type = EndpointType.BATCH_EP
-                update_model_endpoint_last_request(
-                    project=project,
-                    model_endpoint=model_endpoint,
-                    current_request=datetime_now(),
-                    db=db,
-                )
-        patch_patch_model_endpoint.assert_not_called()
 
     @staticmethod
     def test_get_monitoring_time_window_from_controller_run(
@@ -566,7 +531,7 @@ def test_filter_results_by_regex():
 )
 def test_get_kafka_topic(
     project: str,
-    function_name: Optional[str],
+    function_name: str | None,
     expected_topic: str,
 ) -> None:
     assert (
@@ -578,13 +543,13 @@ def test_get_kafka_topic(
     ("profile", "expected_output_stream_type"),
     [
         (
-            DatastoreProfileKafkaSource(
+            DatastoreProfileKafkaStream(
                 name="test-kafka-profile",
                 brokers=["localhost"],
                 topics=[],
                 sasl_user="user1",
                 sasl_pass="1234",
-                kwargs_public={"producer_options": {"api_version": (3, 9)}},
+                kwargs_public={"api_version": (3, 9)},
             ),
             KafkaOutputStream,
         ),
@@ -605,9 +570,9 @@ def test_get_output_stream(
         monkeypatch.setenv("V3IO_API", mlrun.mlconf.v3io_api)
 
     output_stream = get_output_stream(profile=profile, project="test-proj", mock=True)
-    assert isinstance(
-        output_stream, expected_output_stream_type
-    ), "The output stream is of an unexpected type"
+    assert isinstance(output_stream, expected_output_stream_type), (
+        "The output stream is of an unexpected type"
+    )
 
     output_stream.push(2 * [{"k1": 0, "jump": "high"}])
     output_stream.push([{"k1": 1, "jump": "mid"}])
@@ -618,14 +583,143 @@ def test_get_output_stream_unsupported() -> None:
         mlrun.errors.MLRunValueError,
         match=(
             r".*an unexpected stream profile type: "
-            r"<class 'mlrun\.datastore\.datastore_profile\.DatastoreProfileKafkaTarget'>"
+            r"<class 'mlrun\.datastore\.datastore_profile\.DatastoreProfileS3'>"
             r".*"
         ),
     ):
         get_output_stream(
             project="nmo",
             function_name="model-monitoring-controller",
-            profile=DatastoreProfileKafkaTarget(
-                name="k-tgt", brokers="localhost", topic="t1"
-            ),
+            profile=DatastoreProfileS3(name="k-tgt", bucket="b2"),
         )
+
+
+def test_get_start_end():
+    now = mlrun.utils.datetime_now()
+
+    # Test default when only end is provided
+    start, end = get_start_end(
+        start=None,
+        end=now,
+    )
+
+    assert start == mlrun.utils.datetime_min()
+    assert end == now
+
+    # Test when delta is provided
+    start, end = get_start_end(
+        start=None,
+        end=now,
+        delta=datetime.timedelta(seconds=1),
+    )
+
+    assert start == now - datetime.timedelta(seconds=1)
+
+    # Test when start, end and delta are provided (in this case delta should be ignored)
+    start, end = get_start_end(
+        start=now - datetime.timedelta(seconds=10),
+        end=now,
+        delta=datetime.timedelta(seconds=1),
+    )
+
+    assert start == now - datetime.timedelta(seconds=10)
+    assert end == now
+
+    # Test when start and delta are provided
+    start, end = get_start_end(
+        start=now - datetime.timedelta(seconds=10),
+        end=None,
+        delta=datetime.timedelta(seconds=1),
+    )
+
+    assert start == now - datetime.timedelta(seconds=10)
+    assert end == start + datetime.timedelta(seconds=1)
+
+    # Test when start time is later than end time
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="The start time must be before the end time",
+    ):
+        get_start_end(
+            start=now + datetime.timedelta(seconds=10),
+            end=now,
+        )
+
+
+class TestGetTsdbDatabaseName:
+    """Tests for get_tsdb_database_name() function."""
+
+    @staticmethod
+    def test_auto_create_disabled_returns_profile_database(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        profile_database = "my_custom_database"
+        monkeypatch.setattr(
+            mlrun.mlconf.model_endpoint_monitoring.tsdb,
+            "auto_create_database",
+            False,
+        )
+
+        result = get_tsdb_database_name(profile_database)
+
+        assert result == profile_database
+
+    @staticmethod
+    def test_auto_create_enabled_with_system_id_returns_generated_name(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        profile_database = "postgres"
+        system_id = "abc123"
+        monkeypatch.setattr(
+            mlrun.mlconf.model_endpoint_monitoring.tsdb,
+            "auto_create_database",
+            True,
+        )
+        monkeypatch.setattr(mlrun.mlconf, "system_id", system_id)
+
+        result = get_tsdb_database_name(profile_database)
+
+        assert result == f"{TIMESCALEDB_DEFAULT_DB_PREFIX}_{system_id}"
+
+    @staticmethod
+    def test_auto_create_enabled_without_system_id_raises_error(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            mlrun.mlconf.model_endpoint_monitoring.tsdb,
+            "auto_create_database",
+            True,
+        )
+        monkeypatch.setattr(mlrun.mlconf, "system_id", "")
+
+        with pytest.raises(
+            mlrun.errors.MLRunInvalidArgumentError,
+            match="system_id is not set in mlrun.mlconf",
+        ):
+            get_tsdb_database_name("postgres")
+
+    @staticmethod
+    @pytest.mark.parametrize(
+        ("profile_database", "system_id"),
+        [
+            ("postgres", "xyz789"),
+            ("mydb", "test_system"),
+            ("production", "prod_123"),
+        ],
+    )
+    def test_auto_create_generates_consistent_name(
+        monkeypatch: pytest.MonkeyPatch,
+        profile_database: str,
+        system_id: str,
+    ) -> None:
+        monkeypatch.setattr(
+            mlrun.mlconf.model_endpoint_monitoring.tsdb,
+            "auto_create_database",
+            True,
+        )
+        monkeypatch.setattr(mlrun.mlconf, "system_id", system_id)
+
+        result = get_tsdb_database_name(profile_database)
+
+        expected = f"{TIMESCALEDB_DEFAULT_DB_PREFIX}_{system_id}"
+        assert result == expected

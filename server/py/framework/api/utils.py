@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
 import collections
 import copy
+import json
 import re
 import traceback
 import typing
@@ -24,13 +25,16 @@ from http import HTTPStatus
 from os import environ
 from pathlib import Path
 
+import fastapi
 import kubernetes.client
 import semver
 import sqlalchemy.orm
 from fastapi import BackgroundTasks, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from kubernetes.client import V1EnvVar, V1EnvVarSource
 from sqlalchemy.orm import Session
 
+import mlrun.common.constants
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.runtimes.pod
@@ -41,24 +45,24 @@ from mlrun.config import config
 from mlrun.errors import err_to_str
 from mlrun.run import import_function, new_function
 from mlrun.runtimes.utils import enrich_function_from_dict
-from mlrun.utils import get_in, logger
+from mlrun.utils import RunKeys, get_in, logger
 
 import framework.constants
 import framework.db.session
+import framework.db.sqldb.db
+import framework.rundb.sqldb
 import framework.utils.auth.verifier
 import framework.utils.background_tasks
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
 import framework.utils.helpers
 import framework.utils.notifications
+import framework.utils.singletons.db
 import framework.utils.singletons.k8s
+import framework.utils.singletons.project_member
 import services.api.crud
-from framework.db.sqldb.db import SQLDB
-from framework.rundb.sqldb import SQLRunDB
-from framework.utils.singletons.db import get_db
-from framework.utils.singletons.project_member import get_project_member
-from services.api.crud.runtimes.nuclio import delete_nuclio_functions_in_batches
-from services.api.utils.singletons.logs_dir import get_logs_dir
-from services.api.utils.singletons.scheduler import get_scheduler
+import services.api.crud.runtimes.nuclio
+import services.api.utils.singletons.logs_dir
+import services.api.utils.singletons.scheduler
 
 
 def log_and_raise(status=HTTPStatus.BAD_REQUEST.value, **kw):
@@ -71,7 +75,7 @@ def log_path(project, uid) -> Path:
 
 
 def project_logs_path(project) -> Path:
-    return get_logs_dir() / project
+    return services.api.utils.singletons.logs_dir.get_logs_dir() / project
 
 
 def get_obj_path(schema, path, user=""):
@@ -147,9 +151,9 @@ def get_run_db_instance(
 ):
     # TODO: getting the run db should be done seamlessly by the run db factory and not require this logic to
     #  inject the session
-    db = get_db()
-    if isinstance(db, SQLDB):
-        run_db = SQLRunDB(db.dsn, db_session)
+    db = framework.utils.singletons.db.get_db()
+    if isinstance(db, framework.db.sqldb.db.SQLDB):
+        run_db = framework.rundb.sqldb.SQLRunDB(db.dsn, db_session)
     else:
         run_db = db.db
     run_db.connect()
@@ -170,7 +174,9 @@ def parse_submit_run_body(data):
     return function_dict, function_url, task
 
 
-def _generate_function_and_task_from_submit_run_body(db_session: Session, data):
+def _generate_function_and_task_from_submit_run_body(
+    db_session: Session, auth_info: mlrun.common.schemas.AuthInfo, data
+):
     function_dict, function_url, task = parse_submit_run_body(data)
 
     if function_dict and not function_url:
@@ -182,8 +188,8 @@ def _generate_function_and_task_from_submit_run_body(db_session: Session, data):
             )
         else:
             project, name, tag, hash_key = parse_versioned_object_uri(function_url)
-            function_record = get_db().get_function(
-                db_session, name, project, tag, hash_key
+            function_record = framework.utils.singletons.db.get_db().get_function(
+                db_session, name=name, project=project, tag=tag, hash_key=hash_key
             )
             if not function_record:
                 log_and_raise(
@@ -198,25 +204,130 @@ def _generate_function_and_task_from_submit_run_body(db_session: Session, data):
             # assign values from it to the main function object
             function = enrich_function_from_dict(function, function_dict)
 
-    apply_enrichment_and_validation_on_task(task)
+    apply_enrichment_and_validation_on_function(function=function, auth_info=auth_info)
+    apply_enrichment_and_validation_on_task(task, auth_info=auth_info)
 
     return function, task
 
 
 async def submit_run(
-    db_session: Session, auth_info: mlrun.common.schemas.AuthInfo, data
+    db_session: Session,
+    auth_info: mlrun.common.schemas.AuthInfo,
+    background_tasks: fastapi.BackgroundTasks,
+    data,
 ):
-    _, _, _, response = await run_in_threadpool(
-        submit_run_sync, db_session, auth_info, data
+    from services.api.utils.endpoints import (
+        start_model_endpoint_creation_background_task,
     )
+
+    response = None
+
+    try:
+        fn, task = _generate_function_and_task_from_submit_run_body(
+            db_session, auth_info, data
+        )
+        run_db = get_run_db_instance(db_session)
+        fn.set_db_connection(run_db)
+
+        track_models = getattr(fn.spec, "track_models", False)
+        if track_models and background_tasks and db_session:
+            project = task["metadata"]["project"]
+            function_name = fn.metadata.name
+            (
+                fn,
+                model_endpoint_creation_task_name,
+                _,
+                model_endpoint_uids,
+            ) = await start_model_endpoint_creation_background_task(
+                project=project,
+                name=function_name,
+                background_tasks=background_tasks,
+                function=fn.to_dict(),
+                db_session=db_session,
+                is_batch=True,
+            )
+            fn = mlrun.new_function(
+                runtime=fn,
+                project=project,
+                name=function_name,
+            )
+            fn.spec.model_endpoint_creation_task_name = (
+                model_endpoint_creation_task_name
+            )
+
+            # TODO: there should be a better way to do this
+            serving_spec = getattr(fn.spec, "serving_spec")
+            # update the graph from the function, because MEP IDs were added
+            if serving_spec:
+                serving_spec = json.loads(serving_spec)
+                new_graph = fn.spec.graph.to_dict(strip=True) if fn.spec.graph else {}
+                serving_spec["graph"] = new_graph
+                serving_spec["model_endpoint_creation_task_name"] = (
+                    model_endpoint_creation_task_name
+                )
+                serving_spec["model_endpoint_uids"] = model_endpoint_uids
+                fn.spec.serving_spec = json.dumps(serving_spec)
+
+            logger.info(
+                "Started model endpoint creation task",
+                model_endpoint_creation_task_name=model_endpoint_creation_task_name,
+            )
+
+        _, _, _, response = await run_in_threadpool(
+            submit_run_sync,
+            db_session,
+            auth_info,
+            fn,
+            task,
+            data,
+        )
+    except HTTPException:
+        logger.error(traceback.format_exc())
+        raise
+    except mlrun.errors.MLRunHTTPStatusError:
+        raise
+    except Exception as err:
+        logger.error(traceback.format_exc())
+        log_and_raise(
+            HTTPStatus.BAD_REQUEST.value,
+            reason=f"Runtime error: {err_to_str(err)}",
+        )
     return response
 
 
-def apply_enrichment_and_validation_on_task(task):
+def apply_enrichment_and_validation_on_task(
+    task: dict,
+    auth_info: mlrun.common.schemas.AuthInfo | None = None,
+    mask_notification_params_on_task: bool = True,
+):
     # Conceal notification config params from the task object with secrets
-    framework.utils.notifications.mask_notification_params_on_task(
-        task, framework.constants.MaskOperations.CONCEAL
-    )
+    if mask_notification_params_on_task:
+        framework.utils.notifications.mask_notification_params_on_task(
+            task, framework.constants.MaskOperations.CONCEAL
+        )
+
+    # Overwrite any client-supplied spec.auth.user_id with the authenticated identity.
+    if auth_info and auth_info.user_id:
+        task.setdefault("spec", {}).setdefault("auth", {})["user_id"] = (
+            auth_info.user_id
+        )
+    # validates that secrets used in the task are allowed
+    # currently, this only ensures that if k8s mlrun project secrets are used,
+    # they belong to the correct project (not another project’s secret)
+    validate_function_secret_sources(task)
+
+
+def validate_function_secret_sources(function):
+    secrets_list = get_in(function, ["spec", RunKeys.secrets], default=[])
+    secrets = mlrun.secrets.SecretsStore.from_list(secrets_list)
+
+    project_name = get_in(function, ["metadata", "project"])
+
+    if azure_k8s_secrets := secrets.get_azure_vault_k8s_secret():
+        validate_secret_allowed(
+            project_name=project_name,
+            secret_name=azure_k8s_secrets,
+        )
 
 
 # TODO: split enrichment and validation to separate functions should be in the launcher
@@ -228,6 +339,7 @@ def apply_enrichment_and_validation_on_function(
     validate_service_account: bool = True,
     mask_sensitive_data: bool = True,
     ensure_security_context: bool = True,
+    allow_empty_access_key: bool = False,
 ):
     """
     This function should be used only on server side.
@@ -242,7 +354,11 @@ def apply_enrichment_and_validation_on_function(
     # if auth given in request ensure the function pod will have these auth env vars set, otherwise the job won't
     # be able to communicate with the api
     if ensure_auth:
-        ensure_function_has_auth_set(function, auth_info)
+        ensure_function_has_auth_set(
+            function,
+            auth_info,
+            allow_empty_access_key=allow_empty_access_key,
+        )
 
     # if this was triggered by the UI, we will need to attempt auto-mount based on auto-mount config and params passed
     # in the auth_info. If this was triggered by the SDK, then auto-mount was already attempted and will be skipped.
@@ -251,7 +367,7 @@ def apply_enrichment_and_validation_on_function(
 
     # Validate function's service-account, based on allowed SAs for the project, if existing in a project-secret.
     if validate_service_account:
-        process_function_service_account(function)
+        process_function_service_account(function, auth_info)
 
     if mask_sensitive_data:
         mask_function_sensitive_data(function, auth_info)
@@ -259,14 +375,95 @@ def apply_enrichment_and_validation_on_function(
     if ensure_security_context:
         ensure_function_security_context(function, auth_info)
 
+    validate_function_volume_mounts(function)
+    validate_function_env_vars(function)
+    validate_function_secret_sources(function)
 
-def ensure_function_auth_and_sensitive_data_is_masked(
-    function,
-    auth_info: mlrun.common.schemas.AuthInfo,
-    allow_empty_access_key: bool = False,
+
+def validate_function_volume_mounts(
+    function: typing.Union[dict, mlrun.runtimes.KubeResource],
 ):
-    ensure_function_has_auth_set(function, auth_info, allow_empty_access_key)
-    mask_function_sensitive_data(function, auth_info)
+    """
+    Ensure that if a project secret is mounted to the function,
+    it matches the function's project.
+    """
+    project = get_in(function, "metadata.project")
+    volumes = get_in(function, "spec.volumes")
+
+    if not project or not volumes:
+        return
+
+    for volume in volumes:
+        secret_name = volume.get("secret", {}).get("secretName", "")
+        if not secret_name:
+            continue
+        validate_secret_allowed(project, secret_name)
+
+
+def validate_function_env_vars(function):
+    """
+    Ensure that if a project secret is referenced through environment variables,
+    the secret belongs to the same project as the function.
+    """
+    project = get_in(function, "metadata.project")
+    env_vars = get_in(function, "spec.env")
+
+    if not env_vars or not project:
+        return
+
+    for env_var in env_vars:
+        # Handle both dict and V1EnvVar
+        if isinstance(env_var, dict):
+            value_from = env_var.get("valueFrom")
+        elif isinstance(env_var, V1EnvVar):
+            value_from = env_var.value_from
+        else:
+            continue
+
+        if not value_from:
+            continue
+
+        # Handle both dict and V1EnvVarSource
+        if isinstance(value_from, dict):
+            secret_ref = value_from.get("secretKeyRef")
+            if secret_ref and "name" in secret_ref:
+                secret_name = secret_ref["name"]
+            else:
+                continue
+        elif isinstance(value_from, V1EnvVarSource) and value_from.secret_key_ref:
+            secret_name = value_from.secret_key_ref.name
+        else:
+            continue
+
+        if not secret_name:
+            continue
+
+        validate_secret_allowed(
+            project_name=project,
+            secret_name=secret_name,
+        )
+
+
+def validate_secret_allowed(
+    project_name: str,
+    secret_name: str,
+):
+    project_secret_name = (
+        framework.utils.singletons.k8s.get_k8s_helper().get_project_secret_name(
+            project_name
+        )
+    )
+    project_secret_prefix = (
+        framework.utils.singletons.k8s.get_k8s_helper().get_project_secret_name("")
+    )
+    if (
+        secret_name.startswith(project_secret_prefix)
+        and secret_name != project_secret_name
+    ):
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            f"Failed to validate secret '{secret_name}': it belongs to a different project than the"
+            f" function's project '{project_name}'"
+        )
 
 
 def mask_function_sensitive_data(function, auth_info: mlrun.common.schemas.AuthInfo):
@@ -377,7 +574,7 @@ def _resolve_v3io_fuse_volume_access_key_matching_username(
     volume_name: str,
     volume_name_to_volume_mounts: dict,
     auth_info: mlrun.common.schemas.AuthInfo = None,
-) -> typing.Optional[str]:
+) -> str | None:
     """
     Usually v3io fuse mount is set using mlrun.mount_v3io, which by default add a volume mount to /users/<username>, try
     to resolve the username from there.
@@ -495,8 +692,8 @@ def ensure_function_has_auth_set(
                 )
                 # created an access key with control and data session plane, so enriching auth_info with those planes
                 auth_info.planes = [
-                    framework.utils.clients.iguazio.SessionPlanes.control,
-                    framework.utils.clients.iguazio.SessionPlanes.data,
+                    framework.utils.clients.iguazio.v3.SessionPlanes.control,
+                    framework.utils.clients.iguazio.v3.SessionPlanes.data,
                 ]
 
             function.metadata.credentials.access_key = auth_info.access_key
@@ -562,7 +759,9 @@ def try_perform_auto_mount(function, auth_info: mlrun.common.schemas.AuthInfo):
     function.try_auto_mount_based_on_config(override_params)
 
 
-def process_function_service_account(function):
+def process_function_service_account(
+    function, auth_info: mlrun.common.schemas.AuthInfo = None
+):
     # If we're not running inside k8s, skip this check as it's not relevant.
     if not framework.utils.singletons.k8s.get_k8s_helper(
         silent=True
@@ -571,15 +770,20 @@ def process_function_service_account(function):
 
     (
         allowed_service_accounts,
+        forbidden_service_accounts,
         default_service_account,
-    ) = resolve_project_default_service_account(function.metadata.project)
+    ) = resolve_project_service_account_details(
+        function.metadata.project, auth_info=auth_info
+    )
 
     function.validate_and_enrich_service_account(
-        allowed_service_accounts, default_service_account
+        allowed_service_accounts, forbidden_service_accounts, default_service_account
     )
 
 
-def resolve_project_default_service_account(project_name: str):
+def resolve_project_service_account_details(
+    project_name: str, auth_info: mlrun.common.schemas.AuthInfo = None
+):
     allowed_service_accounts = services.api.crud.secrets.Secrets().get_project_secret(
         project_name,
         mlrun.common.schemas.SecretProviderName.kubernetes,
@@ -594,6 +798,37 @@ def resolve_project_default_service_account(project_name: str):
             service_account.strip()
             for service_account in allowed_service_accounts.split(",")
         ]
+
+    forbidden_service_accounts = mlrun.mlconf.default_forbidden_service_accounts()
+    forbidden_service_accounts_secret = (
+        services.api.crud.secrets.Secrets().get_project_secret(
+            project_name,
+            mlrun.common.schemas.SecretProviderName.kubernetes,
+            services.api.crud.secrets.Secrets().generate_client_project_secret_key(
+                services.api.crud.secrets.SecretsClientType.service_accounts,
+                "forbidden",
+            ),
+            allow_secrets_from_k8s=True,
+            allow_internal_secrets=True,
+        )
+    )
+    if forbidden_service_accounts_secret:
+        forbidden_service_accounts.extend(
+            [
+                service_account.strip()
+                for service_account in forbidden_service_accounts_secret.split(",")
+            ]
+        )
+
+    # If the auth info's service account is in the forbidden list, remove it from there to allow the current request to
+    # proceed.
+    # TODO: In the future we should avoid running jobs as a service account that is in the forbidden list altogether.
+    if (
+        auth_info
+        and auth_info.is_service_account()
+        and auth_info.username in forbidden_service_accounts
+    ):
+        forbidden_service_accounts.remove(auth_info.username)
 
     default_service_account = services.api.crud.secrets.Secrets().get_project_secret(
         project_name,
@@ -610,18 +845,11 @@ def resolve_project_default_service_account(project_name: str):
         default_service_account or mlrun.mlconf.function.spec.service_account.default
     )
 
-    # Sanity check on project configuration
-    if (
-        default_service_account
-        and allowed_service_accounts
-        and default_service_account not in allowed_service_accounts
-    ):
-        raise mlrun.errors.MLRunInvalidArgumentError(
-            f"Default service account {default_service_account} is not in list of allowed "
-            + f"service accounts {allowed_service_accounts}"
-        )
+    _validate_service_account_details(
+        default_service_account, allowed_service_accounts, forbidden_service_accounts
+    )
 
-    return allowed_service_accounts, default_service_account
+    return allowed_service_accounts, forbidden_service_accounts, default_service_account
 
 
 def ensure_function_security_context(
@@ -672,9 +900,9 @@ def ensure_function_security_context(
         # before iguazio 3.6 the user unix id is not passed in the session verification response headers
         # so we need to request it explicitly
         if auth_info.user_unix_id is None:
-            iguazio_client = framework.utils.clients.iguazio.Client()
+            iguazio_client = framework.utils.clients.iguazio.v3.Client()
             if (
-                framework.utils.clients.iguazio.SessionPlanes.control
+                framework.utils.clients.iguazio.v3.SessionPlanes.control
                 not in auth_info.planes
             ):
                 logger.warning(
@@ -688,7 +916,7 @@ def ensure_function_security_context(
                     # if we were able to get the user unix id it means we have a control session plane so adding that
                     # to the auth info
                     auth_info.planes.append(
-                        framework.utils.clients.iguazio.SessionPlanes.control
+                        framework.utils.clients.iguazio.v3.SessionPlanes.control
                     )
                 except Exception as exc:
                     raise mlrun.errors.MLRunUnauthorizedError(
@@ -722,7 +950,11 @@ def ensure_function_security_context(
 
 
 def submit_run_sync(
-    db_session: Session, auth_info: mlrun.common.schemas.AuthInfo, data
+    db_session: Session,
+    auth_info: mlrun.common.schemas.AuthInfo,
+    fn,
+    task,
+    data,
 ) -> tuple[str, str, str, dict]:
     """
     :return: Tuple with:
@@ -734,36 +966,32 @@ def submit_run_sync(
     run_uid = None
     project = None
     response = None
-    try:
-        fn, task = _generate_function_and_task_from_submit_run_body(db_session, data)
 
-        run_db = get_run_db_instance(db_session)
-        fn.set_db_connection(run_db)
+    task_for_logging = copy.deepcopy(task)
+    for notification in task_for_logging["spec"].get("notifications", []):
+        mlrun.utils.notifications.notification_pusher.sanitize_notification(
+            notification
+        )
 
-        task_for_logging = copy.deepcopy(task)
-        for notification in task_for_logging["spec"].get("notifications", []):
-            mlrun.utils.notifications.notification_pusher.sanitize_notification(
-                notification
-            )
+    logger.info("Submitting run", function=fn.to_dict(), task=task_for_logging)
+    schedule = data.get("schedule")
+    if schedule:
+        cron_trigger = schedule
+        if isinstance(cron_trigger, dict):
+            cron_trigger = mlrun.common.schemas.ScheduleCronTrigger(**cron_trigger)
+        schedule_labels = task["metadata"].get("labels")
 
-        logger.info("Submitting run", function=fn.to_dict(), task=task_for_logging)
-        schedule = data.get("schedule")
-        if schedule:
-            cron_trigger = schedule
-            if isinstance(cron_trigger, dict):
-                cron_trigger = mlrun.common.schemas.ScheduleCronTrigger(**cron_trigger)
-            schedule_labels = task["metadata"].get("labels")
+        # save the generated function enriched with the specific configuration to the db
+        # and update the task to point to the saved function, so that the scheduler will be able to
+        # access the db version of the function, and not the original function with the default spec
+        # (which can be changed between runs)
+        function_uri = fn.save(versioned=True)
+        data.pop("function", None)
+        data.pop("function_url", None)
+        task["spec"]["function"] = function_uri.replace("db://", "")
 
-            # save the generated function enriched with the specific configuration to the db
-            # and update the task to point to the saved function, so that the scheduler will be able to
-            # access the db version of the function, and not the original function with the default spec
-            # (which can be changed between runs)
-            function_uri = fn.save(versioned=True)
-            data.pop("function", None)
-            data.pop("function_url", None)
-            task["spec"]["function"] = function_uri.replace("db://", "")
-
-            is_update = get_scheduler().store_schedule(
+        is_update = (
+            services.api.utils.singletons.scheduler.get_scheduler().store_schedule(
                 db_session,
                 auth_info,
                 task["metadata"]["project"],
@@ -774,57 +1002,59 @@ def submit_run_sync(
                 schedule_labels,
                 fn_kind=fn.kind,
             )
-
-            project = task["metadata"]["project"]
-            response = {
-                "schedule": schedule,
-                "project": task["metadata"]["project"],
-                "name": task["metadata"]["name"],
-                # indicate whether it was created or modified
-                "action": "modified" if is_update else "created",
-            }
-
-        else:
-            # When processing a hyper-param run, secrets may be needed to access the parameters file (which is accessed
-            # locally from the mlrun service pod) - include project secrets and the caller's access key
-            param_file_secrets = (
-                services.api.crud.Secrets()
-                .list_project_secrets(
-                    task["metadata"]["project"],
-                    mlrun.common.schemas.SecretProviderName.kubernetes,
-                    allow_secrets_from_k8s=True,
-                )
-                .secrets
-            )
-            param_file_secrets["V3IO_ACCESS_KEY"] = (
-                auth_info.data_session or auth_info.access_key
-            )
-
-            run = fn.run(
-                task,
-                watch=False,
-                param_file_secrets=param_file_secrets,
-                auth_info=auth_info,
-            )
-            run_uid = run.metadata.uid
-            project = run.metadata.project
-            if run:
-                response = run.to_dict()
-
-    except HTTPException:
-        logger.error(traceback.format_exc())
-        raise
-    except mlrun.errors.MLRunHTTPStatusError:
-        raise
-    except Exception as err:
-        logger.error(traceback.format_exc())
-        log_and_raise(
-            HTTPStatus.BAD_REQUEST.value,
-            reason=f"Runtime error: {err_to_str(err)}",
         )
+
+        project = task["metadata"]["project"]
+        response = {
+            "schedule": schedule,
+            "project": task["metadata"]["project"],
+            "name": task["metadata"]["name"],
+            # indicate whether it was created or modified
+            "action": "modified" if is_update else "created",
+        }
+
+    else:
+        # When processing a hyper-param run, secrets may be needed to access the parameters file (which is accessed
+        # locally from the mlrun service pod) - include project secrets and the caller's access key
+        param_file_secrets = (
+            services.api.crud.Secrets()
+            .list_project_secrets(
+                task["metadata"]["project"],
+                mlrun.common.schemas.SecretProviderName.kubernetes,
+                allow_secrets_from_k8s=True,
+            )
+            .secrets
+        )
+        param_file_secrets["V3IO_ACCESS_KEY"] = (
+            auth_info.data_session or auth_info.access_key
+        )
+
+        run = fn.run(
+            task,
+            watch=False,
+            param_file_secrets=param_file_secrets,
+            auth_info=auth_info,
+        )
+        run_uid = run.metadata.uid
+        project = run.metadata.project
+        if run:
+            response = run.to_dict()
 
     logger.info("Run submission succeeded", run_uid=run_uid, function=fn.metadata.name)
     return project, fn.kind, run_uid, {"data": response}
+
+
+def submit_run_from_body(
+    db_session: Session,
+    auth_info: mlrun.common.schemas.AuthInfo,
+    data,
+):
+    fn, task = _generate_function_and_task_from_submit_run_body(
+        db_session, auth_info, data
+    )
+    run_db = get_run_db_instance(db_session)
+    fn.set_db_connection(run_db)
+    return submit_run_sync(db_session, auth_info, fn, task, data)
 
 
 # uid is hexdigest of sha1 value, which is double the digest size due to hex encoding
@@ -846,14 +1076,14 @@ def parse_reference(reference: str):
 # Extract project and artifact name from the artifact
 def artifact_project_and_resource_name_extractor(artifact):
     return (
-        artifact.get("metadata").get("project", mlrun.mlconf.default_project),
+        artifact.get("metadata").get("project"),
         artifact.get("spec")["db_key"],
     )
 
 
 def get_or_create_project_deletion_background_task(
     project: mlrun.common.schemas.Project, deletion_strategy: str, db_session, auth_info
-) -> tuple[typing.Optional[typing.Callable], str]:
+) -> tuple[typing.Callable | None, str]:
     """
     This method is responsible for creating a background task for deleting a project.
     The project deletion flow is as follows:
@@ -946,17 +1176,16 @@ async def _delete_project(
     auth_info: mlrun.common.schemas.AuthInfo,
     wait_for_project_deletion: bool,
     background_task_name: str,
-    model_monitoring_access_key: typing.Optional[str] = None,
+    model_monitoring_access_key: str | None = None,
 ):
     force_delete = False
     project_name = project.metadata.name
     try:
         await run_in_threadpool(
-            get_project_member().delete_project,
+            framework.utils.singletons.project_member.get_project_member().delete_project,
             db_session,
             project_name,
             deletion_strategy,
-            auth_info.projects_role,
             auth_info,
             wait_for_completion=True,
             background_task_name=background_task_name,
@@ -998,14 +1227,18 @@ async def _delete_project(
             auth_info,
         )
 
-    await get_project_member().post_delete_project(project_name)
+    await framework.utils.singletons.project_member.get_project_member().post_delete_project(
+        project_name
+    )
 
 
 def verify_project_is_deleted(project_name, auth_info):
     def _verify_project_is_deleted():
         try:
             project = framework.db.session.run_function_with_new_db_session(
-                get_project_member().get_project, project_name, auth_info.session
+                framework.utils.singletons.project_member.get_project_member().get_project,
+                project_name,
+                auth_info,
             )
         except mlrun.errors.MLRunNotFoundError:
             return
@@ -1059,6 +1292,7 @@ def create_function_deletion_background_task(
         _delete_function,
         mlrun.mlconf.background_tasks.default_timeouts.operations.delete_function,
         background_task_name,
+        None,
         db_session,
         project_name,
         function_name,
@@ -1115,8 +1349,10 @@ async def _delete_function(
             for function in nuclio_functions
         ]
         # delete Nuclio functions associated with the function tags in batches
-        failed_requests = await delete_nuclio_functions_in_batches(
-            auth_info, project, nuclio_function_names
+        failed_requests = (
+            await services.api.crud.runtimes.nuclio.delete_nuclio_functions_in_batches(
+                auth_info, project, nuclio_function_names
+            )
         )
         if failed_requests:
             error_message = f"Failed to delete function {function_name}. {';'.join(failed_requests)}"
@@ -1125,6 +1361,12 @@ async def _delete_function(
             )
             raise mlrun.errors.MLRunInternalServerError(error_message)
 
+    # For application runtime functions, clean up source artifacts that were uploaded during deploy
+    if functions[0].get("kind") == mlrun.runtimes.RuntimeKinds.application:
+        await _delete_application_source_artifacts(
+            db_session, project, function_name, auth_info
+        )
+
     # delete the function from the database
     await run_in_threadpool(
         services.api.crud.Functions().delete_function,
@@ -1132,6 +1374,48 @@ async def _delete_function(
         project,
         function_name,
     )
+
+
+async def _delete_application_source_artifacts(
+    db_session: sqlalchemy.orm.Session,
+    project: str,
+    function_name: str,
+    auth_info: mlrun.common.schemas.AuthInfo,
+):
+    """
+    Delete source artifacts associated with an application runtime function.
+
+    When an application runtime function is deployed with a local source file, the source is uploaded as an artifact
+    labeled with the function name.
+    This method cleans up those artifacts when the function is deleted.
+    """
+    labels = [
+        f"{mlrun.common.constants.MLRunInternalLabels.function_name}={function_name}",
+        f"{mlrun.common.constants.MLRunInternalLabels.system_generated}=true",
+    ]
+    logger.debug(
+        "Deleting application source artifacts",
+        project=project,
+        function_name=function_name,
+        labels=labels,
+    )
+    try:
+        await run_in_threadpool(
+            services.api.crud.Artifacts().delete_artifacts,
+            db_session,
+            project=project,
+            name="",
+            tag="*",
+            labels=labels,
+            auth_info=auth_info,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to delete application source artifacts, continuing with function deletion",
+            project=project,
+            function_name=function_name,
+            error=err_to_str(exc),
+        )
 
 
 async def _update_functions_with_deletion_info(functions, project, updates: dict):
@@ -1151,3 +1435,35 @@ async def _update_functions_with_deletion_info(functions, project, updates: dict
 
     tasks = [update_function(function) for function in functions]
     await asyncio.gather(*tasks)
+
+
+def _validate_service_account_details(
+    default_service_account: str,
+    allowed_service_accounts: list[str] | None,
+    forbidden_service_accounts: list[str] | None,
+):
+    """
+    Sanity check on project configuration.
+    Make sure the default service account is in the allowed list and not in the forbidden list if such lists exist.
+
+    :param default_service_account: The default service account name.
+    :param allowed_service_accounts: List of allowed service accounts.
+    :param forbidden_service_accounts: List of forbidden service accounts.
+
+    :raises MLRunInvalidArgumentError: In case of misconfiguration.
+    """
+    if default_service_account and (
+        (
+            allowed_service_accounts
+            and default_service_account not in allowed_service_accounts
+        )
+        or (
+            forbidden_service_accounts
+            and default_service_account in forbidden_service_accounts
+        )
+    ):
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            f"Default service account {default_service_account} is not in list of allowed "
+            + f"service accounts {allowed_service_accounts} or is in the list of forbidden service accounts "
+            + f"{forbidden_service_accounts}"
+        )

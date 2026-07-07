@@ -13,8 +13,13 @@
 # limitations under the License.
 
 import json
-from datetime import datetime, timezone
-from typing import Any, Callable, NewType, Optional
+import time
+import typing
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any, NewType
+
+import storey
 
 import mlrun.common.model_monitoring
 import mlrun.common.schemas
@@ -31,13 +36,15 @@ from mlrun.common.schemas.model_monitoring.constants import (
     WriterEvent,
     WriterEventKind,
 )
+from mlrun.config import config
+from mlrun.model_monitoring.db import TSDBConnector
 from mlrun.model_monitoring.db._stats import (
     ModelMonitoringCurrentStatsFile,
     ModelMonitoringDriftMeasuresFile,
 )
 from mlrun.model_monitoring.helpers import get_result_instance_fqn
 from mlrun.serving.utils import StepToDict
-from mlrun.utils import logger
+from mlrun.utils import logger, now_date
 
 _RawEvent = dict[str, Any]
 _AppResultEvent = NewType("_AppResultEvent", _RawEvent)
@@ -65,7 +72,7 @@ class ModelMonitoringWriter(StepToDict):
     def __init__(
         self,
         project: str,
-        secret_provider: Optional[Callable] = None,
+        secret_provider: Callable | None = None,
     ) -> None:
         self.project = project
         self.name = project  # required for the deployment process
@@ -73,7 +80,6 @@ class ModelMonitoringWriter(StepToDict):
         self._tsdb_connector = mlrun.model_monitoring.get_tsdb_connector(
             project=self.project, secret_provider=secret_provider
         )
-        self._endpoints_records = {}
 
     def _generate_event_on_drift(
         self,
@@ -129,10 +135,7 @@ class ModelMonitoringWriter(StepToDict):
             )
         kind = event.pop(WriterEvent.EVENT_KIND, WriterEventKind.RESULT)
         result_event = _AppResultEvent(json.loads(event.pop(WriterEvent.DATA, "{}")))
-        if not result_event:  # BC for < 1.7.0, can be removed in 1.9.0
-            result_event = _AppResultEvent(event)
-        else:
-            result_event.update(_AppResultEvent(event))
+        result_event.update(_AppResultEvent(event))
 
         expected_keys = list(
             set(WriterEvent.list()).difference(
@@ -170,7 +173,7 @@ class ModelMonitoringWriter(StepToDict):
         )
         stat_kind = event.get(StatsData.STATS_NAME)
         data, timestamp_str = event.get(StatsData.STATS), event.get(StatsData.TIMESTAMP)
-        timestamp = datetime.fromisoformat(timestamp_str).astimezone(tz=timezone.utc)
+        timestamp = datetime.fromisoformat(timestamp_str).astimezone(tz=UTC)
         if stat_kind == StatsKind.CURRENT_STATS.value:
             ModelMonitoringCurrentStatsFile(self.project, endpoint_id).write(
                 data, timestamp
@@ -180,7 +183,7 @@ class ModelMonitoringWriter(StepToDict):
                 data, timestamp
             )
         logger.info(
-            "Updating the model endpoint statistics",
+            "Updated the model endpoint statistics",
             endpoint_id=endpoint_id,
             stats_kind=stat_kind,
         )
@@ -229,3 +232,308 @@ class ModelMonitoringWriter(StepToDict):
             )
 
         logger.info("Model monitoring writer finished handling event")
+
+
+class WriterGraphFactory:
+    def __init__(
+        self,
+        parquet_path: str,
+        lag_threshold_minutes: int | None = None,
+        lag_event_cooldown_minutes: int | None = None,
+    ):
+        self.parquet_path = parquet_path
+        self.parquet_batching_max_events = (
+            config.model_endpoint_monitoring.writer_graph.max_events
+        )
+        self.parquet_batching_timeout_secs = (
+            config.model_endpoint_monitoring.writer_graph.parquet_batching_timeout_secs
+        )
+        self.lag_threshold_minutes = lag_threshold_minutes
+        self.lag_event_cooldown_minutes = lag_event_cooldown_minutes
+
+    def apply_writer_graph(
+        self,
+        fn: mlrun.runtimes.ServingRuntime,
+        tsdb_connector: TSDBConnector,
+    ):
+        graph = typing.cast(
+            mlrun.serving.states.RootFlowStep,
+            fn.set_topology(mlrun.serving.states.StepKinds.flow, engine="async"),
+        )
+
+        graph.to("ReconstructWriterEvent", "event_reconstructor")
+        step = tsdb_connector.add_pre_writer_steps(
+            graph=graph, after="event_reconstructor"
+        )
+        before_choice = step.name if step else "event_reconstructor"
+        graph.add_step("KindChoice", "kind_choice_step", after=before_choice)
+        tsdb_connector.apply_writer_steps(
+            graph=graph,
+            after="kind_choice_step",
+        )
+        graph.add_step(
+            "AlertGenerator",
+            "alert_generator",
+            after="kind_choice_step",
+            project=fn.metadata.project,
+        )
+        lag_threshold_seconds = (
+            self.lag_threshold_minutes * 60 if self.lag_threshold_minutes else None
+        )
+        lag_event_cooldown_seconds = (
+            self.lag_event_cooldown_minutes * 60
+            if self.lag_event_cooldown_minutes
+            else None
+        )
+        graph.add_step(
+            "WriterLagEventsGenerator",
+            "lag_events_generator",
+            after="kind_choice_step",
+            project=fn.metadata.project,
+            lag_threshold_seconds=lag_threshold_seconds,
+            lag_event_cooldown_seconds=lag_event_cooldown_seconds,
+        )
+        graph.add_step(
+            "storey.Filter",
+            name="filter_none",
+            _fn="(event is not None)",
+            after=["alert_generator", "lag_events_generator"],
+        )
+        graph.add_step(
+            "mlrun.serving.remote.MLRunAPIRemoteStep",
+            name="alert_generator_api_call",
+            after="filter_none",
+            method="POST",
+            path=f"projects/{fn.metadata.project}/events/{{kind}}",
+            fill_placeholders=True,
+        )
+
+        graph.add_step(
+            "mlrun.datastore.storeytargets.ParquetStoreyTarget",
+            alternative_v3io_access_key=mlrun.common.schemas.model_monitoring.ProjectSecretKeys.ACCESS_KEY,
+            name="stats_writer",
+            after="kind_choice_step",
+            graph_shape="cylinder",
+            path=self.parquet_path
+            if self.parquet_path.endswith("/")
+            else self.parquet_path + "/",
+            max_events=self.parquet_batching_max_events,
+            flush_after_seconds=self.parquet_batching_timeout_secs,
+            columns=[
+                StatsData.TIMESTAMP,
+                StatsData.STATS,
+                WriterEvent.ENDPOINT_ID,
+                StatsData.STATS_NAME,
+            ],
+            partition_cols=[WriterEvent.ENDPOINT_ID, StatsData.STATS_NAME],
+            single_file=True,
+        )
+
+
+class ReconstructWriterEvent(storey.MapClass):
+    def __init__(self):
+        super().__init__()
+
+    def do(self, event: dict) -> dict[str, Any]:
+        logger.info("Reconstructing the event", event=event)
+        kind = event.pop(WriterEvent.EVENT_KIND, WriterEventKind.RESULT)
+        result_event = _AppResultEvent(json.loads(event.pop(WriterEvent.DATA, "{}")))
+        result_event.update(_AppResultEvent(event))
+
+        expected_keys = list(
+            set(WriterEvent.list()).difference(
+                [WriterEvent.EVENT_KIND, WriterEvent.DATA]
+            )
+        )
+        if kind == WriterEventKind.METRIC:
+            expected_keys.extend(MetricData.list())
+        elif kind == WriterEventKind.RESULT:
+            expected_keys.extend(ResultData.list())
+        elif kind == WriterEventKind.STATS:
+            expected_keys.extend(StatsData.list())
+        else:
+            raise _WriterEventValueError(
+                f"Unknown event kind: {kind}, expected one of: {WriterEventKind.list()}"
+            )
+        missing_keys = [key for key in expected_keys if key not in result_event]
+        if missing_keys:
+            raise _WriterEventValueError(
+                f"The received event misses some keys compared to the expected "
+                f"monitoring application event schema: {missing_keys} for event kind {kind}"
+            )
+        result_event["kind"] = kind
+        if kind in WriterEventKind.user_app_outputs():
+            result_event[WriterEvent.END_INFER_TIME] = datetime.fromisoformat(
+                event[WriterEvent.END_INFER_TIME]
+            )
+        if kind == WriterEventKind.STATS:
+            result_event[StatsData.STATS] = json.dumps(result_event[StatsData.STATS])
+        return result_event
+
+
+class KindChoice(storey.Choice):
+    def select_outlets(self, event):
+        kind = event.get("kind")
+        logger.info("Selecting the outlet for the event", kind=kind)
+        if kind == WriterEventKind.METRIC:
+            outlets = ["tsdb_metrics", "lag_events_generator"]
+        elif kind == WriterEventKind.RESULT:
+            outlets = ["tsdb_app_results", "alert_generator", "lag_events_generator"]
+        elif kind == WriterEventKind.STATS:
+            outlets = ["stats_writer"]
+        else:
+            raise _WriterEventValueError(
+                f"Unknown event kind: {kind}, expected one of: {WriterEventKind.list()}"
+            )
+        return outlets
+
+
+class AlertGenerator(storey.MapClass):
+    def __init__(self, project: str, **kwargs):
+        self.project = project
+        super().__init__(**kwargs)
+
+    def do(self, event: dict) -> dict[str, Any] | None:
+        kind = event.pop(WriterEvent.EVENT_KIND, WriterEventKind.RESULT)
+        if (
+            mlrun.mlconf.alerts.mode == mlrun.common.schemas.alert.AlertsModes.enabled
+            and kind == WriterEventKind.RESULT
+            and (
+                event[ResultData.RESULT_STATUS] == ResultStatusApp.detected.value
+                or event[ResultData.RESULT_STATUS]
+                == ResultStatusApp.potential_detection.value
+            )
+        ):
+            event_value = {
+                "app_name": event[WriterEvent.APPLICATION_NAME],
+                "model": event[WriterEvent.ENDPOINT_NAME],
+                "model_endpoint_id": event[WriterEvent.ENDPOINT_ID],
+                "result_name": event[ResultData.RESULT_NAME],
+                "result_value": event[ResultData.RESULT_VALUE],
+            }
+            data = self._generate_event_data(
+                entity_id=get_result_instance_fqn(
+                    event[WriterEvent.ENDPOINT_ID],
+                    event[WriterEvent.APPLICATION_NAME],
+                    event[ResultData.RESULT_NAME],
+                ),
+                result_status=event[ResultData.RESULT_STATUS],
+                event_value=event_value,
+                project_name=self.project,
+                result_kind=event[ResultData.RESULT_KIND],
+            )
+            event = data.dict()
+            logger.info("Generated alert event", event=event)
+            return event
+        return None
+
+    @staticmethod
+    def _generate_alert_event_kind(
+        result_kind: int, result_status: int
+    ) -> alert_objects.EventKind:
+        """Generate the required Event Kind format for the alerting system"""
+        event_kind = ResultKindApp(value=result_kind).name
+
+        if result_status == ResultStatusApp.detected.value:
+            event_kind = f"{event_kind}_detected"
+        else:
+            event_kind = f"{event_kind}_suspected"
+        return alert_objects.EventKind(
+            value=mlrun.utils.helpers.normalize_name(event_kind)
+        )
+
+    def _generate_event_data(
+        self,
+        entity_id: str,
+        result_status: int,
+        event_value: dict,
+        project_name: str,
+        result_kind: int,
+    ) -> mlrun.common.schemas.Event:
+        entity = mlrun.common.schemas.alert.EventEntities(
+            kind=alert_objects.EventEntityKind.MODEL_ENDPOINT_RESULT,
+            project=project_name,
+            ids=[entity_id],
+        )
+
+        event_kind = self._generate_alert_event_kind(
+            result_status=result_status, result_kind=result_kind
+        )
+
+        event_data = mlrun.common.schemas.Event(
+            kind=alert_objects.EventKind(value=event_kind),
+            entity=entity,
+            value_dict=event_value,
+        )
+
+        return event_data
+
+
+class WriterLagEventsGenerator(storey.MapClass):
+    """Detect lag between event inference time and current time.
+
+    When the writer processes events whose ``end_infer_time`` is older than
+    ``lag_threshold_seconds``, an ``Event`` of kind
+    ``MODEL_MONITORING_LAG_DETECTED`` is emitted so the alerting system
+    can notify the user.  A per-worker cooldown prevents flooding.
+    """
+
+    def __init__(
+        self,
+        project: str,
+        lag_threshold_seconds: float | None = None,
+        lag_event_cooldown_seconds: float | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.project = project
+        self.lag_threshold_seconds = lag_threshold_seconds
+        self.lag_event_cooldown_seconds = lag_event_cooldown_seconds or 0
+        self._last_emit_ts: dict[int, float] = {}  # worker_id -> time.monotonic()
+
+    def do(self, event: dict) -> dict[str, Any] | None:
+        if self.lag_threshold_seconds is None:
+            return None
+
+        end_infer_time = event.get(WriterEvent.END_INFER_TIME)
+        if end_infer_time is None:
+            return None
+
+        if isinstance(end_infer_time, str):
+            end_infer_time = datetime.fromisoformat(end_infer_time)
+
+        lag_seconds = (now_date() - end_infer_time.astimezone(UTC)).total_seconds()
+        if lag_seconds < self.lag_threshold_seconds:
+            return None
+
+        worker_id = getattr(self.context, "worker_id", 0)
+        now_mono = time.monotonic()
+        last_emit = self._last_emit_ts.get(worker_id, -float("inf"))
+        if (now_mono - last_emit) < self.lag_event_cooldown_seconds:
+            return None
+
+        self._last_emit_ts[worker_id] = now_mono
+        entity_id = f"{self.project}.writer.{worker_id}"
+
+        event_data = alert_objects.Event(
+            kind=alert_objects.EventKind.MODEL_MONITORING_LAG_DETECTED,
+            entity=alert_objects.EventEntities(
+                kind=alert_objects.EventEntityKind.MODEL_MONITORING_INFRA,
+                project=self.project,
+                ids=[entity_id],
+            ),
+            value_dict={
+                "lag_seconds": round(lag_seconds, 1),
+                "endpoint_name": event.get(WriterEvent.ENDPOINT_NAME, ""),
+                "endpoint_id": event.get(WriterEvent.ENDPOINT_ID, ""),
+                "app_name": event.get(WriterEvent.APPLICATION_NAME, ""),
+                "worker_id": worker_id,
+            },
+        )
+        logger.info(
+            "Lag detected in writer",
+            lag_seconds=round(lag_seconds, 1),
+            entity_id=entity_id,
+            endpoint_name=event.get(WriterEvent.ENDPOINT_NAME, ""),
+        )
+        return event_data.dict()

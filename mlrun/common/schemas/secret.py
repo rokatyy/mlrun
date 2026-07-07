@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-from typing import Optional
+
+from datetime import datetime
 
 from pydantic.v1 import BaseModel, Field
 
@@ -28,7 +28,7 @@ class SecretProviderName(mlrun.common.types.StrEnum):
 
 class SecretsData(BaseModel):
     provider: SecretProviderName = Field(SecretProviderName.vault)
-    secrets: Optional[dict] = {}
+    secrets: dict | None = {}
 
 
 class AuthSecretData(BaseModel):
@@ -46,8 +46,56 @@ class AuthSecretData(BaseModel):
 
 class SecretKeysData(BaseModel):
     provider: SecretProviderName = Field(SecretProviderName.vault)
-    secret_keys: Optional[list] = []
+    secret_keys: list | None = []
 
 
-class UserSecretCreationRequest(SecretsData):
-    user: str
+class SecretToken(BaseModel):
+    name: str
+    token: str
+
+
+class StoreSecretTokensResponse(BaseModel):
+    created_tokens: list[str] = []
+    updated_tokens: list[str] = []
+
+
+class SecretTokenInfo(BaseModel):
+    name: str
+    expiration: datetime
+    issued_at: datetime
+    user_id: str
+    username: str
+
+
+class ListSecretTokensResponse(BaseModel):
+    secret_tokens: list[SecretTokenInfo]
+
+
+class DeleteSecretTokenResponse(BaseModel):
+    """Response for single token deletion."""
+
+    deleted: bool = Field(
+        default=True,
+        description="True if token was deleted, False if token was not found",
+    )
+    username: str | None = Field(
+        default=None,
+        description="The resolved username of the token owner",
+    )
+
+
+class DeleteSecretTokensResponse(BaseModel):
+    """Response for bulk token deletion."""
+
+    deleted_count: int = Field(
+        default=0,
+        description="Number of tokens successfully deleted",
+    )
+    failed_tokens: list[str] = Field(
+        default_factory=list,
+        description="List of token names that failed to delete",
+    )
+    username: str | None = Field(
+        default=None,
+        description="The resolved username of the token owner",
+    )

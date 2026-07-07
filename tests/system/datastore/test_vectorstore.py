@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
+import importlib.util
 import os
 import random
 import string
@@ -29,13 +29,25 @@ from mlrun.datastore.datastore_profile import (
 )
 from tests.system.base import TestMLRunSystem
 
+LANGCHAIN_AVAILABLE = (
+    importlib.util.find_spec("langchain") is not None
+    and importlib.util.find_spec("langchain_community") is not None
+)
+
+# Skip all tests in this module if langchain_community is not installed
+pytestmark = pytest.mark.skipif(
+    not LANGCHAIN_AVAILABLE,
+    reason="langchain or langchain_community package is not installed",
+)
+
 here = os.path.dirname(__file__)
 config_file_path = os.path.join(here, "../env.yml")
 
 config = {}
 if os.path.exists(config_file_path):
     with open(config_file_path) as yaml_file:
-        config = yaml.safe_load(yaml_file)
+        env = yaml.safe_load(yaml_file)
+        config = env if isinstance(env, dict) else {}
 
 
 @pytest.mark.skipif(
@@ -291,7 +303,12 @@ class TestDatastoreProfile(TestMLRunSystem):
         collection.col.drop()
 
     def make_milvus_connection(self, collection_name, auto_id):
-        from langchain.embeddings import FakeEmbeddings
+        # Try new langchain 1.0+ import path first
+        try:
+            from langchain_core.embeddings import FakeEmbeddings
+        except ImportError:
+            # Fall back to old langchain <1.0 import path
+            from langchain.embeddings import FakeEmbeddings
         from langchain_community.vectorstores import Milvus
 
         embedding_model = FakeEmbeddings(size=3)
@@ -323,7 +340,12 @@ class TestDatastoreProfile(TestMLRunSystem):
         return vectorstore
 
     def test_vectorstore_splitter_and_ids(self):
-        from langchain.text_splitter import CharacterTextSplitter
+        # Try new langchain 1.0+ import path first
+        try:
+            from langchain_text_splitters import CharacterTextSplitter
+        except ImportError:
+            # Fall back to old langchain <1.0 import path
+            from langchain.text_splitter import CharacterTextSplitter
 
         splitter = CharacterTextSplitter(
             separator="",  # Empty string means split by pure character count

@@ -11,23 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 import pathlib
+import re
 import unittest.mock
+import uuid
 from contextlib import nullcontext as does_not_raise
 
 import pytest
+import sqlalchemy.orm
 from fastapi.testclient import TestClient
 
+import mlrun.common.constants
 import mlrun.common.runtimes.constants
 import mlrun.common.schemas
+import mlrun.errors
 import mlrun.launcher.base
 import mlrun.launcher.factory
+from mlrun.common.types import AuthenticationMode
 from mlrun.config import Config
 
-import framework.utils.clients.iguazio
 import services.api.launcher
 import services.api.tests.unit.api.utils
+import services.api.utils.helpers
+
+assets_path = pathlib.Path(__file__).parent / "assets"
+func_path = assets_path / "sample_function.py"
+handler = "hello_word"
+
+
+@pytest.fixture
+def random_project_name():
+    return f"some-project-{uuid.uuid4().hex[:8]}"
 
 
 @pytest.mark.parametrize(
@@ -51,21 +65,17 @@ def test_create_server_side_launcher(is_remote, local, expectation):
 
 
 def test_enrich_runtime_with_auth_info(
-    monkeypatch, k8s_secrets_mock, client: TestClient
+    monkeypatch, k8s_secrets_mock, client: TestClient, random_project_name: str
 ):
-    mlrun.mlconf.httpdb.authentication.mode = "iguazio"
-    monkeypatch.setattr(
-        framework.utils.clients.iguazio,
-        "AsyncClient",
-        lambda *args, **kwargs: unittest.mock.AsyncMock(),
-    )
+    project = random_project_name
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO
+
+    services.api.tests.unit.api.utils.setup_iguazio_v3_async_client_mock(monkeypatch)
     auth_info = mlrun.common.schemas.auth.AuthInfo(
         access_key="access_key",
         username="username",
     )
-    services.api.tests.unit.api.utils.create_project(
-        client, mlrun.mlconf.default_project
-    )
+    services.api.tests.unit.api.utils.create_project(client, project_name=project)
 
     launcher_kwargs = {"auth_info": auth_info}
     launcher = mlrun.launcher.factory.LauncherFactory().create_launcher(
@@ -77,12 +87,13 @@ def test_enrich_runtime_with_auth_info(
     function = mlrun.new_function(
         name="launcher-test",
         kind="job",
+        project=project,
     )
     function.metadata.credentials.access_key = (
         mlrun.model.Credentials.generate_access_key
     )
 
-    launcher.enrich_runtime(function)
+    launcher.enrich_runtime(function, project)
     assert (
         function.get_env("MLRUN_AUTH_SESSION").secret_key_ref.name
         == "secret-ref-username-access_key"
@@ -141,10 +152,11 @@ def test_validate_state_thresholds_failure(state_thresholds, expected_error):
     assert expected_error in str(exc.value)
 
 
-def test_new_function_args_with_default_image_pull_secret(rundb_mock):
-    assets_path = pathlib.Path(__file__).parent / "assets"
-    func_path = assets_path / "sample_function.py"
-    handler = "hello_word"
+def test_new_function_args_with_default_image_pull_secret(
+    db: sqlalchemy.orm.Session, client: TestClient, random_project_name: str
+):
+    project = random_project_name
+    services.api.tests.unit.api.utils.create_project(client, project_name=project)
 
     mlrun.mlconf.function.spec.image_pull_secret = Config(
         {"default": "adam-docker-registry-auth"}
@@ -158,12 +170,17 @@ def test_new_function_args_with_default_image_pull_secret(rundb_mock):
         filename=str(func_path),
         handler=handler,
         image="mlrun/mlrun",
+        project=project,
     )
     uid = "123"
-    run = mlrun.run.RunObject(
-        metadata=mlrun.model.RunMetadata(uid=uid),
-    )
-    rundb_mock.store_run(run, uid)
+    run = {
+        "metadata": {
+            "uid": uid,
+            "name": "test",
+        },
+    }
+    rundb = mlrun.get_run_db()
+    rundb.store_run(run, uid, project)
     run = launcher._create_run_object(run)
 
     run = launcher._enrich_run(
@@ -174,7 +191,7 @@ def test_new_function_args_with_default_image_pull_secret(rundb_mock):
         run.spec.image_pull_secret
         == mlrun.mlconf.function.spec.image_pull_secret.default
     )
-    launcher.enrich_runtime(runtime, full=True)
+    launcher.enrich_runtime(runtime, project, full=True)
     assert (
         runtime.spec.image_pull_secret
         == mlrun.mlconf.function.spec.image_pull_secret.default
@@ -182,46 +199,622 @@ def test_new_function_args_with_default_image_pull_secret(rundb_mock):
 
 
 @pytest.mark.parametrize(
-    "end_time, run_state, should_update",
+    "count, base_delay, default_base_delay, min_base_delay, expectation",
     [
-        (None, mlrun.common.runtimes.constants.RunStates.completed, True),
-        (None, mlrun.common.runtimes.constants.RunStates.error, True),
+        (None, None, "30s", "30s", does_not_raise()),
         (
-            "2024-01-28T12:00:00Z",
-            mlrun.common.runtimes.constants.RunStates.completed,
-            False,
+            1,
+            "29s",
+            "30s",
+            "30s",
+            pytest.raises(
+                mlrun.errors.MLRunInvalidArgumentError,
+                match="Retry backoff base_delay must be at least 30s, got 29s",
+            ),
         ),
         (
-            "2024-01-28T12:00:00Z",
-            mlrun.common.runtimes.constants.RunStates.error,
-            False,
+            1,
+            "31s",
+            "30s",
+            "5m",
+            pytest.raises(
+                mlrun.errors.MLRunInvalidArgumentError,
+                match="Retry backoff base_delay must be at least 5m, got 31s",
+            ),
         ),
-        (None, mlrun.common.runtimes.constants.RunStates.running, False),
+        (3, None, "30s", "30s", does_not_raise()),
+        (3, "1 min", "30s", "30s", does_not_raise()),
         (
-            "2024-01-28T12:00:00Z",
+            -1,
+            None,
+            "30s",
+            "30s",
+            pytest.raises(
+                mlrun.errors.MLRunInvalidArgumentError,
+                match="Retry count must be at least 0, got -1",
+            ),
+        ),
+        (
+            10,
+            "7 days",
+            None,
+            None,
+            pytest.raises(
+                mlrun.errors.MLRunInvalidArgumentError,
+                match=re.escape(
+                    "Retry backoff base_delay 7 days * retry count 10 must be less than 259200 seconds, "
+                    "got 6048000 seconds"
+                ),
+            ),
+        ),
+    ],
+)
+def test_validate_run_retry(
+    count, base_delay, default_base_delay, min_base_delay, expectation
+):
+    if default_base_delay:
+        mlrun.mlconf.function.spec.retry.backoff.default_base_delay = default_base_delay
+    if min_base_delay:
+        mlrun.mlconf.function.spec.retry.backoff.min_base_delay = min_base_delay
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo()
+    )
+    runtime = mlrun.code_to_function(
+        name="test", kind="job", filename=str(func_path), handler=handler
+    )
+
+    retry = None
+    if count or base_delay:
+        retry = {}
+        if count is not None:
+            retry["count"] = count
+
+        if base_delay is not None:
+            retry["backoff"] = {
+                "base_delay": base_delay,
+            }
+
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(
+            retry=retry,
+        ),
+    )
+    assert run.spec.retry.count == (count if count else None)
+
+    if count:
+        assert run.spec.retry.backoff.base_delay == (
+            base_delay if base_delay is not None else default_base_delay
+        )
+    else:
+        assert run.spec.retry.backoff is None
+    with (
+        expectation,
+    ):
+        launcher._validate_retry(runtime.kind, run.spec.retry)
+
+
+def test_validate_run_retry_runtime_kind():
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo()
+    )
+    runtime = mlrun.code_to_function(
+        name="test", kind="mpijob", filename=str(func_path), handler=handler
+    )
+
+    retry = {
+        "count": 3,
+    }
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(
+            retry=retry,
+        ),
+    )
+    with (
+        pytest.raises(
+            mlrun.errors.MLRunInvalidArgumentError,
+            match=re.escape(
+                f"Retry is not supported for runtime kind mpijob, supported kinds are: "
+                f"{mlrun.runtimes.RuntimeKinds.retriable_runtimes()}"
+            ),
+        ),
+    ):
+        launcher._validate_run(runtime, run)
+
+
+def test_run_status_retry_updates():
+    """
+    Test that the run status is updated when a retry is triggered.
+    The test simulates a run that is in the pending_retry state and checks that the retry count is incremented
+    and the state is updated to running when the run is enriched again.
+    """
+    runtime = mlrun.code_to_function(
+        name="test", kind="job", filename=str(func_path), handler="raise_func"
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(
+            retry={
+                "count": 10,
+            },
+        ),
+        status=mlrun.model.RunStatus(
+            state=mlrun.common.runtimes.constants.RunStates.pending_retry,
+        ),
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher()
+    enriched_run = launcher._enrich_run(runtime=runtime, run=run)
+    assert (
+        enriched_run.status.state == mlrun.common.runtimes.constants.RunStates.running
+    )
+    assert enriched_run.status.start_time is None
+    assert enriched_run.status.retry_count == 1, "Expected retry count to be 1"
+    assert run.metadata.labels[mlrun.common.constants.MLRunInternalLabels.retry] == str(
+        enriched_run.status.retry_count
+    )
+    assert enriched_run.status.retries is not None
+    assert len(enriched_run.status.retries) == 1
+    assert enriched_run.status.retries[0]["attempt"] == 0
+
+    enriched_run.status.state = mlrun.common.runtimes.constants.RunStates.pending_retry
+    enriched_run_2 = launcher._enrich_run(runtime=runtime, run=enriched_run)
+    assert (
+        enriched_run_2.status.state == mlrun.common.runtimes.constants.RunStates.running
+    )
+    assert enriched_run_2.status.start_time is None
+    assert enriched_run_2.status.retry_count == 2, "Expected retry count to be 2"
+    assert run.metadata.labels[mlrun.common.constants.MLRunInternalLabels.retry] == str(
+        enriched_run_2.status.retry_count
+    )
+    assert enriched_run_2.status.retries is not None
+    assert len(enriched_run_2.status.retries) == 2
+    assert enriched_run_2.status.retries[1]["attempt"] == 1
+
+
+@pytest.mark.parametrize(
+    "initial_state, db_state, db_deleted, expected_should_skip",
+    [
+        # Not pending_retry, should not skip
+        (mlrun.common.runtimes.constants.RunStates.running, None, False, False),
+        # Deleted run in DB, should skip
+        (mlrun.common.runtimes.constants.RunStates.pending_retry, None, True, True),
+        # Aborted in DB, should skip
+        (
+            mlrun.common.runtimes.constants.RunStates.pending_retry,
+            mlrun.common.runtimes.constants.RunStates.aborted,
+            False,
+            True,
+        ),
+        # Not aborted in DB, should not skip
+        (
+            mlrun.common.runtimes.constants.RunStates.pending_retry,
             mlrun.common.runtimes.constants.RunStates.running,
+            False,
             False,
         ),
     ],
 )
-def test_update_end_time_if_terminal_state(end_time, run_state, should_update):
-    runtime = unittest.mock.MagicMock()
-    runtime._get_db.return_value = unittest.mock.MagicMock()
+def test_should_skip_run(initial_state, db_state, db_deleted, expected_should_skip):
+    # Verify the `_should_skip_run` method correctly determines whether to skip retried runs based on their current
+    # state and the latest status in the database (including deleted or aborted runs).
+    run = mlrun.run.RunObject(
+        status=mlrun.model.RunStatus(state=initial_state),
+        spec=mlrun.model.RunSpec(
+            retry={
+                "count": 10,
+            },
+        ),
+    )
+    launcher = services.api.launcher.ServerSideLauncher()
 
-    uid = "123"
-    run = mlrun.run.RunObject(metadata=mlrun.model.RunMetadata(uid=uid))
-    run.status.state = run_state
-    run.status.end_time = end_time
+    with (
+        unittest.mock.patch("framework.utils.singletons.db.get_db") as get_db_mock,
+        unittest.mock.patch(
+            "framework.db.session.run_function_with_new_db_session"
+        ) as run_with_session_mock,
+    ):
+        get_db_mock.return_value = unittest.mock.Mock()
 
-    services.api.launcher.ServerSideLauncher._update_end_time_if_terminal_state(
-        runtime, run
+        if db_deleted:
+            run_with_session_mock.side_effect = mlrun.errors.MLRunNotFoundError()
+        elif db_state:
+            run_with_session_mock.return_value = {"status": {"state": db_state}}
+
+        should_skip = launcher._should_skip_run(run)
+        assert should_skip is expected_should_skip
+
+
+def test_launcher_skips_aborted_or_deleted_run(monkeypatch):
+    """
+    Verify that the launcher skips running a function when `_should_skip_run` returns True,
+    meaning the run was aborted or deleted after being scheduled for retry.
+    """
+    runtime = mlrun.code_to_function(
+        name="test", kind="job", filename=str(func_path), handler=handler
+    )
+    run = mlrun.run.RunObject(
+        status=mlrun.model.RunStatus(
+            state=mlrun.common.runtimes.constants.RunStates.pending_retry
+        ),
+        spec=mlrun.model.RunSpec(
+            retry={
+                "count": 10,
+            },
+        ),
+    )
+    launcher = services.api.launcher.ServerSideLauncher()
+
+    # Force `_should_skip_run` to return True to simulate aborted/deleted run
+    monkeypatch.setattr(launcher, "_should_skip_run", lambda x: True)
+
+    # Mock runtime handler to validate that it is not called
+    runtime_handler_mock = unittest.mock.Mock()
+    monkeypatch.setattr(
+        services.api.runtime_handlers,
+        "get_runtime_handler",
+        lambda kind: unittest.mock.Mock(run=runtime_handler_mock),
     )
 
-    if should_update:
-        db = runtime._get_db()
-        db.update_run.assert_called_once()
-        updates = db.update_run.call_args[0][0]
-        assert "status.end_time" in updates
-        assert updates["status.end_time"] is not None
-    else:
-        runtime._get_db().update_run.assert_not_called()
+    # Mock execution object
+    mock_execution = unittest.mock.Mock()
+
+    try:
+        # Simulate the same logic that exists in the launcher
+        if launcher._should_skip_run(run):
+            run.status.state = mlrun.common.runtimes.constants.RunStates.aborted
+        else:
+            runtime_handler = services.api.runtime_handlers.get_runtime_handler(
+                runtime.kind
+            )
+            runtime_handler.run(runtime, run, mock_execution)
+    except mlrun.runtimes.utils.RunError:
+        pass
+
+    # Validate result
+    assert run.status.state == mlrun.common.runtimes.constants.RunStates.aborted
+    assert not runtime_handler_mock.called
+
+
+def test_enrich_and_validate_auth_token_name_noop_without_v4_mode():
+    """Test that auth is not modified when not in iguazio v4 mode."""
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo()
+    )
+    initial_auth = {"token_name": "custom-token"}
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(auth=initial_auth),
+    )
+
+    launcher.enrich_and_validate_auth_token_name(run)
+
+    # auth should not be modified when not in v4 mode
+    assert run.spec.auth == initial_auth
+
+
+@pytest.fixture
+def iguazio_v4_mode():
+    """Fixture that sets up iguazio v4 authentication mode."""
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO_V4
+
+
+@pytest.mark.parametrize(
+    "initial_auth,expected_token_name",
+    [
+        # No token provided → resolved token
+        (None, "resolved-token"),
+        # Explicit token → preserved as-is
+        ({"token_name": "custom-token"}, "custom-token"),
+    ],
+)
+def test_enrich_and_validate_auth_token_name_iguazio_v4_resolution(
+    monkeypatch, iguazio_v4_mode, initial_auth, expected_token_name
+):
+    """Test token resolution in iguazio v4 mode."""
+    mock_resolve = unittest.mock.Mock(
+        side_effect=lambda user_id, provided_token_name: (
+            provided_token_name if provided_token_name else "resolved-token"
+        )
+    )
+    monkeypatch.setattr(
+        services.api.utils.helpers,
+        "resolve_auth_token_name",
+        mock_resolve,
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo(user_id="1234")
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(auth=initial_auth),
+    )
+
+    launcher.enrich_and_validate_auth_token_name(run)
+
+    assert run.spec.auth["token_name"] == expected_token_name
+    assert run.spec.auth["user_id"] == "1234"
+    mock_resolve.assert_called_once_with(
+        user_id="1234",
+        provided_token_name=initial_auth.get("token_name") if initial_auth else None,
+    )
+
+
+def test_enrich_and_validate_auth_token_name_iguazio_v4_user_id_fallback_from_spec(
+    monkeypatch, iguazio_v4_mode
+):
+    """Test that user_id is read from spec.auth when auth_info.user_id is None.
+
+    This covers post-restart scheduled jobs and retries where auth_info is empty
+    but user_id was previously persisted on the run/scheduled_object spec.
+    """
+    mock_resolve = unittest.mock.Mock(return_value="resolved-token")
+    monkeypatch.setattr(
+        services.api.utils.helpers,
+        "resolve_auth_token_name",
+        mock_resolve,
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo(user_id=None)
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(auth={"user_id": "spec-user-id"}),
+    )
+
+    launcher.enrich_and_validate_auth_token_name(run)
+
+    mock_resolve.assert_called_once_with(
+        user_id="spec-user-id",
+        provided_token_name=None,
+    )
+    assert run.spec.auth["user_id"] == "spec-user-id"
+    assert run.spec.auth["token_name"] == "resolved-token"
+    # user_id must be propagated back to auth_info so downstream code (e.g.
+    # _mount_secret_token_to_runtime) uses the correct identity, not the empty
+    # auth_info from a post-restart schedule reload.
+    assert launcher._auth_info.user_id == "spec-user-id"
+
+
+def test_enrich_and_validate_auth_token_name_iguazio_v4_token_not_found(
+    monkeypatch, iguazio_v4_mode
+):
+    """Test that MLRunNotFoundError is raised when token resolution fails."""
+    monkeypatch.setattr(
+        services.api.utils.helpers,
+        "resolve_auth_token_name",
+        unittest.mock.Mock(
+            side_effect=mlrun.errors.MLRunNotFoundError("No valid tokens found")
+        ),
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo(user_id="1234")
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(auth=None),
+    )
+
+    with pytest.raises(mlrun.errors.MLRunNotFoundError, match="No valid tokens found"):
+        launcher.enrich_and_validate_auth_token_name(run)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        mlrun.errors.MLRunBadRequestError("No valid tokens found for user id '1234'."),
+        mlrun.errors.MLRunNotFoundError("No valid tokens found for user id '1234'"),
+    ],
+    ids=["bad_request", "not_found"],
+)
+def test_enrich_and_validate_auth_token_name_scheduled_run_tolerates_missing_token(
+    monkeypatch, iguazio_v4_mode, exc
+):
+    """Scheduled runs should not raise when the auth token is missing or revoked.
+
+    When a scheduled KubeJob fires and the user's auth token secret has been
+    deleted (MLRunBadRequestError) or revoked/invalid (MLRunNotFoundError from
+    the iguazio SDK), the method should log a warning, skip the token mount,
+    but still persist user_id on the spec and back-fill auth_info so that
+    retries and downstream code keep working.
+    """
+    monkeypatch.setattr(
+        services.api.utils.helpers,
+        "resolve_auth_token_name",
+        unittest.mock.Mock(side_effect=exc),
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo(user_id="1234")
+    )
+    schedule_label = mlrun.common.schemas.constants.LabelNames.schedule_name
+    run = mlrun.run.RunObject(
+        metadata=mlrun.model.RunMetadata(
+            labels={schedule_label: "my-schedule"},
+        ),
+        spec=mlrun.model.RunSpec(auth=None),
+    )
+
+    with unittest.mock.patch("mlrun.utils.logger") as mock_logger:
+        launcher.enrich_and_validate_auth_token_name(run)
+
+        mock_logger.warning.assert_called_once()
+        call_kwargs = mock_logger.warning.call_args[1]
+        assert call_kwargs["user_id"] == "1234"
+        assert call_kwargs["schedule_name"] == "my-schedule"
+
+    # token_name must NOT be set — token resolution failed
+    assert not run.spec.auth or run.spec.auth.get("token_name") is None
+    # user_id must still be persisted for retries / downstream code
+    assert run.spec.auth["user_id"] == "1234"
+
+
+@pytest.mark.parametrize(
+    "exc,exc_type",
+    [
+        (
+            mlrun.errors.MLRunBadRequestError(
+                "No valid tokens found for user id '1234'."
+            ),
+            mlrun.errors.MLRunBadRequestError,
+        ),
+        (
+            mlrun.errors.MLRunNotFoundError("No valid tokens found for user id '1234'"),
+            mlrun.errors.MLRunNotFoundError,
+        ),
+    ],
+    ids=["bad_request", "not_found"],
+)
+def test_enrich_and_validate_auth_token_name_direct_run_raises_on_missing_token(
+    monkeypatch, iguazio_v4_mode, exc, exc_type
+):
+    """Direct (non-scheduled) runs must still fail fast when the token is missing or revoked."""
+    monkeypatch.setattr(
+        services.api.utils.helpers,
+        "resolve_auth_token_name",
+        unittest.mock.Mock(side_effect=exc),
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo(user_id="1234")
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(auth=None),
+    )
+
+    with pytest.raises(exc_type, match="No valid tokens found"):
+        launcher.enrich_and_validate_auth_token_name(run)
+
+
+def test_enrich_and_validate_auth_token_name_scheduled_run_happy_path(
+    monkeypatch, iguazio_v4_mode
+):
+    """Scheduled runs with a valid token should still enrich normally."""
+    monkeypatch.setattr(
+        services.api.utils.helpers,
+        "resolve_auth_token_name",
+        unittest.mock.Mock(return_value="valid-token"),
+    )
+
+    launcher = services.api.launcher.ServerSideLauncher(
+        auth_info=mlrun.common.schemas.AuthInfo(user_id="1234")
+    )
+    schedule_label = mlrun.common.schemas.constants.LabelNames.schedule_name
+    run = mlrun.run.RunObject(
+        metadata=mlrun.model.RunMetadata(
+            labels={schedule_label: "my-schedule"},
+        ),
+        spec=mlrun.model.RunSpec(auth=None),
+    )
+
+    launcher.enrich_and_validate_auth_token_name(run)
+
+    assert run.spec.auth["token_name"] == "valid-token"
+    assert run.spec.auth["user_id"] == "1234"
+
+
+def test_store_function_enriches_owner_from_auth_info():
+    """Test that server-side owner enrichment overrides client-provided owner."""
+    auth_info = mlrun.common.schemas.AuthInfo(username="authenticated_user")
+    launcher = services.api.launcher.ServerSideLauncher(auth_info=auth_info)
+
+    # Simulate client-provided owner (e.g., 'jovyan' from Jupyter)
+    run = mlrun.run.RunObject(
+        metadata=mlrun.model.RunMetadata(
+            labels={mlrun.common.constants.MLRunInternalLabels.owner: "jovyan"}
+        ),
+        spec=mlrun.model.RunSpec(output_path="/data/{{run.user}}/artifacts"),
+    )
+
+    runtime = unittest.mock.MagicMock()
+    runtime.kind = "job"
+    runtime._get_db.return_value = None
+
+    launcher._store_function(runtime, run)
+
+    # Owner should be overridden with authenticated username
+    assert (
+        run.metadata.labels[mlrun.common.constants.MLRunInternalLabels.owner]
+        == "authenticated_user"
+    )
+    # Template should be replaced with authenticated user
+    assert run.spec.output_path == "/data/authenticated_user/artifacts"
+
+
+def test_store_function_preserves_owner_when_no_auth():
+    """Test that client-provided owner is preserved when auth_info has no username (CE mode)."""
+    # No username in auth_info (CE/unauthenticated mode)
+    auth_info = mlrun.common.schemas.AuthInfo(username=None)
+    launcher = services.api.launcher.ServerSideLauncher(auth_info=auth_info)
+
+    run = mlrun.run.RunObject(
+        metadata=mlrun.model.RunMetadata(
+            labels={mlrun.common.constants.MLRunInternalLabels.owner: "local_user"}
+        ),
+        spec=mlrun.model.RunSpec(output_path="/data/{{run.user}}/artifacts"),
+    )
+
+    runtime = unittest.mock.MagicMock()
+    runtime.kind = "job"
+    runtime._get_db.return_value = None
+
+    launcher._store_function(runtime, run)
+
+    # Owner should remain as client-provided value
+    assert (
+        run.metadata.labels[mlrun.common.constants.MLRunInternalLabels.owner]
+        == "local_user"
+    )
+    # Template should be replaced with client-provided owner
+    assert run.spec.output_path == "/data/local_user/artifacts"
+
+
+def test_store_function_preserves_owner_when_no_auth_info():
+    """Test that client-provided owner is preserved when auth_info is None."""
+    launcher = services.api.launcher.ServerSideLauncher(auth_info=None)
+
+    run = mlrun.run.RunObject(
+        metadata=mlrun.model.RunMetadata(
+            labels={mlrun.common.constants.MLRunInternalLabels.owner: "local_user"}
+        ),
+        spec=mlrun.model.RunSpec(output_path="/data/{{run.user}}/artifacts"),
+    )
+
+    runtime = unittest.mock.MagicMock()
+    runtime.kind = "job"
+    runtime._get_db.return_value = None
+
+    launcher._store_function(runtime, run)
+
+    # Owner should remain as client-provided value
+    assert (
+        run.metadata.labels[mlrun.common.constants.MLRunInternalLabels.owner]
+        == "local_user"
+    )
+    # Template should be replaced with client-provided owner
+    assert run.spec.output_path == "/data/local_user/artifacts"
+
+
+def test_store_function_handles_no_output_path():
+    """Test that _store_function handles runs without output_path."""
+    auth_info = mlrun.common.schemas.AuthInfo(username="authenticated_user")
+    launcher = services.api.launcher.ServerSideLauncher(auth_info=auth_info)
+
+    run = mlrun.run.RunObject(
+        metadata=mlrun.model.RunMetadata(
+            labels={mlrun.common.constants.MLRunInternalLabels.owner: "jovyan"}
+        ),
+        spec=mlrun.model.RunSpec(output_path=None),
+    )
+
+    runtime = unittest.mock.MagicMock()
+    runtime.kind = "job"
+    runtime._get_db.return_value = None
+
+    # Should not raise
+    launcher._store_function(runtime, run)
+
+    # Owner should still be enriched
+    assert (
+        run.metadata.labels[mlrun.common.constants.MLRunInternalLabels.owner]
+        == "authenticated_user"
+    )
+    # output_path should remain None
+    assert run.spec.output_path is None

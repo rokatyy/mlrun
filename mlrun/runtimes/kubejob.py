@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import typing
-import warnings
 
 import mlrun.common.schemas
 import mlrun.db
@@ -75,7 +73,7 @@ class KubejobRuntime(KubeResource):
         self,
         image="",
         base_image=None,
-        commands: typing.Optional[list] = None,
+        commands: list | None = None,
         secret=None,
         source=None,
         extra=None,
@@ -83,7 +81,7 @@ class KubejobRuntime(KubeResource):
         with_mlrun=None,
         auto_build=None,
         requirements=None,
-        overwrite=False,
+        overwrite=True,
         prepare_image_for_deploy=True,
         requirements_file=None,
         builder_env=None,
@@ -113,12 +111,6 @@ class KubejobRuntime(KubeResource):
         :param builder_env: Kaniko builder pod env vars dict (for config/credentials)
             e.g. builder_env={"GIT_TOKEN": token}
         """
-        if not overwrite:
-            # TODO: change overwrite default to True in 1.8.0
-            warnings.warn(
-                "The `overwrite` parameter default will change from 'False' to 'True' in 1.8.0.",
-                mlrun.utils.OverwriteBuildParamsWarning,
-            )
         image = mlrun.utils.helpers.remove_image_protocol_prefix(image)
         self.spec.build.build_config(
             image=image,
@@ -143,11 +135,11 @@ class KubejobRuntime(KubeResource):
     def deploy(
         self,
         watch: bool = True,
-        with_mlrun: typing.Optional[bool] = None,
+        with_mlrun: bool | None = None,
         skip_deployed: bool = False,
         is_kfp: bool = False,
-        mlrun_version_specifier: typing.Optional[bool] = None,
-        builder_env: typing.Optional[dict] = None,
+        mlrun_version_specifier: bool | None = None,
+        builder_env: dict | None = None,
         show_on_failure: bool = False,
         force_build: bool = False,
     ) -> bool:
@@ -189,7 +181,7 @@ class KubejobRuntime(KubeResource):
         self,
         image=None,
         base_image=None,
-        commands: typing.Optional[list] = None,
+        commands: list | None = None,
         secret_name="",
         with_mlrun=True,
         skip_deployed=False,
@@ -214,3 +206,7 @@ class KubejobRuntime(KubeResource):
         raise NotImplementedError(
             f"Running a {self.kind} function from the client is not supported. Use .run() to submit the job to the API."
         )
+
+    @property
+    def serving_spec(self):
+        return self.spec.serving_spec

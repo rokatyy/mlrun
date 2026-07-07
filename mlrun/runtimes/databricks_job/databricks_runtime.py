@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from ast import FunctionDef, parse, unparse
-from base64 import b64decode, b64encode
-from typing import Callable, Optional, Union
+from base64 import b64decode
+from collections.abc import Callable
+from typing import Union
 
 import mlrun
 import mlrun.runtimes.kubejob as kubejob
 import mlrun.runtimes.pod as pod
+import mlrun.utils.helpers
 from mlrun.errors import MLRunInvalidArgumentError
 from mlrun.model import HyperParamOptions, RunObject
 
@@ -81,7 +82,6 @@ class DatabricksSpec(pod.KubeResourceSpec):
         tolerations=None,
         preemption_mode=None,
         security_context=None,
-        clone_target_dir=None,
         state_thresholds=None,
     ):
         super().__init__(
@@ -111,7 +111,6 @@ class DatabricksSpec(pod.KubeResourceSpec):
             tolerations=tolerations,
             preemption_mode=preemption_mode,
             security_context=security_context,
-            clone_target_dir=clone_target_dir,
             state_thresholds=state_thresholds,
         )
         self._termination_grace_period_seconds = 60
@@ -138,7 +137,7 @@ class DatabricksRuntime(kubejob.KubejobRuntime):
             )
 
     def _get_modified_user_code(self, original_handler: str, log_artifacts_code: str):
-        encoded_code = (
+        encoded_code: str | None = (
             self.spec.build.functionSourceCode if hasattr(self.spec, "build") else None
         )
         if not encoded_code:
@@ -162,7 +161,7 @@ class DatabricksRuntime(kubejob.KubejobRuntime):
         if original_handler:
             decoded_code += f"\nresult = {original_handler}(**handler_arguments)\n"
             decoded_code += _return_artifacts_code
-        return b64encode(decoded_code.encode("utf-8")).decode("utf-8")
+        return mlrun.utils.helpers.encode_user_code(decoded_code)
 
     def get_internal_parameters(self, runobj: RunObject):
         """
@@ -202,37 +201,36 @@ from mlrun.runtimes.databricks_job import databricks_wrapper
 def run_mlrun_databricks_job(context,task_parameters: dict, **kwargs):
         databricks_wrapper.run_mlrun_databricks_job(context, task_parameters, **kwargs)
 """
-        wrap_code = b64encode(wrap_code).decode("utf-8")
+        wrap_code = mlrun.utils.helpers.encode_user_code(wrap_code)
         self.spec.build.functionSourceCode = wrap_code
         runspec.spec.handler = "run_mlrun_databricks_job"
 
     def run(
         self,
-        runspec: Optional[
-            Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict]
-        ] = None,
-        handler: Optional[Union[str, Callable]] = None,
-        name: Optional[str] = "",
-        project: Optional[str] = "",
-        params: Optional[dict] = None,
-        inputs: Optional[dict[str, str]] = None,
-        out_path: Optional[str] = "",
-        workdir: Optional[str] = "",
-        artifact_path: Optional[str] = "",
-        watch: Optional[bool] = True,
-        schedule: Optional[Union[str, mlrun.common.schemas.ScheduleCronTrigger]] = None,
-        hyperparams: Optional[dict[str, list]] = None,
-        hyper_param_options: Optional[HyperParamOptions] = None,
-        verbose: Optional[bool] = None,
-        scrape_metrics: Optional[bool] = None,
-        local: Optional[bool] = False,
-        local_code_path: Optional[str] = None,
-        auto_build: Optional[bool] = None,
-        param_file_secrets: Optional[dict[str, str]] = None,
-        notifications: Optional[list[mlrun.model.Notification]] = None,
-        returns: Optional[list[Union[str, dict[str, str]]]] = None,
-        state_thresholds: Optional[dict[str, int]] = None,
-        reset_on_run: Optional[bool] = None,
+        runspec: Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict]
+        | None = None,
+        handler: Union[str, Callable] | None = None,
+        name: str | None = "",
+        project: str | None = "",
+        params: dict | None = None,
+        inputs: dict[str, str] | None = None,
+        workdir: str | None = "",
+        watch: bool | None = True,
+        schedule: Union[str, mlrun.common.schemas.ScheduleCronTrigger] | None = None,
+        hyperparams: dict[str, list] | None = None,
+        hyper_param_options: HyperParamOptions | None = None,
+        verbose: bool | None = None,
+        scrape_metrics: bool | None = None,
+        local: bool | None = False,
+        local_code_path: str | None = None,
+        auto_build: bool | None = None,
+        param_file_secrets: dict[str, str] | None = None,
+        notifications: list[mlrun.model.Notification] | None = None,
+        returns: list[Union[str, dict[str, str]]] | None = None,
+        state_thresholds: dict[str, int] | None = None,
+        reset_on_run: bool | None = None,
+        output_path: str | None = "",
+        retry: Union[mlrun.model.Retry, dict] | None = None,
         **launcher_kwargs,
     ) -> RunObject:
         if local:
@@ -244,9 +242,8 @@ def run_mlrun_databricks_job(context,task_parameters: dict, **kwargs):
             project=project,
             params=params,
             inputs=inputs,
-            out_path=out_path,
             workdir=workdir,
-            artifact_path=artifact_path,
+            output_path=output_path,
             watch=watch,
             schedule=schedule,
             hyperparams=hyperparams,

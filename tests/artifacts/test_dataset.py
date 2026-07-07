@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import pathlib
 
 import dask.dataframe as dd
@@ -75,6 +75,26 @@ def test_dataset_upload_with_src_path_filling_hash():
     artifact.src_path = src_path
     artifact.upload()
     assert artifact.hash is not None
+
+
+def test_dataset_size_reflects_real_bytes_for_directory_target(tmp_path):
+    """A non-.parquet/.pq target is written as a directory; spec.size must be the real byte
+    total, not the directory entry's own (~0) length ("0 B" on v3io, "N/A" on Azure)."""
+    data_frame = pandas.DataFrame({"x": list(range(100))})
+    # ".txt" suffix => directory write
+    target_path = tmp_path / "mydata.txt"
+    artifact = mlrun.artifacts.dataset.DatasetArtifact(
+        df=data_frame,
+        target_path=str(target_path),
+    )
+    artifact.upload()
+
+    assert target_path.is_dir()
+    real_total = sum(
+        part.stat().st_size for part in target_path.rglob("*") if part.is_file()
+    )
+    assert real_total > 0
+    assert artifact.spec.size == real_total
 
 
 def test_dataset_upload_without_df_or_body():
@@ -211,7 +231,52 @@ def test_dataset_stats():
             assert dataset_artifact.status.stats is not None
 
 
-def test_get_log_dataset_dont_duplicate_index_column():
+def test_dataset_stats_with_ignore_preview_limits():
+    """Test that stats=False is respected even when ignore_preview_limits=True.
+
+    Before the fix, an operator precedence bug caused `or ignore_preview_limits`
+    to be evaluated outside of the `stats is None and (...)` group, meaning
+    stats were computed even when the user explicitly disabled them with
+    stats=False.
+    """
+    raw_data = {
+        "first_name": ["Jason", "Molly", "Tina", "Jake", "Amy"],
+        "last_name": ["Miller", "Jacobson", "Ali", "Milner", "Cooze"],
+        "age": [42, 52, 36, 24, 73],
+        "testScore": [25, 94, 57, 62, 70],
+    }
+    df = pandas.DataFrame(
+        raw_data, columns=["first_name", "last_name", "age", "testScore"]
+    )
+
+    # stats=False with ignore_preview_limits=True should NOT compute stats
+    artifact = mlrun.artifacts.dataset.DatasetArtifact(
+        df=df, stats=False, ignore_preview_limits=True
+    )
+    assert artifact.status.stats is None, (
+        "stats should be None when user explicitly sets stats=False, "
+        "even with ignore_preview_limits=True"
+    )
+
+    # stats=None (auto) with ignore_preview_limits=True should compute stats
+    artifact = mlrun.artifacts.dataset.DatasetArtifact(
+        df=df, stats=None, ignore_preview_limits=True
+    )
+    assert artifact.status.stats is not None, (
+        "stats should be computed when stats=None (auto mode) "
+        "and ignore_preview_limits=True"
+    )
+
+    # stats=True with ignore_preview_limits=True should compute stats
+    artifact = mlrun.artifacts.dataset.DatasetArtifact(
+        df=df, stats=True, ignore_preview_limits=True
+    )
+    assert artifact.status.stats is not None, (
+        "stats should be computed when stats=True, regardless of ignore_preview_limits"
+    )
+
+
+def test_get_log_dataset_dont_duplicate_index_column(ensure_project):
     source_url = mlrun.get_sample_path("data/iris/iris.data.raw.csv")
     df = mlrun.get_dataitem(source_url).as_df()
     artifact = mlrun.get_or_create_ctx("test").log_dataset("iris", df=df, upload=False)
@@ -230,7 +295,7 @@ def test_get_log_dataset_dont_duplicate_index_column():
     assert index_counter == 1
 
 
-def test_log_dataset_with_column_overflow(monkeypatch):
+def test_log_dataset_with_column_overflow(monkeypatch, ensure_project):
     context = mlrun.get_or_create_ctx("test")
     source_url = mlrun.get_sample_path("data/iris/iris.data.raw.csv")
     df = mlrun.get_dataitem(source_url).as_df()
@@ -246,8 +311,8 @@ def test_log_dataset_with_column_overflow(monkeypatch):
     assert artifact.status.header_original_length == 6
 
 
-def test_create_dataset_non_existing_label():
-    project = mlrun.new_project("artifact-experiment", save=False)
+def test_create_dataset_non_existing_label(new_project_factory):
+    project = new_project_factory("artifact-experiment", save=False)
     df = pandas.DataFrame(
         {
             "column_1": [0, 1, 2, 3, 4],

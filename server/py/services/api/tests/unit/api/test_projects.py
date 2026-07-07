@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import collections.abc
 import copy
 import datetime
@@ -20,7 +20,7 @@ import json.decoder
 import os
 import unittest.mock
 from http import HTTPStatus
-from typing import Optional
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import deepdiff
@@ -38,8 +38,12 @@ import mlrun.common.constants as mlrun_constants
 import mlrun.common.formatters
 import mlrun.common.runtimes.constants
 import mlrun.common.schemas
+import mlrun.common.types
 import mlrun.errors
 import mlrun_pipelines.common.models
+from mlrun.artifacts import Artifact
+from mlrun.common.schemas.background_task import BackGroundTaskLabel
+from mlrun.common.schemas.model_monitoring import EndpointType, ModelMonitoringAppLabel
 
 import framework.api.utils
 import framework.utils.auth.verifier
@@ -48,6 +52,8 @@ import framework.utils.clients.log_collector
 import framework.utils.singletons.db
 import framework.utils.singletons.k8s
 import framework.utils.singletons.project_member
+import services.alerts.crud
+import services.api.api.endpoints.projects as projects_endpoints
 import services.api.crud
 import services.api.tests.unit.conftest
 import services.api.tests.unit.utils.clients.test_log_collector
@@ -70,6 +76,7 @@ from services.api.daemon import daemon
 ORIGINAL_VERSIONED_API_PREFIX = daemon.service.base_versioned_service_prefix
 FUNCTIONS_API = "projects/{project}/functions/{name}"
 LIST_FUNCTION_API = "projects/{project}/functions"
+PERMISSIONS_PROJECT_NAME = "permissions-project"
 
 
 @pytest.fixture(params=["leader", "follower"])
@@ -166,6 +173,322 @@ def test_get_non_existing_project(
     assert response.status_code == HTTPStatus.NOT_FOUND.value
 
 
+@pytest.mark.asyncio
+async def test_project_permissions_create_when_missing(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify create permissions are required for missing projects."""
+    auth_info = mlrun.common.schemas.AuthInfo()
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    query_global = AsyncMock()
+    resource_type = mlrun.common.schemas.AuthorizationResourceTypes.project_global
+    action = mlrun.common.schemas.AuthorizationAction.create
+    auth_mode = mlrun.common.types.AuthenticationMode.IGUAZIO_V4
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(
+        auth_verifier, "query_global_resource_permissions", query_global
+    )
+    monkeypatch.setattr(mlrun.mlconf.httpdb.authentication, "mode", auth_mode)
+    project_member = framework.utils.singletons.project_member.get_project_member()
+    not_found_error = mlrun.errors.MLRunNotFoundError("Project missing")
+    monkeypatch.setattr(
+        project_member, "get_project", Mock(side_effect=not_found_error)
+    )
+    await projects_endpoints._ensure_project_create_or_update_permissions(
+        db, PERMISSIONS_PROJECT_NAME, auth_info
+    )
+    query_project.assert_not_awaited()
+    query_global.assert_awaited_once_with(resource_type, action, auth_info)
+
+
+@pytest.mark.asyncio
+async def test_project_permissions_update_when_exists(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify update permissions are required for existing projects."""
+    auth_info = mlrun.common.schemas.AuthInfo()
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    query_global = AsyncMock()
+    action = mlrun.common.schemas.AuthorizationAction.update
+    project_name = PERMISSIONS_PROJECT_NAME
+    auth_mode = mlrun.common.types.AuthenticationMode.IGUAZIO_V4
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(
+        auth_verifier, "query_global_resource_permissions", query_global
+    )
+    monkeypatch.setattr(mlrun.mlconf.httpdb.authentication, "mode", auth_mode)
+    project_member = framework.utils.singletons.project_member.get_project_member()
+    existing_project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name=project_name)
+    )
+    monkeypatch.setattr(
+        project_member, "get_project", Mock(return_value=existing_project)
+    )
+
+    await projects_endpoints._ensure_project_create_or_update_permissions(
+        db, project_name, auth_info
+    )
+    query_project.assert_awaited_once_with(project_name, action, auth_info)
+    query_global.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_permissions_owner_short_circuits_opa_check(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the requester is the project owner, skip OPA and populate the owner cache."""
+    project_name = PERMISSIONS_PROJECT_NAME
+    owner_username = "project-owner"
+    auth_info = mlrun.common.schemas.AuthInfo(username=owner_username)
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    add_allowed = Mock()
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(auth_verifier, "add_allowed_project_for_owner", add_allowed)
+    existing_project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name=project_name),
+        spec=mlrun.common.schemas.ProjectSpec(owner=owner_username),
+    )
+    project_member = framework.utils.singletons.project_member.get_project_member()
+    monkeypatch.setattr(
+        project_member, "get_project", Mock(return_value=existing_project)
+    )
+
+    await projects_endpoints._ensure_project_create_or_update_permissions(
+        db, project_name, auth_info
+    )
+
+    add_allowed.assert_called_once_with(project_name, auth_info)
+    query_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_project_owner_short_circuits_opa_check(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the requester owns the project, GET /projects/{name} skips OPA and primes the owner cache."""
+    project_name = PERMISSIONS_PROJECT_NAME
+    owner_username = "project-owner"
+    auth_info = mlrun.common.schemas.AuthInfo(username=owner_username)
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    add_allowed = Mock()
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(auth_verifier, "add_allowed_project_for_owner", add_allowed)
+    monkeypatch.setattr(
+        mlrun.mlconf.httpdb.authentication,
+        "mode",
+        mlrun.common.types.AuthenticationMode.IGUAZIO_V4,
+    )
+    existing_project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name=project_name),
+        spec=mlrun.common.schemas.ProjectSpec(owner=owner_username),
+    )
+    project_member = framework.utils.singletons.project_member.get_project_member()
+    monkeypatch.setattr(
+        project_member, "get_project", Mock(return_value=existing_project)
+    )
+
+    returned = await projects_endpoints.get_project(
+        name=project_name,
+        format_=mlrun.common.formatters.ProjectFormat.full,
+        db_session=db,
+        auth_info=auth_info,
+    )
+
+    assert returned is existing_project
+    add_allowed.assert_called_once_with(project_name, auth_info)
+    query_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_project_non_owner_falls_back_to_opa(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the requester is not the project owner, GET /projects/{name} queries OPA as before."""
+    project_name = PERMISSIONS_PROJECT_NAME
+    auth_info = mlrun.common.schemas.AuthInfo(username="not-the-owner")
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    add_allowed = Mock()
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(auth_verifier, "add_allowed_project_for_owner", add_allowed)
+    monkeypatch.setattr(
+        mlrun.mlconf.httpdb.authentication,
+        "mode",
+        mlrun.common.types.AuthenticationMode.IGUAZIO_V4,
+    )
+    existing_project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name=project_name),
+        spec=mlrun.common.schemas.ProjectSpec(owner="someone-else"),
+    )
+    project_member = framework.utils.singletons.project_member.get_project_member()
+    monkeypatch.setattr(
+        project_member, "get_project", Mock(return_value=existing_project)
+    )
+
+    returned = await projects_endpoints.get_project(
+        name=project_name,
+        format_=mlrun.common.formatters.ProjectFormat.full,
+        db_session=db,
+        auth_info=auth_info,
+    )
+
+    assert returned is existing_project
+    add_allowed.assert_not_called()
+    query_project.assert_awaited_once_with(
+        project_name,
+        mlrun.common.schemas.AuthorizationAction.read,
+        auth_info,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "patch_body, expect_mgmt_check, expect_regular_check",
+    [
+        ({"spec": {"owner": "new_owner"}}, True, False),
+        ({"spec": {"description": "updated"}}, False, True),
+        ({"spec": {"owner": "new_owner", "description": "updated"}}, True, True),
+        ({"metadata": {"labels": {"key": "val"}}}, False, True),
+        ({}, False, True),
+    ],
+)
+async def test_project_permissions_patch_owner_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    patch_body: dict,
+    expect_mgmt_check: bool,
+    expect_regular_check: bool,
+) -> None:
+    """Verify the correct permission checks are invoked based on patch contents."""
+    auth_info = mlrun.common.schemas.AuthInfo()
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    query_resource = AsyncMock()
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(
+        auth_verifier, "query_project_resource_permissions", query_resource
+    )
+
+    await projects_endpoints._verify_patch_project_permissions(
+        PERMISSIONS_PROJECT_NAME, patch_body, auth_info
+    )
+
+    if expect_mgmt_check:
+        query_resource.assert_awaited_once_with(
+            mlrun.common.schemas.AuthorizationResourceTypes.project_owner,
+            PERMISSIONS_PROJECT_NAME,
+            "",
+            mlrun.common.schemas.AuthorizationAction.update,
+            auth_info,
+            resource_namespace=mlrun.common.schemas.AuthorizationResourceNamespace.mgmt,
+        )
+    else:
+        query_resource.assert_not_awaited()
+
+    if expect_regular_check:
+        query_project.assert_awaited_once_with(
+            PERMISSIONS_PROJECT_NAME,
+            mlrun.common.schemas.AuthorizationAction.update,
+            auth_info,
+        )
+    else:
+        query_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_permissions_patch_owner_denied(monkeypatch: pytest.MonkeyPatch):
+    """When mgmt owner permission is denied, the endpoint should raise."""
+    auth_info = mlrun.common.schemas.AuthInfo()
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    monkeypatch.setattr(
+        auth_verifier,
+        "query_project_resource_permissions",
+        AsyncMock(
+            side_effect=mlrun.errors.MLRunAccessDeniedError(
+                "Not allowed to update owner"
+            )
+        ),
+    )
+
+    with pytest.raises(mlrun.errors.MLRunAccessDeniedError):
+        await projects_endpoints._verify_patch_project_permissions(
+            PERMISSIONS_PROJECT_NAME,
+            {"spec": {"owner": "new_owner"}},
+            auth_info,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_owner, expect_mgmt_check",
+    [
+        # Reassigning to a different user -> mgmt owner-update permission required.
+        ("new-owner", True),
+        # No owner in the body -> no owner change intended (stored owner preserved
+        # downstream), so no mgmt check.
+        (None, False),
+        # Body echoes the current owner -> no-op, so no mgmt check.
+        ("current-owner", False),
+    ],
+)
+async def test_store_project_permissions_owner_reassignment_routing(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_owner: str | None,
+    expect_mgmt_check: bool,
+) -> None:
+    """A PUT that reassigns the owner to a different user requires the mgmt owner-update permission."""
+    project_name = PERMISSIONS_PROJECT_NAME
+    stored_owner = "current-owner"
+    # Requester is not the owner, so the regular update-permission path is taken
+    # regardless of the owner routing.
+    auth_info = mlrun.common.schemas.AuthInfo(username="requester")
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project = AsyncMock()
+    query_resource = AsyncMock()
+    monkeypatch.setattr(auth_verifier, "query_project_permissions", query_project)
+    monkeypatch.setattr(
+        auth_verifier, "query_project_resource_permissions", query_resource
+    )
+    existing_project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name=project_name),
+        spec=mlrun.common.schemas.ProjectSpec(owner=stored_owner),
+    )
+    project_member = framework.utils.singletons.project_member.get_project_member()
+    monkeypatch.setattr(
+        project_member, "get_project", Mock(return_value=existing_project)
+    )
+    requested_project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name=project_name),
+        spec=mlrun.common.schemas.ProjectSpec(owner=requested_owner),
+    )
+
+    await projects_endpoints._ensure_project_create_or_update_permissions(
+        db, project_name, auth_info, requested_project=requested_project
+    )
+
+    # Regular update permission is always required for a non-owner requester.
+    query_project.assert_awaited_once_with(
+        project_name,
+        mlrun.common.schemas.AuthorizationAction.update,
+        auth_info,
+    )
+    if expect_mgmt_check:
+        query_resource.assert_awaited_once_with(
+            mlrun.common.schemas.AuthorizationResourceTypes.project_owner,
+            project_name,
+            "",
+            mlrun.common.schemas.AuthorizationAction.update,
+            auth_info,
+            resource_namespace=mlrun.common.schemas.AuthorizationResourceNamespace.mgmt,
+        )
+    else:
+        query_resource.assert_not_awaited()
+
+
 @pytest.fixture()
 def mock_process_model_monitoring_secret() -> collections.abc.Iterator[None]:
     with unittest.mock.patch(
@@ -209,6 +532,25 @@ def test_delete_project_with_resources(
     project_to_remove = "project-to-remove"
     _create_resources_of_all_kinds(db, k8s_secrets_mock, project_to_keep)
     _create_resources_of_all_kinds(db, k8s_secrets_mock, project_to_remove)
+
+    # populate alerts cache
+    services.alerts.crud.alerts.Alerts().populate_caches(session=db)
+    # list alerts and remember ids
+    alert_ids_to_remove = [
+        alert.id
+        for alert in services.alerts.crud.Alerts().list_alerts(
+            session=db,
+            project=project_to_remove,
+        )
+    ]
+
+    alert_ids_to_keep = [
+        alert.id
+        for alert in services.alerts.crud.Alerts().list_alerts(
+            session=db,
+            project=project_to_keep,
+        )
+    ]
 
     (
         project_to_keep_table_name_records_count_map_before_project_removal,
@@ -289,6 +631,35 @@ def test_delete_project_with_resources(
         == {}
     )
 
+    # check that alerts cache is cleaned up
+    for alert_id in alert_ids_to_remove:
+        assert (
+            services.alerts.crud.Alerts()._get_alert_by_id_cached()(db, alert_id)
+            is None
+        )
+        with pytest.raises(mlrun.errors.MLRunNotFoundError):
+            assert services.alerts.crud.Alerts()._get_alert_state_cached()(db, alert_id)
+
+    # check that alerts cache is not cleaned up
+    for alert_id in alert_ids_to_keep:
+        assert (
+            services.alerts.crud.Alerts()._get_alert_by_id_cached()(db, alert_id)
+            is not None
+        )
+        assert (
+            services.alerts.crud.Alerts()._get_alert_state_cached()(db, alert_id)
+            is not None
+        )
+
+    # check that event cache is removed for project_to_remove, and it isn't for project_to_keep
+    project_to_keep_cached_events_count = 0
+    for key, alert_ids in services.alerts.crud.events.Events()._cache.items():
+        assert key[0] != project_to_remove
+        if key[0] == project_to_keep:
+            project_to_keep_cached_events_count += len(alert_ids)
+
+    assert project_to_keep_cached_events_count == len(alert_ids_to_keep)
+
     # deletion strategy - check - should succeed cause no project
     _send_delete_request_and_assert_response_code(
         mlrun.common.schemas.DeletionStrategy.check,
@@ -300,6 +671,61 @@ def test_delete_project_with_resources(
         mlrun.common.schemas.DeletionStrategy.restricted,
         HTTPStatus.NO_CONTENT.value,
     )
+
+
+@pytest.mark.asyncio
+async def test_only_iteration_zero_runs_are_counted(db: Session, client: TestClient):
+    proj = "iter-filter-project"
+    _create_project(client, proj)
+    one_hour_ago = datetime.datetime.now() - datetime.timedelta(hours=1)
+
+    # iter==0 (counted)
+    _create_runs(client, proj, 2, mlrun.common.runtimes.constants.RunStates.running)
+    _create_runs(
+        client,
+        proj,
+        3,
+        mlrun.common.runtimes.constants.RunStates.completed,
+        one_hour_ago,
+    )
+    _create_runs(
+        client, proj, 4, mlrun.common.runtimes.constants.RunStates.error, one_hour_ago
+    )
+
+    # iter>0 (ignored)
+    _create_hyperparam_runs(
+        client=client,
+        project_name=proj,
+        param_name="x",
+        values=[1, 2, 3, 4, 5],
+        state=mlrun.common.runtimes.constants.RunStates.running,
+    )
+    _create_hyperparam_runs(
+        client=client,
+        project_name=proj,
+        param_name="x",
+        values=[6, 7, 8, 9, 10, 11],
+        state=mlrun.common.runtimes.constants.RunStates.completed,
+        start_time=one_hour_ago,
+    )
+    _create_hyperparam_runs(
+        client=client,
+        project_name=proj,
+        param_name="x",
+        values=[12, 13, 14],
+        state=mlrun.common.runtimes.constants.RunStates.aborted,
+        start_time=one_hour_ago,
+    )
+
+    await services.api.crud.Projects().refresh_project_resources_counters_cache(db)
+    summary = mlrun.common.schemas.ProjectSummary(
+        **client.get(f"project-summaries/{proj}").json()
+    )
+
+    # each run created 3 instances
+    assert summary.runs_running_count == 2 * 3
+    assert summary.runs_completed_recent_count == 3 * 3
+    assert summary.runs_failed_recent_count == 4 * 3
 
 
 @pytest.mark.asyncio
@@ -320,9 +746,35 @@ async def test_list_and_get_project_summaries(
         client, project_name, files_count, mlrun.artifacts.PlotArtifact.kind
     )
 
+    code_files_count = 3
+    _create_artifacts(
+        client, project_name, code_files_count, mlrun.artifacts.CodeArtifact.kind
+    )
+    files_count += code_files_count
+
     # create feature sets for the project
     feature_sets_count = 9
     _create_feature_sets(client, project_name, feature_sets_count)
+
+    # create model endpoints for the project
+    real_time_model_endpoint_count = 4
+    batch_model_endpoints_count = 2
+    _create_batch_and_real_time_model_endpoints(
+        client,
+        project_name,
+        real_time_model_endpoint_count,
+        batch_model_endpoints_count,
+    )
+
+    # create model monitoring functions for the project
+    running_model_monitoring_functions = 6
+    failed_model_monitoring_functions = 1
+    _create_running_and_failed_model_monitoring_functions(
+        client,
+        project_name,
+        running_model_monitoring_functions,
+        failed_model_monitoring_functions,
+    )
 
     # create model artifacts for the project
     models_count = 4
@@ -337,6 +789,8 @@ async def test_list_and_get_project_summaries(
 
     # create runs for the project
     running_runs_count = 5
+    expected_running = running_runs_count * 3
+
     _create_runs(
         client,
         project_name,
@@ -356,6 +810,7 @@ async def test_list_and_get_project_summaries(
 
     # create completed runs for the project for less than 24 hours ago
     runs_completed_recent_count = 10
+    expected_completed = runs_completed_recent_count * 3  # each run created 3 instances
     one_hour_ago = datetime.datetime.now() - datetime.timedelta(hours=1)
     _create_runs(
         client,
@@ -386,6 +841,7 @@ async def test_list_and_get_project_summaries(
         mlrun.common.runtimes.constants.RunStates.aborted,
         one_hour_ago,
     )
+    expected_failed = (recent_failed_runs_count + recent_aborted_runs_count) * 3
 
     # create failed runs for the project for more than 24 hours ago to make sure we're not mistakenly counting them
     two_days_ago = datetime.datetime.now() - datetime.timedelta(hours=48)
@@ -409,6 +865,7 @@ async def test_list_and_get_project_summaries(
                 {},
                 {},
                 {},
+                {},
             )
         )
     )
@@ -421,17 +878,21 @@ async def test_list_and_get_project_summaries(
     )
     for index, project_summary in enumerate(project_summaries_output.project_summaries):
         if project_summary.name == empty_project_name:
-            _assert_project_summary(project_summary, 0, 0, 0, 0, 0, 0, 0)
+            _assert_project_summary(project_summary, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         elif project_summary.name == project_name:
             _assert_project_summary(
                 project_summary,
                 files_count,
                 feature_sets_count,
                 models_count,
-                runs_completed_recent_count,
-                recent_failed_runs_count + recent_aborted_runs_count,
-                running_runs_count,
+                expected_completed,
+                expected_failed,
+                expected_running,
                 running_pipelines_count,
+                real_time_model_endpoint_count,
+                batch_model_endpoints_count,
+                running_model_monitoring_functions,
+                failed_model_monitoring_functions,
             )
         else:
             pytest.fail(f"Unexpected project summary returned: {project_summary}")
@@ -444,10 +905,14 @@ async def test_list_and_get_project_summaries(
         files_count,
         feature_sets_count,
         models_count,
-        runs_completed_recent_count,
-        recent_failed_runs_count + recent_aborted_runs_count,
-        running_runs_count,
+        expected_completed,
+        expected_failed,
+        expected_running,
         running_pipelines_count,
+        real_time_model_endpoint_count,
+        batch_model_endpoints_count,
+        running_model_monitoring_functions,
+        failed_model_monitoring_functions,
     )
 
 
@@ -473,6 +938,7 @@ async def test_list_project_summaries_different_installation_modes(
                 {},
                 {},
                 {},
+                {},
             )
         )
     )
@@ -491,6 +957,10 @@ async def test_list_project_summaries_different_installation_modes(
     _assert_project_summary(
         # accessing the zero index as there's only one project
         project_summaries_output.project_summaries[0],
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -520,6 +990,10 @@ async def test_list_project_summaries_different_installation_modes(
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
     )
 
     # Kubernetes installation configuration (mlrun-kit)
@@ -535,6 +1009,10 @@ async def test_list_project_summaries_different_installation_modes(
     _assert_project_summary(
         # accessing the zero index as there's only one project
         project_summaries_output.project_summaries[0],
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         0,
@@ -564,7 +1042,57 @@ async def test_list_project_summaries_different_installation_modes(
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
     )
+
+
+@pytest.mark.asyncio
+async def test_list_project_summaries_filters_by_project_permissions(
+    db: Session, client: TestClient, project_member_mode: str
+) -> None:
+    """Verify that project-summaries only returns summaries for projects the user
+    has permission to see, consistent with GET /projects behaviour."""
+    allowed_project = "allowed-project"
+    forbidden_project = "forbidden-project"
+    _create_project(client, allowed_project)
+    _create_project(client, forbidden_project)
+
+    services.api.crud.Pipelines().list_pipelines = unittest.mock.Mock(
+        return_value=(0, None, [])
+    )
+
+    # mock alert activations logic as it requires MySQL-specific logic not supported by SQLite.
+    framework.utils.singletons.db.SQLDB._calculate_alert_activations_counters = (
+        unittest.mock.Mock(
+            return_value=(
+                {},
+                {},
+                {},
+                {},
+            )
+        )
+    )
+
+    await services.api.crud.Projects().refresh_project_resources_counters_cache(db)
+
+    # Mock filter_projects_by_permissions to only allow one project.
+    # The filter branch is always entered when the request is not from the leader,
+    # which is the case for regular user requests (projects_role is None).
+    framework.utils.auth.verifier.AuthVerifier().filter_projects_by_permissions = (
+        unittest.mock.AsyncMock(return_value=[allowed_project])
+    )
+
+    response = client.get("project-summaries")
+    assert response.status_code == HTTPStatus.OK.value
+    project_summaries_output = mlrun.common.schemas.ProjectSummariesOutput(
+        **response.json()
+    )
+    returned_names = [s.name for s in project_summaries_output.project_summaries]
+    assert returned_names == [allowed_project]
+    assert forbidden_project not in returned_names
 
 
 def test_delete_project_deletion_strategy_check(
@@ -767,14 +1295,15 @@ def test_project_with_invalid_node_selector(
     _assert_project_response(project, response)
 
 
-# leader format is only relevant to follower mode
-@pytest.mark.parametrize("project_member_mode", ["follower"], indirect=True)
 def test_list_projects_leader_format(
     db: Session, client: TestClient, project_member_mode: str
 ) -> None:
     """
     See list_projects in follower.py for explanation on the rationality behind the leader format
     """
+    # leader format is only relevant to follower mode
+    if project_member_mode != "follower":
+        pytest.skip("leader format is only relevant to follower mode")
     # create some projects in the db (mocking projects left there from before when leader format was used)
     project_names = []
     for _ in range(5):
@@ -804,6 +1333,72 @@ def test_list_projects_leader_format(
         )
         == {}
     )
+
+
+def test_get_project_returns_status_columns(
+    db: Session, client: TestClient, project_member_mode: str
+) -> None:
+    # Verify state/op_id/phase/updated_at on the response are sourced from the model columns,
+    # so a follower polling for sync state never sees a value drifted from the pickled full_object.
+    name = f"prj-{uuid4().hex}"
+    framework.utils.singletons.db.get_db().create_project(
+        db,
+        mlrun.common.schemas.Project(
+            metadata=mlrun.common.schemas.ProjectMetadata(name=name),
+        ),
+    )
+    op_id = uuid4()
+    # SQLite drops tzinfo on DateTime round-trip — store naive UTC so equality holds without DB-specific shims.
+    updated_at = datetime.datetime.utcnow().replace(microsecond=0)
+    record = db.query(Project).filter(Project.name == name).one()
+    record.state = "creating"
+    record.op_id = op_id
+    record.phase = 1
+    record.updated_at = updated_at
+    db.commit()
+
+    response = client.get(f"projects/{name}")
+    assert response.status_code == HTTPStatus.OK.value
+    status = response.json()["status"]
+    assert status["state"] == "creating"
+    assert status["op_id"] == str(op_id)
+    assert status["phase"] == 1
+    assert datetime.datetime.fromisoformat(status["updated_at"]) == updated_at
+
+
+def test_list_projects_filter_updated_after(
+    db: Session, client: TestClient, project_member_mode: str
+) -> None:
+    old_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=2)
+    recent_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+    name_old = f"old-{uuid4().hex}"
+    name_recent = f"recent-{uuid4().hex}"
+
+    for name, ts in [(name_old, old_at), (name_recent, recent_at)]:
+        framework.utils.singletons.db.get_db().create_project(
+            db,
+            mlrun.common.schemas.Project(
+                metadata=mlrun.common.schemas.ProjectMetadata(name=name),
+            ),
+        )
+        record = db.query(Project).filter(Project.name == name).one()
+        record.updated_at = ts
+        db.commit()
+
+    cutoff = (
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=30)
+    ).isoformat()
+    response = client.get(
+        "projects",
+        params={
+            "format": mlrun.common.formatters.ProjectFormat.name_only,
+            "updated_after": cutoff,
+        },
+    )
+    assert response.status_code == HTTPStatus.OK.value
+    returned = set(response.json()["projects"])
+    assert name_recent in returned
+    assert name_old not in returned
 
 
 def test_projects_crud(
@@ -1139,6 +1734,68 @@ def test_delete_project_fail_fast(
             )
 
 
+@pytest.mark.parametrize("delete_api_version", ["v1", "v2"])
+@pytest.mark.parametrize(
+    "requester_username, expect_permission_check",
+    [
+        ("project-owner", False),
+        ("someone-else", True),
+    ],
+)
+def test_delete_project_owner_short_circuits_opa_check(
+    unversioned_client: TestClient,
+    mock_project_follower_iguazio_client,
+    mocked_k8s_helper,
+    monkeypatch: pytest.MonkeyPatch,
+    delete_api_version: str,
+    requester_username: str,
+    expect_permission_check: bool,
+) -> None:
+    """When the requester is the project owner, both delete endpoints must skip
+    the OPA permission query and prime the owner cache. Non-owners still go
+    through query_project_permissions and never prime the cache.
+    """
+    owner_username = "project-owner"
+    project = mlrun.common.schemas.Project(
+        metadata=mlrun.common.schemas.ProjectMetadata(name="owned-project"),
+        spec=mlrun.common.schemas.ProjectSpec(owner=owner_username),
+    )
+    response = unversioned_client.post("v1/projects", json=project.dict())
+    assert response.status_code == HTTPStatus.CREATED.value
+
+    auth_verifier = framework.utils.auth.verifier.AuthVerifier()
+    query_project_permissions = AsyncMock()
+    add_allowed_project_for_owner = Mock()
+    monkeypatch.setattr(
+        auth_verifier, "query_project_permissions", query_project_permissions
+    )
+    monkeypatch.setattr(
+        auth_verifier, "add_allowed_project_for_owner", add_allowed_project_for_owner
+    )
+
+    response = unversioned_client.delete(
+        f"{delete_api_version}/projects/{project.metadata.name}",
+        headers={mlrun.common.schemas.HeaderNames.remote_user: requester_username},
+    )
+    assert response.status_code in (
+        HTTPStatus.NO_CONTENT.value,
+        HTTPStatus.ACCEPTED.value,
+    )
+
+    if expect_permission_check:
+        query_project_permissions.assert_awaited_once_with(
+            project.metadata.name,
+            mlrun.common.schemas.AuthorizationAction.delete,
+            unittest.mock.ANY,
+        )
+        add_allowed_project_for_owner.assert_not_called()
+    else:
+        query_project_permissions.assert_not_awaited()
+        add_allowed_project_for_owner.assert_called_once_with(
+            project.metadata.name, unittest.mock.ANY
+        )
+
+
 def test_project_image_builder_validation(
     db: Session,
     client: TestClient,
@@ -1261,10 +1918,10 @@ def _create_resources_of_all_kinds(
                 function["spec"]["index"] = index
                 functions_hashes.append(
                     db.store_function(
-                        db_session,
-                        function,
-                        function_name,
-                        project,
+                        session=db_session,
+                        function=function,
+                        name=function_name,
+                        project=project,
                         tag=function_tag,
                         versioned=True,
                     )
@@ -1295,8 +1952,8 @@ def _create_resources_of_all_kinds(
                     artifact_uids.append(
                         db.store_artifact(
                             db_session,
-                            artifact_key,
-                            artifact,
+                            key=artifact_key,
+                            artifact=artifact,
                             iter=artifact_iter,
                             tag=artifact_tag,
                             project=project,
@@ -1304,6 +1961,33 @@ def _create_resources_of_all_kinds(
                         )
                     )
 
+    # Create child artifacts
+    parent_artifact_db = Artifact.from_dict(
+        db.read_artifact(
+            db_session,
+            key=artifact_keys[0],
+            tag=artifact_tags[0],
+            iter=0,
+            project=project,
+        )
+    )
+    artifact = copy.deepcopy(artifact_template)
+    artifact["metadata"]["iter"] = 0
+    artifact["metadata"]["tag"] = "child"
+    artifact["metadata"]["tree"] = "some_tree_child"
+    artifact["spec"]["parent_uri"] = parent_artifact_db.uri
+
+    artifact_uids.append(
+        db.store_artifact(
+            db_session,
+            key="child_artifact_key",
+            artifact=artifact,
+            iter=0,
+            tag="some_tree_child",
+            project=project,
+            producer_id="some_tree_child",
+        )
+    )
     # Create several runs
     run = {
         "bla": "blabla",
@@ -1441,6 +2125,9 @@ def _create_resources_of_all_kinds(
         name="task",
         project=project,
         state=mlrun.common.schemas.BackgroundTaskState.running,
+        labels={
+            BackGroundTaskLabel.pipeline: "test_pipeline",
+        },
     )
 
     ds_profile = mlrun.common.schemas.DatastoreProfile(
@@ -1551,6 +2238,7 @@ def _assert_db_resources_in_project(
         # Logs are saved as files, the DB table is not really in use
         # in follower mode the DB project tables are irrelevant
         # alert_templates are not tied to project and are pre-populated anyway
+        # background_task_labels are optional
         if (
             cls.__name__ == "User"
             or cls.__tablename__ == "runs_tags"
@@ -1593,6 +2281,10 @@ def _assert_db_resources_in_project(
                 or (
                     # TimeWindowTracker is not a project-level table
                     cls.__name__ == "TimeWindowTracker"
+                )
+                or (
+                    # TablePartitionInterval is not a project-level table
+                    cls.__name__ == "TablePartitionInterval"
                 )
             ):
                 continue
@@ -1673,6 +2365,13 @@ def _assert_db_resources_in_project(
                     .filter(ModelEndpoint.project == project)
                     .count()
                 )
+            if cls.__tablename__ == "background_task_labels":
+                number_of_cls_records = (
+                    db_session.query(BackGroundTaskLabel)
+                    .join(cls)
+                    .filter(BackGroundTaskLabel.project == project)
+                    .count()
+                )
             if cls.__tablename__ == "artifacts_labels":
                 # Artifact table is deprecated, we are using ArtifactV2 instead
                 continue
@@ -1685,19 +2384,19 @@ def _assert_db_resources_in_project(
                 "You excluded an object from the regular handling but forgot to add special handling"
             )
         if assert_no_resources:
-            assert (
-                number_of_cls_records == 0
-            ), f"Table {cls.__tablename__} records were found"
+            assert number_of_cls_records == 0, (
+                f"Table {cls.__tablename__} records were found"
+            )
         else:
-            assert (
-                number_of_cls_records > 0
-            ), f"Table {cls.__tablename__} records were not found"
+            assert number_of_cls_records > 0, (
+                f"Table {cls.__tablename__} records were not found"
+            )
         table_name_records_count_map[cls.__tablename__] = number_of_cls_records
     return table_name_records_count_map
 
 
 def _list_project_names_and_assert(
-    client: TestClient, expected_names: list[str], params: Optional[dict] = None
+    client: TestClient, expected_names: list[str], params: dict | None = None
 ):
     params = params or {}
     params["format"] = mlrun.common.formatters.ProjectFormat.name_only
@@ -1719,7 +2418,7 @@ def _list_project_names_and_assert(
 def _assert_project_response(
     expected_project: mlrun.common.schemas.Project,
     response,
-    extra_exclude: Optional[dict] = None,
+    extra_exclude: dict | None = None,
 ):
     project = mlrun.common.schemas.Project(**response.json())
     _assert_project(expected_project, project, extra_exclude)
@@ -1734,6 +2433,10 @@ def _assert_project_summary(
     runs_failed_recent_count: int,
     runs_running_count: int,
     pipelines_running_count: int,
+    real_time_model_endpoint_count: int,
+    batch_model_endpoints_count: int,
+    running_model_monitoring_functions: int,
+    failed_model_monitoring_functions: int,
 ):
     assert project_summary.files_count == files_count
     assert project_summary.feature_sets_count == feature_sets_count
@@ -1742,12 +2445,24 @@ def _assert_project_summary(
     assert project_summary.runs_failed_recent_count == runs_failed_recent_count
     assert project_summary.runs_running_count == runs_running_count
     assert project_summary.pipelines_running_count == pipelines_running_count
+    assert (
+        project_summary.real_time_model_endpoint_count == real_time_model_endpoint_count
+    )
+    assert project_summary.batch_model_endpoint_count == batch_model_endpoints_count
+    assert (
+        project_summary.running_model_monitoring_functions
+        == running_model_monitoring_functions
+    )
+    assert (
+        project_summary.failed_model_monitoring_functions
+        == failed_model_monitoring_functions
+    )
 
 
 def _assert_project(
     expected_project: mlrun.common.schemas.Project,
     project: mlrun.common.schemas.Project,
-    extra_exclude: Optional[dict] = None,
+    extra_exclude: dict | None = None,
 ):
     exclude = {"id": ..., "metadata": {"created"}, "status": {"state"}}
     if extra_exclude:
@@ -1797,55 +2512,197 @@ def _create_feature_sets(client: TestClient, project_name, feature_sets_count):
             assert response.status_code == HTTPStatus.OK.value, response.json()
 
 
-def _create_functions(client: TestClient, project_name, functions_count):
+def _create_model_endpoint(
+    client: TestClient, project_name, model_endpoint_count, endpoint_type, suffix=""
+):
+    for index in range(model_endpoint_count):
+        model_endpoint_name = f"model-endpoint-name-{suffix}-{index}"
+        model_endpoint = {
+            "metadata": {
+                "name": model_endpoint_name,
+                "project": project_name,
+                "endpoint_type": endpoint_type,
+            },
+            "spec": {},
+            "status": {},
+        }
+        response = client.post(
+            f"projects/{project_name}/model-endpoints",
+            json=model_endpoint,
+            params={"creation-strategy": "inplace"},
+        )
+        assert response.status_code == HTTPStatus.CREATED.value, response.json()
+
+
+def _create_batch_and_real_time_model_endpoints(
+    client: TestClient,
+    project_name,
+    real_time_model_endpoint_count,
+    batch_model_endpoints_count,
+):
+    _create_model_endpoint(
+        client=client,
+        project_name=project_name,
+        model_endpoint_count=real_time_model_endpoint_count,
+        endpoint_type=EndpointType.NODE_EP,
+        suffix="real-time",
+    )
+    _create_model_endpoint(
+        client=client,
+        project_name=project_name,
+        model_endpoint_count=batch_model_endpoints_count,
+        endpoint_type=EndpointType.BATCH_EP,
+        suffix="batch",
+    )
+
+
+def _generate_runtime(name) -> mlrun.runtimes.ServingRuntime:
+    runtime = mlrun.runtimes.ServingRuntime()
+    runtime.metadata.name = name
+    return runtime
+
+
+def _create_functions(
+    client: TestClient,
+    project_name,
+    functions_count,
+    suffix="",
+    labels=None,
+    state=None,
+):
     for index in range(functions_count):
-        function_name = f"function-name-{index}"
-        # create several versions of the same function to verify we're not counting all versions, just all functions
-        # (unique name)
-        for _ in range(3):
-            function = {
-                "metadata": {"name": function_name, "project": project_name},
-                "spec": {"some_field": str(uuid4())},
-            }
-            response = client.post(
-                FUNCTIONS_API.format(project=project_name, name=function_name),
-                json=function,
-                params={"versioned": True},
-            )
-            assert response.status_code == HTTPStatus.OK.value, response.json()
+        function_name = f"function-name-{suffix}-{index}"
+        func = _generate_runtime(function_name)
+        if labels:
+            func.metadata.labels = labels
+        if state:
+            func.status.state = state
+        params = {"versioned": False}
+        response = client.post(
+            FUNCTIONS_API.format(project=project_name, name=function_name),
+            json=func.to_dict(),
+            params=params,
+        )
+        assert response.status_code == HTTPStatus.OK.value, response.json()
+
+
+def _create_running_and_failed_model_monitoring_functions(
+    client: TestClient,
+    project_name,
+    running_model_monitoring_functions,
+    failed_model_monitoring_functions,
+):
+    labels = {ModelMonitoringAppLabel.KEY: ModelMonitoringAppLabel.VAL}
+    _create_functions(
+        client=client,
+        project_name=project_name,
+        functions_count=running_model_monitoring_functions,
+        suffix="running",
+        labels=labels,
+        state=mlrun.common.schemas.FunctionState.ready,
+    )
+    _create_functions(
+        client=client,
+        project_name=project_name,
+        functions_count=failed_model_monitoring_functions,
+        suffix="failed",
+        labels=labels,
+        state=mlrun.common.schemas.FunctionState.error,
+    )
+
+
+def _create_run(
+    client: TestClient,
+    project_name: str,
+    run_uid: str,
+    run_name: str,
+    kind: str,
+    state: str | None = None,
+    start_time: datetime.datetime | None = None,
+    parameters: dict | None = None,
+    iteration: int | None = None,
+):
+    """Helper function to create a single run."""
+    run = {
+        "kind": kind,
+        "metadata": {
+            "name": run_name,
+            "uid": run_uid,
+            "project": project_name,
+        },
+    }
+
+    if parameters:
+        run["spec"] = {"parameters": parameters}
+
+    if state or start_time:
+        run["status"] = {}
+        if state:
+            run["status"]["state"] = state
+        if start_time:
+            run["status"]["start_time"] = start_time.isoformat()
+
+    url = f"projects/{project_name}/runs/{run_uid}"
+    if iteration:
+        url += f"?iter={iteration}"
+
+    response = client.post(url, json=run)
+    assert response.status_code == HTTPStatus.OK.value, response.json()
 
 
 def _create_runs(
     client: TestClient, project_name, runs_count, state=None, start_time=None
 ):
+    """Create multiple runs with the same name (3 instances each)."""
     for index in range(runs_count):
         run_name = f"run-name-{str(uuid4())}"
-        # create several runs of the same name to verify we're not counting all instances, just all unique run names
+        # create several runs of the same name to verify we're counting all instances
         for _ in range(3):
             run_uid = str(uuid4())
-            run = {
-                "kind": mlrun.artifacts.model.ModelArtifact.kind,
-                "metadata": {
-                    "name": run_name,
-                    "uid": run_uid,
-                    "project": project_name,
-                },
-            }
-            if state:
-                run["status"] = {
-                    "state": state,
-                }
-            if start_time:
-                run.setdefault("status", {})["start_time"] = start_time.isoformat()
-            response = client.post(f"run/{project_name}/{run_uid}", json=run)
-            assert response.status_code == HTTPStatus.OK.value, response.json()
+            _create_run(
+                client=client,
+                project_name=project_name,
+                run_uid=run_uid,
+                run_name=run_name,
+                kind=mlrun.artifacts.model.ModelArtifact.kind,
+                state=state,
+                start_time=start_time,
+            )
+    # Total runs created: runs_count * 3
+
+
+def _create_hyperparam_runs(
+    client: TestClient,
+    project_name: str,
+    param_name: str,
+    values: list,
+    state: str,
+    start_time: datetime.datetime | None = None,
+    iteration_start: int = 1,
+):
+    """Create hyperparameter runs with different parameter values."""
+    for i, val in enumerate(values, start=iteration_start):
+        run_uid = str(uuid4())
+        run_name = f"hp-{param_name}-{val}"
+
+        _create_run(
+            client=client,
+            project_name=project_name,
+            run_uid=run_uid,
+            run_name=run_name,
+            kind="job",
+            state=state,
+            start_time=start_time,
+            parameters={param_name: val},
+            iteration=i,
+        )
 
 
 def _create_schedule(
     client: TestClient,
     project_name,
     cron_trigger: mlrun.common.schemas.ScheduleCronTrigger,
-    labels: Optional[dict] = None,
+    labels: dict | None = None,
 ):
     if not labels:
         labels = {}

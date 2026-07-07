@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import base64
 import copy
 import json
@@ -19,6 +19,7 @@ import os
 import unittest.mock
 
 import deepdiff
+import kubernetes.client as k8s_client
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -35,6 +36,22 @@ import services.api.utils.builder
 from framework.utils.singletons.db import get_db
 from services.api.tests.unit.conftest import APIK8sSecretsMock
 from services.api.tests.unit.runtimes.base import TestRuntimeBase
+
+
+def create_node_affinity_with_terms(
+    terms: list[list[k8s_client.V1NodeSelectorRequirement]],
+) -> k8s_client.V1Affinity:
+    """Helper function to create a V1Affinity with specific node selector terms."""
+    return k8s_client.V1Affinity(
+        node_affinity=k8s_client.V1NodeAffinity(
+            required_during_scheduling_ignored_during_execution=k8s_client.V1NodeSelector(
+                node_selector_terms=[
+                    k8s_client.V1NodeSelectorTerm(match_expressions=term)
+                    for term in terms
+                ]
+            )
+        )
+    )
 
 
 class TestKubejobRuntime(TestRuntimeBase):
@@ -162,7 +179,12 @@ class TestKubejobRuntime(TestRuntimeBase):
         }
         runtime.with_node_selection(node_selector=node_selector)
         self.execute_function(runtime)
-        self._assert_pod_creation_config(expected_node_selector=node_selector)
+        self._assert_pod_creation_config(
+            expected_node_selector={
+                **mlrun.mlconf.get_default_function_node_selector(),
+                **node_selector,
+            }
+        )
 
         runtime = self._generate_runtime()
         affinity = self._generate_affinity()
@@ -220,12 +242,14 @@ class TestKubejobRuntime(TestRuntimeBase):
             assert pod.spec.node_name is None
 
         if affinity:
-            assert pod.spec.affinity == affinity
+            assert pod.spec.affinity == mlrun.k8s_utils.sanitize_k8s_objects(affinity)
         else:
             assert pod.spec.affinity is None
 
         if tolerations:
-            assert pod.spec.tolerations == tolerations
+            assert pod.spec.tolerations == mlrun.k8s_utils.sanitize_k8s_objects(
+                tolerations
+            )
         else:
             assert pod.spec.tolerations is None
 
@@ -339,6 +363,275 @@ class TestKubejobRuntime(TestRuntimeBase):
         self.execute_function(runtime)
         self._assert_pod_creation_config(
             expected_node_selector=expected_merged_selector
+        )
+
+    # Common Preemptible Affinity Terms
+    preemptible_affinity_iguazio = [
+        [
+            k8s_client.V1NodeSelectorRequirement(
+                key="app.iguazio.com/lifecycle", operator="In", values=["preemptible"]
+            )
+        ]
+    ]
+
+    preemptible_affinity_cloud_provider = [
+        [
+            k8s_client.V1NodeSelectorRequirement(
+                key="cloud.google.com/gke-spot", operator="In", values=["true"]
+            )
+        ]
+    ]
+
+    @staticmethod
+    def mock_preemptible_config():
+        """Fixture to set up mock preemptible configurations before each test."""
+        mlrun.mlconf.preemptible_nodes.node_selector = base64.b64encode(
+            json.dumps(
+                {
+                    "app.iguazio.com/lifecycle": "preemptible",
+                    "cloud.google.com/gke-spot": "true",
+                }
+            ).encode("utf-8")
+        )
+        mlrun.mlconf.preemptible_nodes.tolerations = base64.b64encode(
+            json.dumps(
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    }
+                ]
+            ).encode("utf-8")
+        )
+
+    @pytest.mark.parametrize(
+        "mode, tolerations, node_selector, affinity, expected_tolerations, expected_node_selector, expected_affinity",
+        [
+            # Mode "none" – no change.
+            (
+                "none",
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                    {
+                        "key": "some-key",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                ],
+                {
+                    "user-node-selector": "some-value",
+                    "cloud.google.com/gke-spot": "true",
+                },
+                {},
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                    {
+                        "key": "some-key",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                ],
+                {
+                    "user-node-selector": "some-value",
+                    "cloud.google.com/gke-spot": "true",
+                },
+                {},
+            ),
+            # Mode "prevent" – preemptible settings are removed, affinity is cleared.
+            (
+                "prevent",
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                    {
+                        "key": "some-key",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                ],
+                {
+                    "app.iguazio.com/lifecycle": "preemptible",
+                    "some-node-selector": "some-value",
+                },
+                create_node_affinity_with_terms(preemptible_affinity_iguazio),
+                [
+                    {
+                        "key": "some-key",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                ],
+                {"some-node-selector": "some-value"},
+                None,
+            ),
+            # Mode "constrain" – preemptible toleration is merged, affinity is set to preemptible.
+            (
+                "constrain",
+                [],
+                {"user-node-selector": "some-value"},
+                None,
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    },
+                ],
+                {"user-node-selector": "some-value"},
+                create_node_affinity_with_terms(
+                    preemptible_affinity_iguazio + preemptible_affinity_cloud_provider
+                ),
+            ),
+            # Mode "allow" – conflicting node selector settings are purged.
+            (
+                "allow",
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                {
+                    "user-node-selector": "some-value",
+                    "app.iguazio.com/lifecycle": "preemptible",
+                },
+                create_node_affinity_with_terms(
+                    preemptible_affinity_iguazio + preemptible_affinity_cloud_provider
+                ),
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                {
+                    "user-node-selector": "some-value",
+                    "app.iguazio.com/lifecycle": "preemptible",
+                },
+                create_node_affinity_with_terms(
+                    preemptible_affinity_iguazio + preemptible_affinity_cloud_provider
+                ),
+            ),
+            # Mode "allow" with no preemptible toleration.
+            (
+                "allow",
+                [],
+                {"user-node-selector": "some-value"},
+                None,
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                {"user-node-selector": "some-value"},
+                None,
+            ),
+            # Mode "prevent" without initial tolerations.
+            (
+                "prevent",
+                [],
+                {
+                    "user-node-selector": "some-value",
+                    "app.iguazio.com/lifecycle": "preemptible",
+                },
+                None,
+                [],
+                {"user-node-selector": "some-value"},
+                None,
+            ),
+            # Mode "constrain" with tolerations already set.
+            (
+                "constrain",
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                {"user-node-selector": "some-value"},
+                None,
+                [
+                    {
+                        "key": "cloud.google.com/gke-spot",
+                        "value": "true",
+                        "operator": "Equal",
+                        "effect": "NoSchedule",
+                    }
+                ],
+                {"user-node-selector": "some-value"},
+                create_node_affinity_with_terms(
+                    preemptible_affinity_iguazio + preemptible_affinity_cloud_provider
+                ),
+            ),
+            # Mode "none" with no tolerations or selectors provided.
+            (
+                "none",
+                [],
+                {},
+                None,
+                [],
+                {},
+                None,
+            ),
+        ],
+    )
+    def test_merge_preemption_mode(
+        self,
+        db: Session,
+        k8s_secrets_mock,
+        mode,
+        tolerations,
+        node_selector,
+        affinity,
+        expected_tolerations,
+        expected_node_selector,
+        expected_affinity,
+    ):
+        self.mock_preemptible_config()
+        runtime = self._generate_runtime()
+        runtime.spec.preemption_mode = mode
+
+        runtime.with_node_selection(
+            node_selector=node_selector,
+            tolerations=tolerations,
+            affinity=affinity,
+        )
+
+        self.execute_function(runtime)
+        self._assert_pod_creation_config(
+            expected_node_selector=expected_node_selector,
+            expected_affinity=expected_affinity,
+            expected_tolerations=expected_tolerations,
         )
 
     def test_set_annotation(self, db: Session, k8s_secrets_mock):
@@ -721,7 +1014,7 @@ def my_func(context):
 
         assert runtime.spec.build.base_image == "mlrun/mlrun"
 
-        runtime.build_config(commands=["python -m pip install numpy"])
+        runtime.build_config(commands=["python -m pip install numpy"], overwrite=False)
         expected_commands = [
             "python -m pip install pandas",
             "python -m pip install numpy",
@@ -735,9 +1028,7 @@ def my_func(context):
             == {}
         )
 
-        runtime.build_config(
-            commands=["python -m pip install scikit-learn"], overwrite=True
-        )
+        runtime.build_config(commands=["python -m pip install scikit-learn"])
         expected_commands = ["python -m pip install scikit-learn"]
         assert (
             deepdiff.DeepDiff(
@@ -771,7 +1062,7 @@ def my_func(context):
             == {}
         )
 
-        runtime.build_config(requirements=["scikit-learn"], overwrite=True)
+        runtime.build_config(requirements=["scikit-learn"])
         expected_requirements = ["scikit-learn"]
         assert (
             deepdiff.DeepDiff(
@@ -822,7 +1113,8 @@ def my_func(context):
             (True, [], True),
             (False, ["some command"], False),
             (False, ["python -m pip install pip"], False),
-            (True, ["python -m pip install --upgrade pip~=22.0"], False),
+            # when user asks for a specific pip version, we don't upgrade it
+            (True, ["python -m pip install --upgrade pip~=25.0"], False),
             (True, ["python -m pip install --upgrade pandas"], True),
         ],
     )
@@ -1152,6 +1444,30 @@ def my_func(context):
             mlconf.function.spec.state_thresholds.default.pending_scheduled
         )
         assert run["spec"]["state_thresholds"] == expected_state_thresholds
+
+    def test_generate_default_runtime_env(self):
+        runtime = self._generate_runtime()
+
+        runobj = mlrun.model.RunObject.from_dict(
+            {
+                "metadata": {"name": "job", "project": self.project},
+            }
+        )
+
+        env, external_source_env = runtime._generate_runtime_env(runobj)
+
+        assert env["MLRUN_ACTIVE_PROJECT"] == self.project
+        assert not deepdiff.DeepDiff(
+            json.loads(env["MLRUN_EXEC_CONFIG"]), runobj.to_dict()
+        )
+        assert env["MLRUN_NAMESPACE"] == mlrun.mlconf.namespace
+
+        assert external_source_env["MLRUN_RUNTIME_KIND"] is not None
+
+        # TODO: Remove this assertion in 1.12.0
+        # Ensure that the MLRUN_DEFAULT_PROJECT env var is also injected into the runtime environment for
+        # backward compatibility
+        assert env["MLRUN_DEFAULT_PROJECT"] == self.project
 
     @staticmethod
     def _assert_build_commands(expected_commands, runtime):

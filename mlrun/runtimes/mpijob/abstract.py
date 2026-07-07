@@ -13,8 +13,8 @@
 # limitations under the License.
 import abc
 import os
-from typing import Optional
 
+import mlrun.errors
 from mlrun.config import config
 from mlrun.runtimes.kubejob import KubejobRuntime
 from mlrun.runtimes.pod import KubeResourceSpec
@@ -53,8 +53,13 @@ class MPIResourceSpec(KubeResourceSpec):
         tolerations=None,
         preemption_mode=None,
         security_context=None,
-        clone_target_dir=None,
         state_thresholds=None,
+        serving_spec=None,
+        graph=None,
+        parameters=None,
+        track_models=None,
+        env_from=None,
+        mount_otlp_secret: bool = False,
     ):
         super().__init__(
             command=command,
@@ -68,6 +73,7 @@ class MPIResourceSpec(KubeResourceSpec):
             volumes=volumes,
             volume_mounts=volume_mounts,
             env=env,
+            env_from=env_from,
             resources=resources,
             replicas=replicas,
             image_pull_policy=image_pull_policy,
@@ -83,8 +89,12 @@ class MPIResourceSpec(KubeResourceSpec):
             tolerations=tolerations,
             preemption_mode=preemption_mode,
             security_context=security_context,
-            clone_target_dir=clone_target_dir,
             state_thresholds=state_thresholds,
+            serving_spec=serving_spec,
+            graph=graph,
+            parameters=parameters,
+            track_models=track_models,
+            mount_otlp_secret=mount_otlp_secret,
         )
         self.mpi_args = mpi_args or [
             "-x",
@@ -109,6 +119,15 @@ class AbstractMPIJobRuntime(KubejobRuntime, abc.ABC):
     def spec(self, spec):
         self._spec = self._verify_dict(spec, "spec", MPIResourceSpec)
 
+    def validate(self):
+        super().validate()
+        # The MPIJob runtime is not supported on Iguazio v4 (IG4) systems, where the mpi-operator is
+        # no longer deployed. Submitting one would otherwise fail with an opaque Kubernetes 404.
+        if config.is_iguazio_v4_mode():
+            raise mlrun.errors.MLRunBadRequestError(
+                "The MPIJob runtime is not supported on this system."
+            )
+
     @staticmethod
     def _get_run_completion_updates(run: dict) -> dict:
         # TODO: add a 'workers' section in run objects state, each worker will update its state while
@@ -118,7 +137,7 @@ class AbstractMPIJobRuntime(KubejobRuntime, abc.ABC):
         return {}
 
     def with_tracing(
-        self, log_file_path: Optional[str] = None, enable_cycle_markers: bool = False
+        self, log_file_path: str | None = None, enable_cycle_markers: bool = False
     ):
         """Add Horovod Timeline activity tracking to the job to analyse
         its performance.
@@ -150,11 +169,11 @@ class AbstractMPIJobRuntime(KubejobRuntime, abc.ABC):
 
     def with_autotune(
         self,
-        log_file_path: Optional[str] = None,
-        warmup_samples: Optional[int] = None,
-        steps_per_sample: Optional[int] = None,
-        bayes_opt_max_samples: Optional[int] = None,
-        gaussian_process_noise: Optional[float] = None,
+        log_file_path: str | None = None,
+        warmup_samples: int | None = None,
+        steps_per_sample: int | None = None,
+        bayes_opt_max_samples: int | None = None,
+        gaussian_process_noise: float | None = None,
     ):
         """Adds an Autotuner to help optimize Horovod's Parameters for better performance.
 

@@ -13,16 +13,17 @@
 # limitations under the License.
 import abc
 import os
-import typing
 from copy import deepcopy
 from datetime import datetime
-from typing import Optional
 
 from kubernetes import client as k8s_client
 from kubernetes.client.rest import ApiException
 from sqlalchemy.orm import Session
 
 import mlrun.common.constants as mlrun_constants
+import mlrun.common.schemas
+import mlrun.errors
+import mlrun.k8s_utils
 import mlrun.utils.regex
 from mlrun.common.runtimes.constants import RunStates, SparkApplicationStates
 from mlrun.runtimes import RuntimeClassMode, Spark3Runtime
@@ -88,6 +89,7 @@ class Spark3RuntimeHandler(KubeRuntimeHandler, abc.ABC):
         runtime: mlrun.runtimes.sparkjob.Spark3Runtime,
         run: mlrun.run.RunObject,
         execution: mlrun.execution.MLClientCtx,
+        auth_info: mlrun.common.schemas.AuthInfo = None,
     ):
         self._validate_sparkjob(runtime, run)
 
@@ -183,13 +185,17 @@ class Spark3RuntimeHandler(KubeRuntimeHandler, abc.ABC):
             ),
         )
 
-        update_in(job, "spec.volumes", runtime.spec.volumes)
-
         self.add_secrets_to_spec_before_running(
-            runtime, project_name=run.metadata.project
+            runtime,
+            project_name=run.metadata.project,
+            token_name=(run.spec.auth or {}).get("token_name"),
+            auth_info=auth_info,
         )
 
-        command, args, extra_env = self._get_cmd_args(runtime, run)
+        # Update volumes after secrets are added to ensure secret volumes are included
+        update_in(job, "spec.volumes", runtime.spec.volumes)
+
+        command, args, extra_env = self._get_cmd_args(runtime, run, auth_info=auth_info)
         code = None
         if "MLRUN_EXEC_CODE" in [e.get("name") for e in extra_env]:
             code = f"""
@@ -201,6 +207,9 @@ with ctx:
 
         update_in(job, "spec.driver.env", extra_env + runtime.spec.env)
         update_in(job, "spec.executor.env", extra_env + runtime.spec.env)
+        if runtime.spec.env_from:
+            update_in(job, "spec.driver.envFrom", runtime.spec.env_from)
+            update_in(job, "spec.executor.envFrom", runtime.spec.env_from)
         update_in(job, "spec.driver.volumeMounts", runtime.spec.volume_mounts)
         update_in(job, "spec.executor.volumeMounts", runtime.spec.volume_mounts)
         update_in(job, "spec.deps", runtime.spec.deps)
@@ -330,6 +339,7 @@ with ctx:
         self._enrich_job(runtime, job)
 
         self._enrich_node_selectors(run, runtime, job, run.metadata.project)
+        self._enrich_preemption_mode(runtime, job)
 
         if runtime.spec.command:
             if "://" not in runtime.spec.command:
@@ -348,7 +358,7 @@ with ctx:
         runtime: mlrun.runtimes.sparkjob.Spark3Runtime,
         job: dict,
         meta: k8s_client.V1ObjectMeta,
-        code: Optional[str] = None,
+        code: str | None = None,
     ):
         namespace = meta.namespace
         k8s = framework.utils.singletons.k8s.get_k8s_helper()
@@ -358,9 +368,7 @@ with ctx:
             k8s_config_map.metadata = meta
             k8s_config_map.metadata.name += "-script"
             k8s_config_map.data = {runtime.code_script: code}
-            config_map = k8s.v1api.create_namespaced_config_map(
-                namespace, k8s_config_map
-            )
+            config_map = k8s.create_configmap(namespace, k8s_config_map)
             config_map_name = config_map.metadata.name
 
             vol_src = k8s_client.V1ConfigMapVolumeSource(name=config_map_name)
@@ -379,17 +387,17 @@ with ctx:
             )
 
         try:
-            resp = k8s.crdapi.create_namespaced_custom_object(
+            resp = k8s.create_crd(
                 Spark3Runtime.group,
                 Spark3Runtime.version,
+                Spark3Runtime.plural,
                 namespace=namespace,
-                plural=Spark3Runtime.plural,
                 body=job,
             )
             name = get_in(resp, "metadata.name", "unknown")
             logger.info(f"SparkJob {name} created")
             return resp
-        except ApiException as exc:
+        except (ApiException, mlrun.errors.MLRunBaseError) as exc:
             crd = (
                 f"{Spark3Runtime.group}/{Spark3Runtime.version}/{Spark3Runtime.plural}"
             )
@@ -450,7 +458,7 @@ with ctx:
 
     def _resolve_crd_object_status_info(
         self, crd_object: dict
-    ) -> tuple[bool, Optional[datetime], Optional[str]]:
+    ) -> tuple[bool, datetime | None, str | None]:
         state = crd_object.get("status", {}).get("applicationState", {}).get("state")
         if not state:
             return False, None, None
@@ -528,7 +536,8 @@ with ctx:
             return
 
         run.setdefault("status", {})["ui_url"] = ui_url
-        db.store_run(db_session, run, uid, project)
+        run_updates = {"status.ui_url": ui_url}
+        db.update_run(db_session, updates=run_updates, uid=uid, project=project)
 
     @staticmethod
     def are_resources_coupled_to_run_object() -> bool:
@@ -561,10 +570,10 @@ with ctx:
         db_session: Session,
         namespace: str,
         deleted_resources: list[dict],
-        label_selector: Optional[str] = None,
+        label_selector: str | None = None,
         force: bool = False,
-        grace_period: Optional[int] = None,
-        resource_deletion_grace_period: typing.Optional[int] = None,
+        grace_period: int | None = None,
+        resource_deletion_grace_period: int | None = None,
     ):
         """
         Handling config maps deletion
@@ -578,7 +587,7 @@ with ctx:
             )
             uids.append(uid)
 
-        config_maps = framework.utils.singletons.k8s.get_k8s_helper().v1api.list_namespaced_config_map(
+        config_maps = framework.utils.singletons.k8s.get_k8s_helper().list_configmaps(
             namespace, label_selector=label_selector
         )
         for config_map in config_maps.items:
@@ -587,15 +596,15 @@ with ctx:
                     mlrun_constants.MLRunInternalLabels.uid, None
                 )
                 if force or uid in uids:
-                    framework.utils.singletons.k8s.get_k8s_helper().v1api.delete_namespaced_config_map(
+                    framework.utils.singletons.k8s.get_k8s_helper().delete_configmap(
                         config_map.metadata.name,
                         namespace,
                         grace_period_seconds=resource_deletion_grace_period,
                     )
                     logger.info(f"Deleted config map: {config_map.metadata.name}")
-            except ApiException as exc:
+            except (ApiException, mlrun.errors.MLRunNotFoundError) as exc:
                 # ignore error if config map is already removed
-                if exc.status != 404:
+                if isinstance(exc, ApiException) and exc.status != 404:
                     raise
 
     @staticmethod
@@ -604,9 +613,23 @@ with ctx:
         job: dict,
     ):
         if runtime.spec.priority_class_name:
+            # Spark 3.2
             verify_and_update_in(
                 job,
                 "spec.batchSchedulerOptions.priorityClassName",
+                runtime.spec.priority_class_name,
+                str,
+            )
+            # Spark 3.5
+            verify_and_update_in(
+                job,
+                "spec.driver.priorityClassName",
+                runtime.spec.priority_class_name,
+                str,
+            )
+            verify_and_update_in(
+                job,
+                "spec.executor.priorityClassName",
                 runtime.spec.priority_class_name,
                 str,
             )
@@ -657,18 +680,6 @@ with ctx:
             "spec.executor.serviceAccount",
             runtime.spec.service_account or "sparkapp",
         )
-
-        if runtime.spec.driver_tolerations:
-            update_in(job, "spec.driver.tolerations", runtime.spec.driver_tolerations)
-        if runtime.spec.executor_tolerations:
-            update_in(
-                job, "spec.executor.tolerations", runtime.spec.executor_tolerations
-            )
-
-        if runtime.spec.driver_affinity:
-            update_in(job, "spec.driver.affinity", runtime.spec.driver_affinity)
-        if runtime.spec.executor_affinity:
-            update_in(job, "spec.executor.affinity", runtime.spec.executor_affinity)
 
         if runtime.spec.monitoring:
             if (
@@ -772,6 +783,57 @@ with ctx:
                     )
                 ),
             )
+
+    def _enrich_preemption_mode(
+        self,
+        runtime: mlrun.runtimes.sparkjob.spark3job.Spark3Runtime,
+        job: dict,
+    ):
+        """
+        Enrich Spark job driver and executor specs with nodeSelector, affinity, and tolerations
+        based on the function's preemption mode.
+        """
+
+        def enrich_and_update(component: str, affinity, tolerations, preemption_mode):
+            current_node_selector = job["spec"][component].get("nodeSelector", {})
+            node_selector, enriched_tolerations, enriched_affinity = (
+                mlrun.k8s_utils.enrich_preemption_mode(
+                    preemption_mode=preemption_mode,
+                    node_selector=current_node_selector,
+                    affinity=affinity,
+                    tolerations=tolerations,
+                )
+            )
+            enriched_tolerations, enriched_affinity = (
+                mlrun.k8s_utils.sanitize_scheduling_configuration(
+                    enriched_tolerations, enriched_affinity
+                )
+            )
+
+            if enriched_tolerations:
+                update_in(job, f"spec.{component}.tolerations", enriched_tolerations)
+
+            if enriched_affinity:
+                update_in(job, f"spec.{component}.affinity", enriched_affinity)
+
+            # Only update the node selector if the preemption mode enrichment modified it.
+            # If enrichment returns the same value, avoid reapplying to prevent unnecessary updates.
+            if current_node_selector != node_selector:
+                update_in(job, f"spec.{component}.nodeSelector", node_selector)
+
+        enrich_and_update(
+            component="driver",
+            affinity=runtime.spec.driver_affinity,
+            tolerations=runtime.spec.driver_tolerations,
+            preemption_mode=runtime.spec.driver_preemption_mode,
+        )
+
+        enrich_and_update(
+            component="executor",
+            affinity=runtime.spec.executor_affinity,
+            tolerations=runtime.spec.executor_tolerations,
+            preemption_mode=runtime.spec.executor_preemption_mode,
+        )
 
     def _get_spark_version(self):
         return "3.2.3"

@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-from datetime import datetime, timezone
-from typing import Optional
 
+from datetime import UTC, datetime
+
+import deepdiff
 from pydantic.v1 import BaseModel, Extra, Field
 
 import mlrun.common.types
@@ -28,45 +28,45 @@ from mlrun.common.schemas.object import ObjectKind, ObjectSpec, ObjectStatus
 class HubObjectMetadata(BaseModel):
     name: str
     description: str = ""
-    labels: Optional[dict] = {}
-    updated: Optional[datetime]
-    created: Optional[datetime]
+    labels: dict | None = {}
+    updated: datetime | None
+    created: datetime | None
 
     class Config:
         extra = Extra.allow
 
 
-# Currently only functions are supported. Will add more in the future.
 class HubSourceType(mlrun.common.types.StrEnum):
     functions = "functions"
+    modules = "modules"
+    steps = "steps"
 
 
 # Sources-related objects
 class HubSourceSpec(ObjectSpec):
     path: str  # URL to base directory, should include schema (s3://, etc...)
     channel: str
-    credentials: Optional[dict] = {}
-    object_type: HubSourceType = Field(HubSourceType.functions, const=True)
+    credentials: dict | None = {}
 
 
 class HubSource(BaseModel):
     kind: ObjectKind = Field(ObjectKind.hub_source, const=True)
     metadata: HubObjectMetadata
     spec: HubSourceSpec
-    status: Optional[ObjectStatus] = ObjectStatus(state="created")
+    status: ObjectStatus | None = ObjectStatus(state="created")
 
-    def get_full_uri(self, relative_path):
-        return f"{self.spec.path}/{self.spec.object_type}/{self.spec.channel}/{relative_path}"
+    def get_full_uri(self, relative_path, object_type):
+        return f"{self.spec.path}/{object_type}/{self.spec.channel}/{relative_path}"
 
-    def get_catalog_uri(self):
-        return self.get_full_uri(mlrun.mlconf.hub.catalog_filename)
+    def get_catalog_uri(self, object_type):
+        return self.get_full_uri(mlrun.mlconf.hub.catalog_filename, object_type)
 
     @classmethod
     def generate_default_source(cls):
         if not mlrun.mlconf.hub.default_source.create:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         hub_metadata = HubObjectMetadata(
             name=mlrun.mlconf.hub.default_source.name,
             description=mlrun.mlconf.hub.default_source.description,
@@ -78,9 +78,21 @@ class HubSource(BaseModel):
             spec=HubSourceSpec(
                 path=mlrun.mlconf.hub.default_source.url,
                 channel=mlrun.mlconf.hub.default_source.channel,
-                object_type=HubSourceType(mlrun.mlconf.hub.default_source.object_type),
             ),
             status=ObjectStatus(state="created"),
+        )
+
+    def diff(self, another_source: "HubSource") -> dict:
+        """
+        Compare this HubSource with another one.
+        Returns a dict of differences (metadata, spec, status).
+        """
+        exclude_paths = [
+            "root['metadata']['updated']",
+            "root['metadata']['created']",
+        ]
+        return deepdiff.DeepDiff(
+            self.dict(), another_source.dict(), exclude_paths=exclude_paths
         )
 
 
@@ -94,21 +106,16 @@ class IndexedHubSource(BaseModel):
 
 # Item-related objects
 class HubItemMetadata(HubObjectMetadata):
-    source: HubSourceType = Field(HubSourceType.functions, const=True)
+    source: HubSourceType = HubSourceType.functions
     version: str
-    tag: Optional[str]
+    tag: str | None
 
     def get_relative_path(self) -> str:
-        if self.source == HubSourceType.functions:
-            # This is needed since the hub deployment script modifies the paths to use _ instead of -.
-            modified_name = self.name.replace("-", "_")
-            # Prefer using the tag if exists. Otherwise, use version.
-            version = self.tag or self.version
-            return f"{modified_name}/{version}/"
-        else:
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                f"Bad source for hub item - {self.source}"
-            )
+        # This is needed since the hub deployment script modifies the paths to use _ instead of -.
+        modified_name = self.name.replace("-", "_")
+        # Prefer using the tag if exists. Otherwise, use version.
+        version = self.tag or self.version
+        return f"{modified_name}/{version}/"
 
 
 class HubItemSpec(ObjectSpec):
@@ -127,3 +134,8 @@ class HubCatalog(BaseModel):
     kind: ObjectKind = Field(ObjectKind.hub_catalog, const=True)
     channel: str
     catalog: list[HubItem]
+
+
+class HubModuleType(mlrun.common.types.StrEnum):
+    generic = "generic"
+    monitoring_app = "monitoring_application"

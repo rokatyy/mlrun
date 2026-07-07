@@ -100,7 +100,7 @@ class NotificationPusher(_NotificationPusherBase):
     def __init__(
         self,
         runs: typing.Union[mlrun.lists.RunList, list],
-        default_params: typing.Optional[dict] = None,
+        default_params: dict | None = None,
     ):
         self._runs = runs
         self._default_params = default_params or {}
@@ -287,13 +287,29 @@ class NotificationPusher(_NotificationPusherBase):
             )
             project = run.metadata.project
             workflow_id = run.status.results.get("workflow_id", None)
-            runs.extend(Workflow.get_workflow_steps(workflow_id, project))
+            db = mlrun.get_run_db()
+            runs.extend(Workflow.get_workflow_steps(db, workflow_id, project))
 
         message = (
             self.messages.get(run.state(), "").format(resource=resource)
             + f" in project {run.metadata.project}"
             + custom_message
         )
+
+        retry_count = run.status.retry_count or 0
+        max_retries = (run.spec.retry.count or 0) if run.spec.retry else 0
+
+        # If any retries were attempted, include retry info in the final notification message.
+        # This is only shown when the final notification is sent (after success or final failure)
+        if retry_count > 0:
+            message += f"\nRetries attempted: {retry_count}"
+            if (
+                run.state() == runtimes_constants.RunStates.error
+                and retry_count >= max_retries
+            ):
+                message += (
+                    "\nRetry limit reached - run has failed after all retry attempts."
+                )
 
         severity = (
             notification_object.severity
@@ -331,7 +347,7 @@ class NotificationPusher(_NotificationPusherBase):
                 run_uid=run.metadata.uid,
             )
             update_notification_status_kwargs["sent_time"] = datetime.datetime.now(
-                tz=datetime.timezone.utc
+                tz=datetime.UTC
             )
         except Exception as exc:
             logger.warning(
@@ -381,7 +397,7 @@ class NotificationPusher(_NotificationPusherBase):
                 run_uid=run.metadata.uid,
             )
             update_notification_status_kwargs["sent_time"] = datetime.datetime.now(
-                tz=datetime.timezone.utc
+                tz=datetime.UTC
             )
 
         except Exception as exc:
@@ -409,9 +425,9 @@ class NotificationPusher(_NotificationPusherBase):
         project: str,
         notification: mlrun.model.Notification,
         run_state: runtimes_constants.RunStates,
-        status: typing.Optional[str] = None,
-        sent_time: typing.Optional[datetime.datetime] = None,
-        reason: typing.Optional[str] = None,
+        status: str | None = None,
+        sent_time: datetime.datetime | None = None,
+        reason: str | None = None,
     ):
         # Skip update the notification state if the following conditions are met:
         # 1. the run is not in a terminal state
@@ -457,7 +473,7 @@ class NotificationPusher(_NotificationPusherBase):
 
 
 class CustomNotificationPusher(_NotificationPusherBase):
-    def __init__(self, notification_types: typing.Optional[list[str]] = None):
+    def __init__(self, notification_types: list[str] | None = None):
         notifications = {
             notification_type: notification_module.NotificationTypes(
                 notification_type
@@ -474,12 +490,17 @@ class CustomNotificationPusher(_NotificationPusherBase):
             for notification_type, notification in notifications.items()
             if notification.is_async
         }
+        self._server_notifications = []
 
     @property
     def notifications(self):
         notifications = self._sync_notifications.copy()
         notifications.update(self._async_notifications)
         return notifications
+
+    @property
+    def server_notifications(self):
+        return self._server_notifications
 
     def push(
         self,
@@ -488,7 +509,7 @@ class CustomNotificationPusher(_NotificationPusherBase):
             mlrun.common.schemas.NotificationSeverity, str
         ] = mlrun.common.schemas.NotificationSeverity.INFO,
         runs: typing.Union[mlrun.lists.RunList, list] = None,
-        custom_html: typing.Optional[str] = None,
+        custom_html: str | None = None,
     ):
         def sync_push():
             for notification_type, notification in self._sync_notifications.items():
@@ -510,7 +531,15 @@ class CustomNotificationPusher(_NotificationPusherBase):
     def add_notification(
         self,
         notification_type: str,
-        params: typing.Optional[dict[str, str]] = None,
+        params: dict[str, str] | None = None,
+        name: str | None = None,
+        message: str | None = None,
+        severity: mlrun.common.schemas.notification.NotificationSeverity = (
+            mlrun.common.schemas.notification.NotificationSeverity.INFO
+        ),
+        when: list[str] | None = None,
+        condition: str | None = None,
+        secret_params: dict[str, str] | None = None,
     ):
         if notification_type not in [
             notification_module.NotificationTypes.console,
@@ -518,6 +547,17 @@ class CustomNotificationPusher(_NotificationPusherBase):
         ]:
             # We want that only the console and ipython notifications will be notified by the client.
             # The rest of the notifications will be notified by the BE.
+            self._server_notifications.append(
+                mlrun.model.Notification(
+                    kind=notification_type,
+                    name=name,
+                    message=message,
+                    severity=severity,
+                    when=when or runtimes_constants.RunStates.notification_states(),
+                    params=params,
+                    secret_params=secret_params,
+                )
+            )
             return
 
         if notification_type in self._async_notifications:
@@ -546,7 +586,7 @@ class CustomNotificationPusher(_NotificationPusherBase):
             logger.warning(f"No notification of type {notification_type} in project")
 
     def edit_notification(
-        self, notification_type: str, params: typing.Optional[dict[str, str]] = None
+        self, notification_type: str, params: dict[str, str] | None = None
     ):
         self.remove_notification(notification_type)
         self.add_notification(notification_type, params)
@@ -577,7 +617,7 @@ class CustomNotificationPusher(_NotificationPusherBase):
     def push_pipeline_start_message(
         self,
         project: str,
-        pipeline_id: typing.Optional[str] = None,
+        pipeline_id: str | None = None,
     ):
         db = mlrun.get_run_db()
         db.push_run_notifications(pipeline_id, project)
@@ -585,20 +625,17 @@ class CustomNotificationPusher(_NotificationPusherBase):
     def push_pipeline_start_message_from_client(
         self,
         project: str,
-        commit_id: typing.Optional[str] = None,
-        pipeline_id: typing.Optional[str] = None,
-        has_workflow_url: bool = False,
+        commit_id: str | None = None,
+        pipeline_id: str | None = None,
     ):
-        html, message = self.generate_start_message(
-            commit_id, has_workflow_url, pipeline_id, project
-        )
+        html, message = self.generate_start_message(commit_id, pipeline_id, project)
         self.push(message, "info", custom_html=html)
 
     def push_pipeline_run_results(
         self,
         runs: typing.Union[mlrun.lists.RunList, list],
         push_all: bool = False,
-        state: typing.Optional[str] = None,
+        state: str | None = None,
     ):
         """
         push a structured table with run results to notification targets
@@ -624,9 +661,7 @@ class CustomNotificationPusher(_NotificationPusherBase):
             text += f", state={state}"
         self.push(text, "info", runs=runs_list)
 
-    def generate_start_message(
-        self, commit_id=None, has_workflow_url=None, pipeline_id=None, project=None
-    ):
+    def generate_start_message(self, commit_id=None, pipeline_id=None, project=None):
         message = f"Workflow started in project {project}"
         if pipeline_id:
             message += f" id={pipeline_id}"
@@ -635,7 +670,7 @@ class CustomNotificationPusher(_NotificationPusherBase):
         )
         if commit_id:
             message += f", commit={commit_id}"
-        if has_workflow_url:
+        if pipeline_id is not None:
             url = mlrun.utils.helpers.get_workflow_url(project, pipeline_id)
         else:
             url = mlrun.utils.helpers.get_runs_url(project)

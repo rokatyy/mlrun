@@ -17,6 +17,7 @@ import typing
 from os.path import exists, isdir
 from urllib.parse import urlparse
 
+import mlrun.artifacts.helpers
 import mlrun.common.schemas.artifact
 import mlrun.config
 import mlrun.utils.regex
@@ -37,11 +38,13 @@ from .base import (
     DirArtifact,
     LinkArtifact,
 )
+from .code import CodeArtifact
 from .dataset import (
     DatasetArtifact,
     TableArtifact,
 )
 from .document import DocumentArtifact
+from .llm_prompt import LLMPromptArtifact
 from .model import ModelArtifact
 from .plots import (
     PlotArtifact,
@@ -59,6 +62,8 @@ artifact_types = {
     "dataset": DatasetArtifact,
     "plotly": PlotlyArtifact,
     "document": DocumentArtifact,
+    "llm-prompt": LLMPromptArtifact,
+    "code": CodeArtifact,
 }
 
 
@@ -107,11 +112,6 @@ class ArtifactProducer:
 
 def dict_to_artifact(struct: dict) -> Artifact:
     kind = struct.get("kind", "")
-
-    # TODO: remove this in 1.8.0
-    if mlrun.utils.is_legacy_artifact(struct):
-        return mlrun.artifacts.base.convert_legacy_artifact_to_new_format(struct)
-
     artifact_class = artifact_types[kind]
     return artifact_class.from_dict(struct)
 
@@ -221,7 +221,12 @@ class ArtifactManager:
         else:
             key = item.key
             target_path = target_path or item.target_path
-
+        if isinstance(item, ModelArtifact) and item.model_url:
+            if upload:
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "log_artifact of ModelArtifact does not accept arguments for both upload and model_url parameters"
+                )
+            upload = False
         validate_artifact_key_name(key, "artifact.key")
         validate_inline_artifact_body_size(item.spec.inline)
         src_path = local_path or item.src_path  # TODO: remove src_path
@@ -262,6 +267,10 @@ class ArtifactManager:
         item.iter = producer.iteration
         project = project or producer.project
         item.project = project
+        if item.spec.parent_uri:
+            mlrun.artifacts.helpers.check_artifact_parent(
+                artifact_project=item.project, expected_parent_uri=item.spec.parent_uri
+            )
         if is_retained_producer:
             # if the producer is retained, we want to use the original target path
             target_path = target_path or item.target_path
@@ -331,7 +340,7 @@ class ArtifactManager:
         self.artifact_uris[item.key] = item.uri
         self._log_to_db(item.db_key, producer.project, producer.inputs, item)
 
-    def _log_to_db(self, key, project, sources, item, tag=None) -> typing.Optional[str]:
+    def _log_to_db(self, key, project, sources, item, tag=None) -> str | None:
         """
         log artifact to db
         :param key: Identifying key of the artifact.
@@ -396,13 +405,13 @@ class ArtifactManager:
         deletion_strategy: mlrun.common.schemas.artifact.ArtifactsDeletionStrategies = (
             mlrun.common.schemas.artifact.ArtifactsDeletionStrategies.metadata_only
         ),
-        secrets: typing.Optional[dict] = None,
+        secrets: dict | None = None,
     ):
         self.artifact_db.del_artifact(
             key=item.db_key,
             project=item.project,
-            tag=item.tag,
             tree=item.tree,
+            uid=item.uid,
             iter=item.iter,
             deletion_strategy=deletion_strategy,
             secrets=secrets,

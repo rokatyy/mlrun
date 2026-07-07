@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -71,7 +71,7 @@ def my_job(context, p1=1, p2="x"):
 
 
 if __name__ == "__main__":
-    context = get_or_create_ctx("train")
+    context = get_or_create_ctx("train", project="test-project")
     p1 = context.get_param("p1", 1)
     p2 = context.get_param("p2", "a-string")
     my_job(context, p1, p2)

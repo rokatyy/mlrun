@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
 import http
 import unittest.mock
-from typing import Optional
 
 import deepdiff
 import fastapi.testclient
@@ -464,7 +463,7 @@ def _mock_runtime_handlers_delete_resources(
     def _assert_delete_resources_label_selector(
         db,
         db_session,
-        label_selector: Optional[str] = None,
+        label_selector: str | None = None,
         force: bool = False,
         grace_period: int = mlrun.mlconf.runtime_resources_deletion_grace_period,
     ):

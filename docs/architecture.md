@@ -2,11 +2,7 @@
 <a id="architecture"></a>
 # MLRun architecture
 
-MLRun started as a community effort to map the different components in the ML project lifecycle, provide a common metadata layer, and automate the operationalization process (a.k.a MLOps).
- 
-Instead of a siloed, complex, and manual process, MLRun enables production pipeline design using a modular strategy, 
-where the different parts contribute to a continuous, automated, and far simpler path from research and development to scalable 
-production pipelines without refactoring code, adding glue logic, or spending significant efforts on data and ML engineering. **MLRun simplifies and accelerates the time to production.**
+Instead of a siloed, complex, and manual process, MLRun enables production pipeline design using a modular strategy, where the different parts contribute to a continuous, automated, and far simpler path from research and development to scalable production pipelines without refactoring code, adding glue logic, or spending significant efforts on data and ML engineering. **MLRun simplifies and accelerates the time to production.**
 
 MLRun uses **Serverless Function** technology: write the code once, using your preferred development environment and 
 simple "local" semantics, and then run it as-is on different platforms and at scale. MLRun automates the build process, execution, 
@@ -28,7 +24,7 @@ MLRun has two main components, the service and the client (SDK):
 <p align="center"><img src="_static/images/mlrun-cluster.png" alt="mlrun-flow" width="700"/></p><br>
 
 
-## MLRun: an integrated and open approach
+## MLRun an integrated and open approach
 
 Data preparation, model development, model and application delivery, and end to end monitoring are tightly connected: 
 they cannot be managed in silos. This is where MLRun AI orchestration comes in. Gen AI, ML, data, and DevOps/MLOps teams 
@@ -43,3 +39,11 @@ While each component in MLRun is independent, the integration provides much grea
 
 When one of the components detailed above is updated, it immediately impacts the feature generation, the model serving pipeline, and the monitoring. MLRun applies versioning to each component, as well as versioning and rolling upgrades across components.
 
+## MLRun non-root user support
+
+By default, MLRun assigns the root user to MLRun runtimes and pods. You can improve the security context by changing the security mode, which is implemented by Iguazio during installation, and applied system-wide:
+
+- **Override**: Use the user id of the user that triggered the current run or use the nogroupid for group id. Requires Iguazio v3.5.1 and higher.
+- **Disabled**: Security context is not auto applied (the system applies the root user). (default)
+
+See also {ref}`images-usage`.

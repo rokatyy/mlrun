@@ -1,13 +1,19 @@
 (project-setup)=
 # MLRun project bootstrapping with `project_setup.py`
 
-## Overview
-
 The `project_setup.py` script in MLRun automates project initialization and configuration, facilitating seamless setup of MLRun projects by registering functions, workflows, Git sources, Docker images, and more. It ensures consistency by registering and updating all functions and workflows within the project.
 
-Upon loading an MLRun project via {py:meth}`~mlrun.projects.get_or_create_project` or {py:meth}`~mlrun.projects.load_project`, the system automatically invokes the `project_setup.py` script.
+**In this section**
+- [Overview](#overview)
+- [Format](#format)
+- [Example usage](#example-usage)
+- [Common operations](#common-operations)
 
-**Note:** Ensure the script resides in the root of the project context.
+## Overview
+
+```{Admonition} Note
+Ensure that the script resides in the root of the project context.
+```
 
 ```python
 import mlrun
@@ -25,8 +31,7 @@ The `project_setup.py` script returns the updated MLRun project after applying t
 def setup(project: mlrun.projects.MlrunProject) -> mlrun.projects.MlrunProject:
     # ... (setup configurations)
 
-    # Save and return the project:
-    project.save()
+    # Return the project
     return project
 ```
 
@@ -89,8 +94,7 @@ def setup(project: mlrun.projects.MlrunProject) -> mlrun.projects.MlrunProject:
     # MLRun Workflows - note that paths are relative to the project context (./src)
     project.set_workflow("main", "workflows/main_workflow.py")
 
-    # Save and return the project:
-    project.save()
+    # Return the project
     return project
 ```
 
@@ -125,7 +129,7 @@ project.set_source(source, pull_at_runtime=True)
 ### Export Project to Zip File Archive
 Export the local project directory contents to a zip file archive. Use this in conjunction with setting the project source for rapid iteration without requiring a Git commit for each change. See {py:meth}`~mlrun.projects.MlrunProject.set_source` and {py:meth}`~mlrun.projects.MlrunProject.export` for more info.
 
-**Note:** This requires using the Iguazio `v3io` data layer or some `s3` compliant object storage such as `minio`.
+**Note:** This requires using the Iguazio `v3io` data layer or some `s3` compliant object storage such as `seaweedFS`.
 
 ```python
 source = project.get_param("source")  # v3io:///bigdata/my_project.zip

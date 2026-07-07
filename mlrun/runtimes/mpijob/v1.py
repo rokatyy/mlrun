@@ -48,8 +48,13 @@ class MPIV1ResourceSpec(MPIResourceSpec):
         tolerations=None,
         preemption_mode=None,
         security_context=None,
-        clone_target_dir=None,
         state_thresholds=None,
+        serving_spec=None,
+        graph=None,
+        parameters=None,
+        track_models=None,
+        env_from=None,
+        mount_otlp_secret: bool = False,
     ):
         super().__init__(
             command=command,
@@ -63,6 +68,7 @@ class MPIV1ResourceSpec(MPIResourceSpec):
             volumes=volumes,
             volume_mounts=volume_mounts,
             env=env,
+            env_from=env_from,
             resources=resources,
             replicas=replicas,
             image_pull_policy=image_pull_policy,
@@ -79,8 +85,12 @@ class MPIV1ResourceSpec(MPIResourceSpec):
             tolerations=tolerations,
             preemption_mode=preemption_mode,
             security_context=security_context,
-            clone_target_dir=clone_target_dir,
             state_thresholds=state_thresholds,
+            serving_spec=serving_spec,
+            graph=graph,
+            parameters=parameters,
+            track_models=track_models,
+            mount_otlp_secret=mount_otlp_secret,
         )
         self.clean_pod_policy = clean_pod_policy or MPIJobV1CleanPodPolicies.default()
 

@@ -12,19 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 MLRUN_VERSION ?= unstable
+MLRUN_GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
 MLRUN_DOCKER_REGISTRY ?=
 MLRUN_DOCKER_REPO ?= mlrun
 MLRUN_DOCKER_TAG ?= $(shell echo "$(MLRUN_VERSION)" | sed -E 's/\+/\-/g')
 MLRUN_DOCKER_IMAGE_PREFIX := $(if $(MLRUN_DOCKER_REGISTRY),$(strip $(MLRUN_DOCKER_REGISTRY))$(MLRUN_DOCKER_REPO),$(MLRUN_DOCKER_REPO))
 
-GO_VERSION=$(shell grep -m1 'go ' go.work | awk '{split($$2,a,"."); print a[1] "." a[2]}')
+GO_VERSION=$(shell grep -m1 'go ' go.mod | awk '{split($$2,a,"."); print a[1] "." a[2]}')
 GOPATH ?= $(shell go env GOPATH)
 OS_NAME = $(shell uname)
 KUBECONFIG := $(if $(KUBECONFIG),$(KUBECONFIG),$(HOME)/.kube/config)
 
 CI_BIN_DIR=$(shell pwd)/.bin
-GO_WORKSPACES ?= $(shell go work edit -json | jq -c -r '[.Use[].DiskPath] | map_values("./" + . + "/...")[]')
 DOCKER_IMAGES = log-collector
+LOG_COLLECTOR_IMAGE_NAME := $(MLRUN_DOCKER_IMAGE_PREFIX)/log-collector:$(MLRUN_DOCKER_TAG)
+DEFAULT_IMAGES += $(LOG_COLLECTOR_IMAGE_NAME)
+
+GOLANGCI_LINT_VERSION := 2.12.1
+GOLANGCI_LINT_BIN := $(CI_BIN_DIR)/golangci-lint
+GOLANGCI_LINT_INSTALL_COMMAND := GOBIN=$(CI_BIN_DIR) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v$(GOLANGCI_LINT_VERSION)
+
+GOTESTSUM_VERSION = v1.13.0
+GOTESTSUM_BIN := $(CI_BIN_DIR)/gotestsum-$(GOTESTSUM_VERSION)
 
 #
 # Build
@@ -37,23 +46,30 @@ build: docker-images
 docker-images: compile-schemas $(DOCKER_IMAGES)
 	@echo Built $(DOCKER_IMAGES)
 
+.PHONY: print-docker-images
+print-docker-images:
+	@for image in $(DEFAULT_IMAGES); do \
+		echo $$image ; \
+	done
+
 .PHONY: log-collector
 log-collector: compile-schemas
 	@echo Building log-collector image
 	docker build \
-		--file services/log-collector/cmd/logcollector/docker/Dockerfile \
+		--file services/logcollector/cmd/docker/Dockerfile \
 		--build-arg GO_VERSION=$(GO_VERSION) \
-		--tag $(MLRUN_DOCKER_IMAGE_PREFIX)/log-collector:$(MLRUN_DOCKER_TAG) \
+		--build-arg MLRUN_GIT_COMMIT=$(MLRUN_GIT_COMMIT) \
+		--tag $(LOG_COLLECTOR_IMAGE_NAME) \
 		.
 
 .PHONY: push-log-collector
 push-log-collector:
 	@echo Pushing log-collector image
-	docker push $(MLRUN_DOCKER_IMAGE_PREFIX)/log-collector:$(MLRUN_DOCKER_TAG)
+	docker push $(LOG_COLLECTOR_IMAGE_NAME)
 
 .PHONY: pull-log-collector
 pull-log-collector:
-	docker pull $(MLRUN_DOCKER_IMAGE_PREFIX)/log-collector:$(MLRUN_DOCKER_TAG)
+	docker pull $(LOG_COLLECTOR_IMAGE_NAME)
 
 .PHONY: schemas-compiler
 schemas-compiler:
@@ -78,13 +94,19 @@ compile-schemas-go:
 #
 # Test
 #
+
+$(GOTESTSUM_BIN):
+	@echo "$(YELLOW)Installing gotestsum $(GOTESTSUM_VERSION)...$(NC)"
+	GOBIN=$(CI_BIN_DIR) go install gotest.tools/gotestsum@$(GOTESTSUM_VERSION) && \
+    mv $(CI_BIN_DIR)/gotestsum $(GOTESTSUM_BIN)
+
 .PHONY: test-unit-local
-test-unit-local: compile-schemas-local
-	go test -v -race -tags=test_unit -short $(GO_WORKSPACES)
+test-unit-local: compile-schemas-local $(GOTESTSUM_BIN)
+	$(GOTESTSUM_BIN) --format testname -- -v -race -tags=test_unit -short ./...
 
 .PHONY: test-integration-local
-test-integration-local: compile-schemas-local
-	go test -v -p 1 -race -tags=test_integration $(GO_WORKSPACES)
+test-integration-local: compile-schemas-local $(GOTESTSUM_BIN)
+	$(GOTESTSUM_BIN) --format testname -- -v -p 1 -race -tags=test_integration ./...
 
 .PHONY: test-unit-dockerized
 test-unit-dockerized: schemas-compiler
@@ -111,17 +133,23 @@ test-integration-dockerized: schemas-compiler
 # Misc
 #
 .PHONY: fmt
-fmt: ensure-golangci
+fmt: ensure-golangci compile-schemas-go
 	@echo Formatting...
 	gofmt -s -w .
-	$(CI_BIN_DIR)/golangci-lint run --fix -- $(GO_WORKSPACES)
+	$(GOLANGCI_LINT_BIN) run --fix ./...
 	@echo Done.
 
 .PHONY: lint
 lint: ensure-golangci compile-schemas-go ensure-test-files-annotated
 	@echo Linting...
-	$(CI_BIN_DIR)/golangci-lint run --verbose -- $(GO_WORKSPACES)
+	$(GOLANGCI_LINT_BIN) run --verbose ./...
 	@echo Done.
+
+.PHONY: security
+security: compile-schemas-go
+	@echo Running security checks...
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
 
 .PHONY: ensure-test-files-annotated
 ensure-test-files-annotated:
@@ -137,5 +165,13 @@ ensure-test-files-annotated:
 
 .PHONY: ensure-golangci
 ensure-golangci:
-	@test -e $(CI_BIN_DIR)/golangci-lint || \
-		(curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(CI_BIN_DIR) v1.62.2)
+	@if ! command -v $(GOLANGCI_LINT_BIN) >/dev/null 2>&1; then \
+		echo "golangci-lint not found. Installing..."; \
+		$(GOLANGCI_LINT_INSTALL_COMMAND); \
+	else \
+		installed_version=$$($(GOLANGCI_LINT_BIN) version | awk '/version/ {print $$4}' | sed 's/^v//'); \
+		if [ "$$installed_version" != "$(GOLANGCI_LINT_VERSION)" ]; then \
+			echo "golangci-lint version mismatch ($$installed_version != $(GOLANGCI_LINT_VERSION)). Reinstalling..."; \
+			$(GOLANGCI_LINT_INSTALL_COMMAND); \
+		fi \
+	fi

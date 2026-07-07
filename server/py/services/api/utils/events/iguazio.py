@@ -11,16 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
-from typing import Optional
 
 import igz_mgmt.schemas.events
 
 import mlrun.common.schemas
 from mlrun.utils import logger
 
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
 import services.api.utils.events.base as base_events
 
 PROJECT_AUTH_SECRET_CREATED = "Security.Project.AuthSecret.Created"
@@ -31,9 +29,7 @@ PROJECT_SECRET_DELETED = "Security.Project.Secret.Deleted"
 
 
 class Client(base_events.BaseEventClient):
-    def __init__(
-        self, access_key: Optional[str] = None, verbose: Optional[bool] = None
-    ):
+    def __init__(self, access_key: str | None = None, verbose: bool | None = None):
         self.access_key = (
             access_key
             or mlrun.mlconf.events.access_key
@@ -45,7 +41,7 @@ class Client(base_events.BaseEventClient):
     def emit(self, event: igz_mgmt.Event):
         try:
             logger.debug("Emitting event", event=event)
-            framework.utils.clients.iguazio.Client().emit_manual_event(
+            framework.utils.clients.iguazio.v3.Client().emit_manual_event(
                 self.access_key, event
             )
         except Exception as exc:
@@ -80,7 +76,7 @@ class Client(base_events.BaseEventClient):
         self,
         project: str,
         secret_name: str,
-        secret_keys: Optional[list[str]] = None,
+        secret_keys: list[str] | None = None,
         action: mlrun.common.schemas.SecretEventActions = mlrun.common.schemas.SecretEventActions.created,
     ) -> igz_mgmt.AuditEvent:
         """

@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import logging
 from types import ModuleType
-from typing import Any, Optional
+from typing import Any
 
 from mlrun_pipelines.common.imports import (
     dsl,
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize placeholders for KFP v2 components
 kubernetes: ModuleType = ModuleType("kubernetes")
-PipelineTask: Optional[type["PipelineTaskBase"]] = None
+PipelineTask: type["PipelineTaskBase"] | None = None
 
 
 class PipelineTaskBase:
@@ -44,8 +44,8 @@ class DummyPipelineTask(PipelineTaskBase):
         self,
         name: str,
         command: list,
-        args: Optional[list[Any]] = None,
-        file_outputs: Optional[dict[str, str]] = None,
+        args: list[Any] | None = None,
+        file_outputs: dict[str, str] | None = None,
     ) -> None:
         self.name = name
         self.command = command
@@ -72,13 +72,13 @@ try:
     Compiler = real_compiler.Compiler
     PipelineTask = real_PipelineTask
     Client = real_Client
+    kfp.Client = Client
 
 except ImportError:
     logger.warning(
         "Kubeflow Pipelines (KFP) is not installed. Using noop implementations."
     )
     from mlrun_pipelines.common.imports import (
-        Client,
         Compiler,
         compiler,
         dsl,

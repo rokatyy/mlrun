@@ -14,6 +14,7 @@
 
 import sys
 import typing
+from datetime import datetime
 
 import mlrun.common
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
@@ -24,6 +25,7 @@ BinCounts = typing.NewType("BinCounts", list[int])
 BinEdges = typing.NewType("BinEdges", list[float])
 
 _MAX_FLOAT = sys.float_info.max
+logger = mlrun.utils.create_logger(level="info", name="mm_helpers")
 
 
 def parse_model_endpoint_project_prefix(path: str, project_name: str):
@@ -36,7 +38,7 @@ def parse_model_endpoint_store_prefix(store_prefix: str):
     return endpoint, container, path
 
 
-def get_kafka_topic(project: str, function_name: typing.Optional[str] = None) -> str:
+def get_kafka_topic(project: str, function_name: str | None = None) -> str:
     if (
         function_name is None
         or function_name == mm_constants.MonitoringFunctionNames.STREAM
@@ -50,17 +52,42 @@ def get_kafka_topic(project: str, function_name: typing.Optional[str] = None) ->
     )
 
 
-def parse_monitoring_stream_path(
-    stream_uri: str, project: str, function_name: typing.Optional[str] = None
-) -> str:
-    if stream_uri.startswith("kafka://"):
-        if "?topic" in stream_uri:
-            raise mlrun.errors.MLRunValueError("Custom kafka topic is not allowed")
-        # Add topic to stream kafka uri
-        topic = get_kafka_topic(project=project, function_name=function_name)
-        stream_uri += f"?topic={topic}"
+# Constants for TimescaleDB database naming
+TIMESCALEDB_DEFAULT_DB_PREFIX = "mlrun_mm"
 
-    return stream_uri
+
+def get_tsdb_database_name(profile_database: str) -> str:
+    """
+    Determine the TimescaleDB database name based on configuration.
+
+    When auto_create_database is enabled (default), generates a database name
+    using the system_id: 'mlrun_mm_{system_id}'.
+    When disabled, uses the database from the profile as-is.
+
+    This function is used by both TimescaleDBConnector (API server side) and
+    TimescaleDBStoreyTarget (stream side) to ensure consistent database naming.
+
+    :param profile_database: The database name from the PostgreSQL profile.
+    :return: The database name to use for TimescaleDB connections.
+    :raises MLRunInvalidArgumentError: If auto_create_database is enabled but
+                                       system_id is not set.
+    """
+    auto_create = mlrun.mlconf.model_endpoint_monitoring.tsdb.auto_create_database
+
+    if not auto_create:
+        return profile_database
+
+    # Auto-create mode: generate database name using system_id
+    if not mlrun.mlconf.system_id:
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            "system_id is not set in mlrun.mlconf. "
+            "TimescaleDB requires system_id for auto-generating database name "
+            "when auto_create_database is enabled. "
+            "Either set system_id in MLRun configuration or disable auto_create_database "
+            "and provide an explicit database in the PostgreSQL connection string."
+        )
+
+    return f"{TIMESCALEDB_DEFAULT_DB_PREFIX}_{mlrun.mlconf.system_id}"
 
 
 def _get_counts(hist: Histogram) -> BinCounts:
@@ -100,3 +127,86 @@ def pad_features_hist(feature_stats: FeatureStats) -> None:
     for feature in feature_stats.values():
         if hist_key in feature:
             pad_hist(Histogram(feature[hist_key]))
+
+
+def get_model_endpoints_creation_task_status(
+    server,
+) -> tuple[
+    mlrun.common.schemas.BackgroundTaskState,
+    datetime | None,
+    set[str] | None,
+]:
+    background_task = None
+    background_task_state = mlrun.common.schemas.BackgroundTaskState.running
+    background_task_check_timestamp = None
+    model_endpoint_uids = None
+    try:
+        background_task = mlrun.get_run_db().get_project_background_task(
+            server.project, server.model_endpoint_creation_task_name
+        )
+        background_task_check_timestamp = mlrun.utils.now_date()
+        log_background_task_state(
+            server, background_task.status.state, background_task_check_timestamp
+        )
+        background_task_state = background_task.status.state
+    except mlrun.errors.MLRunNotFoundError:
+        logger.warning(
+            "Model endpoint creation task not found listing model endpoints",
+            project=server.project,
+            task_name=server.model_endpoint_creation_task_name,
+        )
+    if background_task is None:
+        if model_endpoints := mlrun.get_run_db().list_model_endpoints(
+            project=server.project,
+            function_name=server.function_name,
+            function_tag=server.function_tag,
+            tsdb_metrics=False,
+        ):
+            model_endpoint_uids = {
+                endpoint.metadata.uid for endpoint in model_endpoints.endpoints
+            }
+            logger.info(
+                "Model endpoints found after background task not found, model monitoring will monitor "
+                "events",
+                project=server.project,
+                function_name=server.function_name,
+                function_tag=server.function_tag,
+                uids=model_endpoint_uids,
+            )
+            background_task_state = mlrun.common.schemas.BackgroundTaskState.succeeded
+        else:
+            logger.warning(
+                "Model endpoints not found after background task not found, model monitoring will not "
+                "monitor events",
+                project=server.project,
+                function_name=server.function_name,
+                function_tag=server.function_tag,
+            )
+            background_task_state = mlrun.common.schemas.BackgroundTaskState.failed
+    return background_task_state, background_task_check_timestamp, model_endpoint_uids
+
+
+def log_background_task_state(
+    server,
+    background_task_state: mlrun.common.schemas.BackgroundTaskState,
+    background_task_check_timestamp: datetime | None,
+):
+    logger.info(
+        "Checking model endpoint creation task status",
+        task_name=server.model_endpoint_creation_task_name,
+    )
+    if (
+        background_task_state
+        in mlrun.common.schemas.BackgroundTaskState.terminal_states()
+    ):
+        logger.info(
+            f"Model endpoint creation task completed with state {background_task_state}"
+        )
+    else:  # in progress
+        logger.info(
+            f"Model endpoint creation task is still in progress with the current state: "
+            f"{background_task_state}. Events will not be monitored for the next "
+            f"{mlrun.mlconf.model_endpoint_monitoring.model_endpoint_creation_check_period} seconds",
+            function_name=server.function_name,
+            background_task_check_timestamp=background_task_check_timestamp.isoformat(),
+        )

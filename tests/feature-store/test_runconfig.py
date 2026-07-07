@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import pathlib
 
 import mlrun
@@ -25,9 +25,9 @@ def test_none_config():
     fn = RunConfig().to_function("serving", "x/y")
     assert fn.kind == "serving"
     assert fn.spec.image == "x/y"
-    assert (
-        fn.spec.build.functionSourceCode
-    ), "serving source is empty (should have footer)"
+    assert fn.spec.build.functionSourceCode, (
+        "serving source is empty (should have footer)"
+    )
 
     fn = RunConfig(image="a/b").to_function("job", "x/y")
     assert fn.kind == "job"

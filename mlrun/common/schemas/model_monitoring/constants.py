@@ -16,7 +16,6 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Optional
 
 import mlrun.common.constants
 import mlrun.common.helpers
@@ -34,6 +33,7 @@ class ModelEndpointSchema(MonitoringStrEnum):
     UID = "uid"
     PROJECT = "project"
     ENDPOINT_TYPE = "endpoint_type"
+    MODE = "mode"
     NAME = "name"
     CREATED = "created"
     UPDATED = "updated"
@@ -42,12 +42,10 @@ class ModelEndpointSchema(MonitoringStrEnum):
     # spec
     FUNCTION_NAME = "function_name"
     FUNCTION_TAG = "function_tag"
-    FUNCTION_UID = "function_uid"
     MODEL_NAME = "model_name"
-    MODEL_DB_KEY = "model_db_key"
-    MODEL_TAG = "model_tag"
+    MODEL_TAGS = "model_tags"
+    MODEL_PATH = "model_path"
     MODEL_CLASS = "model_class"
-    MODEL_UID = "model_uid"
     FEATURE_NAMES = "feature_names"
     LABEL_NAMES = "label_names"
     FEATURE_STATS = "feature_stats"
@@ -144,6 +142,22 @@ class EventFieldType:
     EFFECTIVE_SAMPLE_COUNT = "effective_sample_count"
 
 
+class StreamProcessingEvent:
+    MODEL = "model"
+    MODEL_CLASS = "model_class"
+    MICROSEC = "microsec"
+    WHEN = "when"
+    ERROR = "error"
+    ENDPOINT_ID = "endpoint_id"
+    SAMPLING_PERCENTAGE = "sampling_percentage"
+    EFFECTIVE_SAMPLE_COUNT = "effective_sample_count"
+    LABELS = "labels"
+    FUNCTION_URI = "function_uri"
+    REQUEST = "request"
+    RESPONSE = "resp"
+    METRICS = "metrics"
+
+
 class FeatureSetFeatures(MonitoringStrEnum):
     LATENCY = EventFieldType.LATENCY
     METRICS = EventFieldType.METRICS
@@ -163,6 +177,7 @@ class ApplicationEvent:
     END_INFER_TIME = "end_infer_time"
     ENDPOINT_ID = "endpoint_id"
     ENDPOINT_NAME = "endpoint_name"
+    ENDPOINT_UPDATED = "endpoint_updated"
 
 
 class WriterEvent(MonitoringStrEnum):
@@ -180,6 +195,10 @@ class WriterEventKind(MonitoringStrEnum):
     RESULT = "result"
     STATS = "stats"
 
+    @classmethod
+    def user_app_outputs(cls):
+        return [cls.METRIC, cls.RESULT]
+
 
 class ControllerEvent(MonitoringStrEnum):
     KIND = "kind"
@@ -190,14 +209,26 @@ class ControllerEvent(MonitoringStrEnum):
     FIRST_REQUEST = "first_request"
     FEATURE_SET_URI = "feature_set_uri"
     ENDPOINT_TYPE = "endpoint_type"
+
+    # first_timestamp and last_timestamp are used to batch completed events
+    FIRST_TIMESTAMP = "first_timestamp"
+    LAST_TIMESTAMP = "last_timestamp"
+
     ENDPOINT_POLICY = "endpoint_policy"
     # Note: currently under endpoint policy we will have a dictionary including the keys: "application_names"
-    # and "base_period"
+    # "base_period", and "updated_endpoint" stand for when the MEP was updated
+
+
+class ControllerEventEndpointPolicy(MonitoringStrEnum):
+    BASE_PERIOD = "base_period"
+    MONITORING_APPLICATIONS = "monitoring_applications"
+    ENDPOINT_UPDATED = "endpoint_updated"
 
 
 class ControllerEventKind(MonitoringStrEnum):
     NOP_EVENT = "nop_event"
     REGULAR_EVENT = "regular_event"
+    BATCH_COMPLETE = "batch_complete"
 
 
 class MetricData(MonitoringStrEnum):
@@ -224,6 +255,49 @@ class StatsKind(MonitoringStrEnum):
     DRIFT_MEASURES = "drift_measures"
 
 
+class OTelMonitoringAttribute(MonitoringStrEnum):
+    """Attribute keys exported on OTel metric events for model-monitoring
+    application results / metrics.
+
+    Dot-separated naming follows the OpenTelemetry semantic-conventions
+    convention. ``project``, ``app.name``, ``function.name``,
+    ``endpoint.uid``, ``endpoint.name`` are shared by every entry in a
+    batch. ``result.name``, ``result.kind`` and ``result.status`` apply only
+    to entries coming from a :class:`ModelMonitoringApplicationResult`;
+    ``metric.name`` applies only to entries coming from a
+    :class:`ModelMonitoringApplicationMetric`.
+    """
+
+    PROJECT = "project"
+    APP_NAME = "app.name"
+    FUNCTION_NAME = "function.name"
+    ENDPOINT_UID = "endpoint.uid"
+    ENDPOINT_NAME = "endpoint.name"
+    RESULT_NAME = "result.name"
+    RESULT_KIND = "result.kind"
+    RESULT_STATUS = "result.status"
+    METRIC_NAME = "metric.name"
+
+
+class OTelMonitoringMetricName(MonitoringStrEnum):
+    """OTel instrument names for model-monitoring application outputs.
+
+    One fixed instrument name covers all results and another covers all
+    metrics; the specific result/metric name is carried as the
+    ``result.name`` / ``metric.name`` attribute (see
+    :class:`OTelMonitoringAttribute`) rather than being encoded in the
+    instrument name. This keeps every result under one metric family
+    (exported as ``mlrun_model_monitoring_result``) so dashboards and queries
+    can filter and aggregate by the ``result_name`` label instead of matching
+    a distinct per-result metric name, and bounds the number of OTel
+    instruments to two regardless of how many result/metric names a project
+    produces.
+    """
+
+    RESULT = "mlrun.model_monitoring.result"
+    METRIC = "mlrun.model_monitoring.metric"
+
+
 class EventLiveStats:
     LATENCY_AVG_5M = "latency_avg_5m"
     LATENCY_AVG_1H = "latency_avg_1h"
@@ -240,19 +314,14 @@ class EventKeyMetrics:
     REAL_TIME = "real_time"
 
 
-class ModelEndpointTarget(MonitoringStrEnum):
-    V3IO_NOSQL = "v3io-nosql"
-    SQL = "sql"
-
-
 class TSDBTarget(MonitoringStrEnum):
     V3IO_TSDB = "v3io-tsdb"
-    TDEngine = "tdengine"
+    TimescaleDB = "postgresql"
 
 
-class DefaultProfileName(StrEnum):
-    STREAM = "mm-infra-stream"
-    TSDB = "mm-infra-tsdb"
+class StreamTarget(MonitoringStrEnum):
+    V3IO = "v3io"
+    KAFKA = "kafka"
 
 
 class ProjectSecretKeys:
@@ -274,17 +343,6 @@ class GetEventsFormat(MonitoringStrEnum):
     INTERSECTION = "intersection"
 
 
-class ModelEndpointTargetSchemas(MonitoringStrEnum):
-    V3IO = "v3io"
-    MYSQL = "mysql"
-    SQLITE = "sqlite"
-
-
-class ModelMonitoringStoreKinds:
-    ENDPOINTS = "endpoints"
-    EVENTS = "events"
-
-
 class FileTargetKind:
     ENDPOINTS = "endpoints"
     EVENTS = "events"
@@ -297,6 +355,8 @@ class FileTargetKind:
     MONITORING_APPLICATION = "monitoring_application"
     ERRORS = "errors"
     STATS = "stats"
+    PARQUET_STATS = "parquet_stats"
+    LAST_REQUEST = "last_request"
 
 
 class ModelMonitoringMode(StrEnum):
@@ -304,21 +364,57 @@ class ModelMonitoringMode(StrEnum):
     disabled = "disabled"
 
 
+class ScheduleChiefFields(StrEnum):
+    LAST_REQUEST = "last_request"
+    LAST_ANALYZED = "last_analyzed"
+
+
 class EndpointType(IntEnum):
     NODE_EP = 1  # end point that is not a child of a router
     ROUTER = 2  # endpoint that is router
     LEAF_EP = 3  # end point that is a child of a router
     BATCH_EP = 4  # endpoint that is representing an offline batch endpoint
+    USER_EP = 5  # user-defined endpoint, not backed by a deployed function
 
     @classmethod
     def top_level_list(cls):
-        return [cls.NODE_EP, cls.ROUTER, cls.BATCH_EP]
+        return [cls.NODE_EP, cls.ROUTER, cls.BATCH_EP, cls.USER_EP]
+
+
+class EndpointMode(IntEnum):
+    REAL_TIME = 0
+    BATCH = 1
+    BATCH_LEGACY = 2  # legacy batch mode, used for endpoints created through the batch inference job
+
+
+class NuclioMonitoringEnvVars(MonitoringStrEnum):
+    """Environment variable names injected into nuclio/application functions when track_models=True."""
+
+    MODEL_MONITORING_URL = "MODEL_MONITORING_URL"
+    MODEL_ENDPOINT_UID = "MODEL_ENDPOINT_UID"
+    MODEL_ENDPOINT_NAME = "MODEL_ENDPOINT_NAME"
+    MODEL_ENDPOINTS_MAP = "MODEL_ENDPOINTS_MAP"
+
+
+class MonitoringHTTPPayload(MonitoringStrEnum):
+    """Field names for the HTTP ingest payload POSTed to the stream pod."""
+
+    MODEL_ENDPOINT_UID = "model_endpoint_uid"
+    MODEL_ENDPOINT_NAME = "model_endpoint_name"
+    TIMESTAMP = "timestamp"  # optional
+    INPUTS = "inputs"
+    OUTPUTS = "outputs"
+    LATENCY = "latency"  # optional: inference latency in microseconds
 
 
 class MonitoringFunctionNames(MonitoringStrEnum):
     STREAM = "model-monitoring-stream"
     APPLICATION_CONTROLLER = "model-monitoring-controller"
     WRITER = "model-monitoring-writer"
+
+
+class MonitoringAlertNames(MonitoringStrEnum):
+    LAG_DETECTED = "monitoring-lag-detected"
 
 
 class V3IOTSDBTables(MonitoringStrEnum):
@@ -329,7 +425,7 @@ class V3IOTSDBTables(MonitoringStrEnum):
     PREDICTIONS = "predictions"
 
 
-class TDEngineSuperTables(MonitoringStrEnum):
+class TimescaleDBTables(MonitoringStrEnum):
     APP_RESULTS = "app_results"
     METRICS = "metrics"
     PREDICTIONS = "predictions"
@@ -340,8 +436,8 @@ class TDEngineSuperTables(MonitoringStrEnum):
 class FunctionURI:
     project: str
     function: str
-    tag: Optional[str] = None
-    hash_key: Optional[str] = None
+    tag: str | None = None
+    hash_key: str | None = None
 
     @classmethod
     def from_string(cls, function_uri):
@@ -359,7 +455,7 @@ class FunctionURI:
 @dataclass
 class VersionedModel:
     model: str
-    version: Optional[str]
+    version: str | None
 
     @classmethod
     def from_string(cls, model):
@@ -426,16 +522,20 @@ class ResultStatusApp(IntEnum):
     detected = 2
 
 
-class ModelMonitoringAppLabel:
+class ModelMonitoringLabel:
     KEY = mlrun.common.constants.MLRunInternalLabels.mlrun_type
-    VAL = "mlrun__model-monitoring-application"
+    VAL = ""
 
     def __str__(self) -> str:
         return f"{self.KEY}={self.VAL}"
 
 
-class ControllerPolicy:
-    BASE_PERIOD = "base_period"
+class ModelMonitoringAppLabel(ModelMonitoringLabel):
+    VAL = "mlrun__model-monitoring-application"
+
+
+class ModelMonitoringInfraLabel(ModelMonitoringLabel):
+    VAL = "mlrun__model-monitoring-infra"
 
 
 class HistogramDataDriftApplicationConstants:
@@ -452,9 +552,11 @@ class SpecialApps:
     MLRUN_INFRA = "mlrun-infra"
 
 
-_RESERVED_FUNCTION_NAMES = MonitoringFunctionNames.list() + [SpecialApps.MLRUN_INFRA]
+class ModelMonitoringLabels:
+    MLRUN_MODEL_MONITORING_INFRA = "mlrun-model-monitoring-infra"
 
-V3IO_MODEL_MONITORING_DB = "v3io"
+
+_RESERVED_FUNCTION_NAMES = MonitoringFunctionNames.list() + [SpecialApps.MLRUN_INFRA]
 
 
 class ModelEndpointMonitoringMetricType(StrEnum):
@@ -462,19 +564,25 @@ class ModelEndpointMonitoringMetricType(StrEnum):
     METRIC = "metric"
 
 
-_FQN_PART_PATTERN = r"[a-zA-Z0-9_-]+"
-FQN_PATTERN = (
-    rf"^(?P<project>{_FQN_PART_PATTERN})\."
-    rf"(?P<app>{_FQN_PART_PATTERN})\."
-    rf"(?P<type>{ModelEndpointMonitoringMetricType.RESULT}|{ModelEndpointMonitoringMetricType.METRIC})\."
-    rf"(?P<name>{_FQN_PART_PATTERN})$"
-)
-FQN_REGEX = re.compile(FQN_PATTERN)
-
 # refer to `mlrun.utils.regex.project_name`
-PROJECT_PATTERN = r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+_INNER_PROJECT_PATTERN = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+PROJECT_PATTERN = rf"^{_INNER_PROJECT_PATTERN}$"
 
 MODEL_ENDPOINT_ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
+
+_FQN_PART_PATTERN = r"[a-zA-Z0-9_-]+"
+_RESULT_NAME_PATTERN = r"[a-zA-Z_][a-zA-Z0-9_]*"
+
+FQN_PATTERN = (
+    rf"^(?P<project>{_INNER_PROJECT_PATTERN})\."
+    rf"(?P<app>{_FQN_PART_PATTERN})\."
+    rf"(?P<type>{ModelEndpointMonitoringMetricType.RESULT}|{ModelEndpointMonitoringMetricType.METRIC})\."
+    rf"(?P<name>{_RESULT_NAME_PATTERN})$"
+)
+FQN_REGEX = re.compile(FQN_PATTERN)
+APP_NAME_REGEX = re.compile(_FQN_PART_PATTERN)
+RESULT_NAME_REGEX = re.compile(_RESULT_NAME_PATTERN)
+
 
 INTERSECT_DICT_KEYS = {
     ModelEndpointMonitoringMetricType.METRIC: "intersect_metrics",

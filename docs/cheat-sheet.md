@@ -1,7 +1,10 @@
 (cheat-sheet)=
 # MLRun cheat sheet
 
-## Table of contents
+The cheat sheet provides simple code examples of many of MLRun's features.
+
+**In this section**
+
 - [MLRun setup](#mlrun-setup)
 - [MLRun projects](#mlrun-projects)
     - [General workflow](#general-workflow)
@@ -25,16 +28,16 @@
 - [Hyperparameter tuning](#hyperparameter-tuning)
 
 ## MLRun setup
-Docs: [Set up your client environment](./install/remote.md), [Installation and setup guide](./install.md)
+Docs: [Set up your client environment](./setup-guide.md), [Development Guide](setup-guide.md)
 
 ### MLRun server/client overview
 
 MLRun has two main components, the service and the client (SDK+UI):
-- MLRun service runs over Kubernetes (can also be deployed using local Docker for demo and test purposes) - see [installation documentation](./install.md) for more information
+- MLRun service runs over Kubernetes (can also be deployed using local Docker for demo and test purposes) - see [MLRun CE installation documentation](setup-guide.md) for more information
 - MLRun client SDK is installed in your development environment via `pip` and interacts with the service using REST API calls
 
 ### Remote connection (laptop, CI/CD, etc.)
-Docs: [Configure remote environment](./install/remote.md#configure-remote-environment)
+Docs: [Configure remote environment](./setup-guide.md#configure-remote-environment)
 
 **Localhost**: Create a `mlrun.env` file for environment variables. MLRUN_DBPATH saves the URL endpoint of the MLRun APIs 
 service endpoint. Since it is localhost, username and access_key are not required:
@@ -88,7 +91,7 @@ project.run(name="training_pipeline", arguments={...})
 ```
 
 ### Git integration
-Docs: [Create and use functions](./runtimes/create-and-use-functions.ipynb#multiple-source-files)
+Docs: [Create and use functions](./runtimes/create-and-use-functions.ipynb#create-a-function-with-multiple-source-files)
 
 An MLRun project can be backed by a Git repo. Functions consume the repo and pull the code either: once when Docker image is built (production workflow); or at runtime (development workflow).
 
@@ -153,10 +156,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Set up Python 3.9
+    - name: Set up Python 3.11
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.11'
         architecture: 'x64'
     
     - name: Install mlrun
@@ -257,7 +260,7 @@ mpijob.run()
 
 ```python
 project = mlrun.get_or_create_project("dask")
-dask = project.set_function(name="my-dask", kind="dask", image="mlrun/ml-base")
+dask = project.set_function(name="my-dask", kind="dask", image="mlrun/mlrun")
 dask.spec.remote = True
 dask.spec.replicas = 5
 dask.spec.service_type = "NodePort"
@@ -286,9 +289,48 @@ spark.with_igz_spark()
 spark.spec.replicas = 2
 
 spark.deploy()  # build image
-spark.run(artifact_path="/User")  # run spark job
+spark.run(output_path="/User")  # run spark job
 ```
 
+#### Databricks Runtime
+
+```python
+import os
+import mlrun
+
+
+def add_databricks_env(function):
+    job_env = {
+        "DATABRICKS_HOST": os.environ["DATABRICKS_HOST"],
+        "DATABRICKS_CLUSTER_ID": os.environ.get("DATABRICKS_CLUSTER_ID"),  #  optional
+    }
+
+    for name, val in job_env.items():
+        function.spec.env.append({"name": name, "value": val})
+
+
+project_name = "databricks-runtime-project"
+project = mlrun.get_or_create_project(project_name, context="./", user_project=False)
+secrets = {"DATABRICKS_TOKEN": os.environ["DATABRICKS_TOKEN"]}
+project.set_secrets(secrets)
+
+function = mlrun.code_to_function(
+    name="function-with-args",
+    kind="databricks",
+    project=project_name,
+    filename="run_etl.py",
+    image="mlrun/mlrun",
+    handler="run",
+)
+add_databricks_env(function=function)
+
+run = function.run(
+    params={
+        "param1": "value1",
+        "task_parameters": {"timeout_minutes": 15},
+    },
+)
+```
 ### Resource management
 Docs: [Managing job resources](./runtimes/configuring-job-resources.md)
 
@@ -359,14 +401,17 @@ fn.with_node_selection(node_selector={"app.iguazio.com/lifecycle": "non-preempti
 
 ### Serving/Nuclio triggers
 
-Docs: [Nuclio Triggers](https://github.com/nuclio/nuclio-jupyter/blob/development/nuclio/triggers.py)
+Docs: [Nuclio Triggers](https://github.com/nuclio/nuclio-jupyter/blob/master/nuclio/triggers.py)
+
+#### HTTP
 
 By default, Nuclio deploys a default HTTP trigger if the function doesn't have one. This is because users typically want to invoke functions through HTTP. 
 However, we provide a way to disable the default HTTP trigger using:
 `function.disable_default_http_trigger()`
 ```{admonition} Note
 
-`disable_default_http_trigger` is supported from Nuclio 1.13.1.
+- `disable_default_http_trigger` is supported from Nuclio 1.13.1.
+- RabbitMQ is supported from 
 ```
 
 Also, you can explicitly enable the default HTTP trigger creation with:
@@ -392,6 +437,23 @@ serve.add_v3io_stream_trigger(
     shards=1,
 )
 
+# RabbitMQ stream trigger
+
+function.add_rabbitmq_trigger(
+    url="amqp://rabbitmq-host:5672",
+    exchange_name="my-exchange",
+    queue_name="my-queue",
+    username="user",
+    password="pass",
+)
+# or with topics (routing keys):
+
+function.add_rabbitmq_trigger(
+    url="amqp://rabbitmq-host:5672",
+    exchange_name="my-exchange",
+    topics=["key1", "key2"],
+)
+
 # Kafka stream trigger
 serve.add_trigger(
     name="kafka",
@@ -403,6 +465,7 @@ serve.add_trigger(
         initial_offset="earliest",
     ),
 )
+
 
 # Cron trigger
 serve.add_trigger("cron_interval", spec=nuclio.CronTrigger(interval="10s"))
@@ -695,6 +758,35 @@ batch_run = project.run_function(
         "perform_drift_analysis": True,
     },
 )
+```
+### Data store profiles
+  ```python
+  from mlrun.datastore.datastore_profile import (
+      DatastoreProfileKafkaStream,
+      DatastoreProfilePostgreSQL,
+  )
+  # Create and register TSDB profile
+  tsdb_profile = DatastoreProfilePostgreSQL(
+      name=tsdb_profile_name,
+      user="postgres",
+      password="postgres",
+      host="timescaledb",
+      port=5432,
+      database="postgres",
+  )
+  project.register_datastore_profile(tsdb_profile)
+  # Create and register stream profile
+  stream_profile = DatastoreProfileKafkaStream(
+      name=stream_profile_name,
+      brokers="kafka-stream:9092",
+      topics=[],
+  )
+  project.register_datastore_profile(stream_profile)
+  # Set model monitoring credentials and enable the infrastructure
+  project.set_model_monitoring_credentials(
+      tsdb_profile_name=tsdb_profile.name,
+      stream_profile_name=stream_profile.name,
+  )
 ```
 
 ## Alerts and notifications
@@ -1042,7 +1134,7 @@ feature_service = fvec.get_online_feature_service().feature_service.get(
 ```
 
 ## Real-time pipelines
-Docs: [Real-time serving pipelines](./serving/serving-graph.md), [Real-time pipeline use cases](./serving/use-cases.md), [Graph concepts and state machine](./serving/realtime-pipelines.ipynb), [Model serving graph](./serving/model-serving-get-started.ipynb), [Writing custom steps](./serving/writing-custom-steps.ipynb)
+Docs: {ref}`serving-graph`, {ref}`basic-example`, {ref}`getting-started`, {ref}`building-graphs`, {ref}`deploying-graphs`, {ref}`demos-serving`, {ref}`advanced-graph-cfg`.
 
 ### Definitions
 
@@ -1057,7 +1149,7 @@ Graphs have two modes (topologies):
 
 ### Simple graph
 
-Docs: [Real-time serving pipelines getting started](./serving/getting-started.ipynb#getting-started)
+Docs: {ref}`basic-example`
 
 Define Python file(s) to orchestrate
 ```python
@@ -1107,7 +1199,7 @@ project.deploy_function(fn)
 
 ### Simple model serving router
 
-Docs: [Example of a simple model serving router](./serving/use-cases.md#example-of-a-simple-model-serving-router)
+Docs: [Example of a simple model serving router](./serving/getting-started.md#simple-model-serving-router)
 
 ```python
 # load the sklearn model serving function and add models to it
@@ -1125,7 +1217,7 @@ fn.invoke("/v2/models/model1/infer", body={"inputs": [5]})
 
 ### Custom model serving class
 
-Docs: [Model serving graph](./serving/model-serving-get-started.ipynb)
+Docs: {ref}`writing-custom-steps`
 
 ```python
 from cloudpickle import load
@@ -1174,7 +1266,7 @@ router.add_route("m2", class_name="ClassifierModel", model_path=path2)
 # add the final step (after the router), which handles post-processing and response to the client
 graph.add_step(class_name="Echo", name="final", after="ensemble").respond()
 ```
-![](./_static/images/graph-flow.svg)
+![](./_static/images/serving-router-graph.png)
 
 ## Hyperparameter tuning
 Docs: [Hyperparameter tuning optimization](./hyper-params.ipynb)
@@ -1250,7 +1342,7 @@ Docs: [Running the workers using Dask](./hyper-params.ipynb#running-the-workers-
 # Create Dask cluster
 project = mlrun.get_or_create_project(dask - cluster)
 dask_cluster = project.set_function(
-    name="dask-cluster", kind="dask", image="mlrun/ml-base"
+    name="dask-cluster", kind="dask", image="mlrun/mlrun"
 )
 dask_cluster.apply(mlrun.mount_v3io())  # add volume mounts
 dask_cluster.spec.service_type = "NodePort"  # open interface to the dask UI dashboard

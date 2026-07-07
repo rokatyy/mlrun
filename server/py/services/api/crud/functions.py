@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import datetime
-from typing import Optional, Union
+from typing import Union
 
 import sqlalchemy.orm
 
@@ -39,12 +38,11 @@ class Functions(
         db_session: sqlalchemy.orm.Session,
         function: dict,
         name: str,
-        project: Optional[str] = None,
+        project: str | None = None,
         tag: str = "",
         versioned: bool = False,
         auth_info: mlrun.common.schemas.AuthInfo = None,
     ) -> str:
-        project = project or mlrun.mlconf.default_project
         if auth_info:
             function_obj = mlrun.new_function(
                 name=name, project=project, runtime=function, tag=tag
@@ -53,32 +51,40 @@ class Functions(
             # intermediate steps or temporary objects which might not be executed at any phase and therefore we don't
             # want to enrich if user didn't requested.
             # (The way user will request to generate is by passing $generate in the metadata.credentials.access_key)
-            framework.api.utils.ensure_function_auth_and_sensitive_data_is_masked(
-                function_obj, auth_info, allow_empty_access_key=True
+            framework.api.utils.apply_enrichment_and_validation_on_function(
+                function=function_obj,
+                auth_info=auth_info,
+                allow_empty_access_key=True,
+                perform_auto_mount=False,
+                ensure_security_context=False,
             )
             function = function_obj.to_dict()
 
         return framework.utils.singletons.db.get_db().store_function(
-            db_session,
-            function,
-            name,
-            project,
-            tag,
-            versioned,
+            session=db_session,
+            function=function,
+            name=name,
+            project=project,
+            tag=tag,
+            versioned=versioned,
         )
 
     def get_function(
         self,
         db_session: sqlalchemy.orm.Session,
         name: str,
-        project: Optional[str] = None,
+        project: str | None = None,
         tag: str = "",
         hash_key: str = "",
-        format_: Optional[str] = None,
+        format_: str | None = None,
     ) -> dict:
-        project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().get_function(
-            db_session, name, project, tag, hash_key, format_
+            db_session,
+            name=name,
+            project=project,
+            tag=tag,
+            hash_key=hash_key,
+            format_=format_,
         )
 
     def delete_function(
@@ -94,19 +100,19 @@ class Functions(
     def list_functions(
         self,
         db_session: sqlalchemy.orm.Session,
-        project: Optional[Union[str, list[str]]] = None,
-        name: Optional[str] = None,
-        tag: Optional[str] = None,
-        kind: Optional[str] = None,
-        labels: Optional[list[str]] = None,
-        hash_key: Optional[str] = None,
-        offset: Optional[int] = None,
-        limit: Optional[int] = None,
+        project: Union[str, list[str]] | None = None,
+        name: str | None = None,
+        tag: str | None = None,
+        kind: str | None = None,
+        labels: list[str] | None = None,
+        states: list[str] | None = None,
+        hash_key: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
         format_: mlrun.common.formatters.FunctionFormat = None,
-        since: Optional[datetime.datetime] = None,
-        until: Optional[datetime.datetime] = None,
+        since: datetime.datetime | None = None,
+        until: datetime.datetime | None = None,
     ) -> list:
-        project = project or mlrun.mlconf.default_project
         if labels is None:
             labels = []
         return framework.utils.singletons.db.get_db().list_functions(
@@ -116,6 +122,7 @@ class Functions(
             tag=tag,
             kind=kind,
             labels=labels,
+            states=states or None,
             hash_key=hash_key,
             format_=format_,
             since=since,

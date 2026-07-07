@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import typing
 
@@ -24,7 +23,7 @@ class ModelEndpointFormat(ObjectFormat, mlrun.common.types.StrEnum):
     full = "full"
 
     @staticmethod
-    def format_method(_format: str) -> typing.Optional[typing.Callable]:
+    def format_method(_format: str) -> typing.Callable | None:
         return {
             ModelEndpointFormat.full: None,
         }[_format]

@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
-from typing import Optional
 
 import mlrun
 
@@ -35,8 +33,8 @@ class MLRunLoggingCallback(LoggingCallback):
     def __init__(
         self,
         context: mlrun.MLClientCtx,
-        dynamic_hyperparameters: Optional[list[str]] = None,
-        static_hyperparameters: Optional[list[str]] = None,
+        dynamic_hyperparameters: list[str] | None = None,
+        static_hyperparameters: list[str] | None = None,
         logging_frequency: int = 100,
     ):
         """

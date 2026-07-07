@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from copy import copy
-from typing import Optional
 
 import pandas as pd
 
@@ -55,7 +54,7 @@ class RunList(list):
         for run in self:
             iterations = get_in(run, "status.iterations", "")
             row = [
-                get_in(run, "metadata.project", config.default_project),
+                get_in(run, "metadata.project", config.active_project),
                 get_in(run, "metadata.uid", ""),
                 get_in(run, "metadata.iteration", ""),
                 get_in(run, "status.start_time", ""),
@@ -133,11 +132,11 @@ class RunList(list):
     def compare(
         self,
         hide_identical: bool = True,
-        exclude: Optional[list] = None,
-        show: Optional[bool] = None,
+        exclude: list | None = None,
+        show: bool | None = None,
         extend_iterations=True,
         filename=None,
-        colorscale: Optional[str] = None,
+        colorscale: str | None = None,
     ):
         """return/show parallel coordinates plot + table to compare between the list of runs
 

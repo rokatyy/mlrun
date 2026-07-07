@@ -1,8 +1,7 @@
 (auto-logging-mlops)=
 # Automated experiment tracking
 
-You can write custom training functions or use built-in hub functions for training models using 
-common open-source frameworks and/or cloud services (such as AzureML, Sagemaker, etc.). 
+You can write custom training functions or use built-in hub functions for training models using common open-source frameworks and/or cloud services (such as AzureML, Sagemaker, etc.). 
 
 Inside the ML function you can use the `apply_mlrun()` method, which automates the tracking and MLOps
 functionality.
@@ -36,3 +35,6 @@ configurations. Reading the docs of your favorite framework to get the most out 
 - [PyTorch](../api/mlrun.frameworks/mlrun.frameworks.pytorch.rst) 
 - [XGBoost](../api/mlrun.frameworks/mlrun.frameworks.xgboost.rst) 
 - [LightGBM](../api/mlrun.frameworks/mlrun.frameworks.lgbm.rst)
+
+**See also**
+- {ref}`packagers` — the packager system that powers automatic input/output handling for any MLRun function

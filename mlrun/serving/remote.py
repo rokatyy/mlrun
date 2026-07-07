@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
 import json
 from copy import copy
-from typing import Optional
+from typing import Union
 
 import aiohttp
 import requests
@@ -23,10 +23,15 @@ import storey
 from storey.flow import _ConcurrentJobExecution
 
 import mlrun
+import mlrun.common.schemas
 import mlrun.config
+import mlrun.platforms
+import mlrun.utils.async_http
+from mlrun.common.helpers import parse_versioned_object_uri
 from mlrun.errors import err_to_str
-from mlrun.utils import logger
+from mlrun.utils import dict_to_json, logger
 
+from ..config import config
 from .utils import (
     _extract_input_data,
     _update_result_body,
@@ -42,19 +47,19 @@ class RemoteStep(storey.SendToHttp):
     def __init__(
         self,
         url: str,
-        subpath: Optional[str] = None,
-        method: Optional[str] = None,
-        headers: Optional[dict] = None,
-        url_expression: Optional[str] = None,
-        body_expression: Optional[str] = None,
+        subpath: str | None = None,
+        method: str | None = None,
+        headers: dict | None = None,
+        url_expression: str | None = None,
+        body_expression: str | None = None,
         return_json: bool = True,
-        input_path: Optional[str] = None,
-        result_path: Optional[str] = None,
+        input_path: str | None = None,
+        result_path: str | None = None,
         max_in_flight=None,
         retries=None,
         backoff_factor=None,
         timeout=None,
-        headers_expression: Optional[str] = None,
+        headers_expression: str | None = None,
         **kwargs,
     ):
         """class for calling remote endpoints
@@ -73,7 +78,9 @@ class RemoteStep(storey.SendToHttp):
 
         :param url:     http(s) url or function [project/]name to call
         :param subpath: path (which follows the url), use `$path` to use the event.path
-        :param method:  HTTP method (GET, POST, ..), default to POST
+        :param method:  The HTTP method to use for the request (e.g., "GET", "POST", "PUT", "DELETE").
+                        If not provided, the step will try to use `event.method` at runtime, and if that
+                        is also missing, it defaults to `"POST"`.
         :param headers: dictionary with http header values
         :param url_expression: an expression for getting the url from the event, e.g. "event['url']"
         :param body_expression: an expression for getting the request body from the event, e.g. "event['data']"
@@ -150,8 +157,8 @@ class RemoteStep(storey.SendToHttp):
     async def _process_event(self, event):
         # async implementation (with storey)
         body = self._get_event_or_body(event)
-        method, url, headers, body = self._generate_request(event, body)
-        kwargs = {}
+        method, url, headers, body, kwargs = self._generate_request(event, body)
+        kwargs = kwargs or {}
         if self.timeout:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=self.timeout)
         try:
@@ -162,7 +169,7 @@ class RemoteStep(storey.SendToHttp):
                 text = await resp.text()
                 raise RuntimeError(f"bad http response {resp.status}: {text}")
             return resp
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             logger.error(f"http request to {url} timed out in RemoteStep {self.name}")
             raise exc
 
@@ -191,7 +198,7 @@ class RemoteStep(storey.SendToHttp):
             )
 
         body = _extract_input_data(self._input_path, event.body)
-        method, url, headers, body = self._generate_request(event, body)
+        method, url, headers, body, kwargs = self._generate_request(event, body)
         try:
             resp = self._session.request(
                 method,
@@ -200,6 +207,7 @@ class RemoteStep(storey.SendToHttp):
                 headers=headers,
                 data=body,
                 timeout=self.timeout,
+                **kwargs,
             )
         except requests.exceptions.ReadTimeout as err:
             raise requests.exceptions.ReadTimeout(
@@ -234,19 +242,19 @@ class RemoteStep(storey.SendToHttp):
             headers[event_id_key] = event.id
         if method == "GET":
             body = None
-        elif body is not None and not isinstance(body, (str, bytes)):
+        elif body is not None and not isinstance(body, str | bytes):
             if self._body_function_handler:
                 body = self._body_function_handler(body)
             body = json.dumps(body)
             headers["Content-Type"] = "application/json"
 
-        return method, url, headers, body
+        return method, url, headers, body, {}
 
     def _get_data(self, data, headers):
         if (
             self.return_json
             or headers.get("content-type", "").lower() == "application/json"
-        ) and isinstance(data, (str, bytes)):
+        ) and isinstance(data, str | bytes):
             data = json.loads(data)
         return data
 
@@ -254,15 +262,15 @@ class RemoteStep(storey.SendToHttp):
 class BatchHttpRequests(_ConcurrentJobExecution):
     def __init__(
         self,
-        url: Optional[str] = None,
-        subpath: Optional[str] = None,
-        method: Optional[str] = None,
-        headers: Optional[dict] = None,
-        url_expression: Optional[str] = None,
-        body_expression: Optional[str] = None,
+        url: str | None = None,
+        subpath: str | None = None,
+        method: str | None = None,
+        headers: dict | None = None,
+        url_expression: str | None = None,
+        body_expression: str | None = None,
         return_json: bool = True,
-        input_path: Optional[str] = None,
-        result_path: Optional[str] = None,
+        input_path: str | None = None,
+        result_path: str | None = None,
         retries=None,
         backoff_factor=None,
         timeout=None,
@@ -383,7 +391,7 @@ class BatchHttpRequests(_ConcurrentJobExecution):
 
             if is_get:
                 body = None
-            elif body is not None and not isinstance(body, (str, bytes)):
+            elif body is not None and not isinstance(body, str | bytes):
                 if self._body_function_handler:
                     body = self._body_function_handler(body)
                 body = json.dumps(body)
@@ -451,6 +459,158 @@ class BatchHttpRequests(_ConcurrentJobExecution):
         if (
             self.return_json
             or headers.get("content-type", "").lower() == "application/json"
-        ) and isinstance(data, (str, bytes)):
+        ) and isinstance(data, str | bytes):
             data = json.loads(data)
         return data
+
+
+class MLRunAPIRemoteStep(RemoteStep):
+    def __init__(
+        self, method: str, path: str, fill_placeholders: bool | None = None, **kwargs
+    ):
+        """
+        Graph step implementation for calling MLRun API endpoints
+
+        :param method:  The HTTP method to use for the request (e.g., "GET", "POST", "PUT", "DELETE").
+                        If not provided, the step will try to use `event.method` at runtime, and if that
+                        is also missing, it defaults to `"POST"`.
+        :param path:    API path (e.g. /api/projects)
+        :param fill_placeholders: if True, fill placeholders in the path using event fields (default to False)
+        :param kwargs:  other arguments passed to RemoteStep
+        """
+        super().__init__(url="", method=method, **kwargs)
+        self.rundb = None
+        self.path = path
+        self.fill_placeholders = fill_placeholders
+
+    def _generate_request(self, event, body):
+        method = self.method or event.method or "POST"
+        kw = {
+            key: value
+            for key, value in (
+                ("params", body.get("params")),
+                ("json", body.get("json")),
+            )
+            if value is not None
+        }
+
+        headers = self.headers or {}
+        headers.update(body.get("headers", {}))
+
+        if self.rundb.user:
+            kw["auth"] = (self.rundb.user, self.rundb.password)
+        elif self.rundb.token_provider:
+            token = self.rundb.token_provider.get_token()
+            if token:
+                # Iguazio auth doesn't support passing token through bearer, so use cookie instead
+                if self.rundb.token_provider.is_iguazio_session():
+                    session_cookie = f'session=j:{{"sid": "{token}"}}'
+                    headers["cookie"] = session_cookie
+                else:
+                    if mlrun.common.schemas.HeaderNames.authorization not in headers:
+                        logger.info(
+                            "Adding authorization header with bearer token for MLRun API request"
+                        )
+                        headers.update(
+                            {
+                                mlrun.common.schemas.HeaderNames.authorization: (
+                                    mlrun.common.schemas.AuthorizationHeaderPrefixes.bearer
+                                    + token
+                                )
+                            }
+                        )
+
+        if mlrun.common.schemas.HeaderNames.client_version not in headers:
+            headers.update(
+                {
+                    mlrun.common.schemas.HeaderNames.client_version: self.rundb.client_version,
+                    mlrun.common.schemas.HeaderNames.python_version: self.rundb.python_version,
+                    "User-Agent": f"{requests.utils.default_user_agent()} mlrun/{config.version}",
+                }
+            )
+
+        url = self.url.format(**body) if self.fill_placeholders else self.url
+        headers["Content-Type"] = "application/json"
+        return method, url, headers, dict_to_json(body), kw
+
+    def post_init(self, mode="sync", **kwargs):
+        super().post_init(mode=mode, **kwargs)
+        self.fill_placeholders = self.fill_placeholders or False
+        self.rundb = mlrun.get_run_db()
+        self.url = self.rundb.get_base_api_url(self.path)
+
+
+class RemoteFunctionStep(RemoteStep):
+    """
+    Graph step implementation for invoking functions remotely.
+
+    :param fn:  Either an `mlrun.runtimes.RemoteRuntime` object or
+                a string URI in the form `function_name` or `project_name/function_name`.
+    :param project_name:  Optional project name containing the function. If not provided,
+                          the project name will be derived automatically according to the following order:
+
+                          1. Extracted from the function URI (if specified as 'project_name/function_name')
+                          2. Taken from the `project_name` parameter
+                          3. Inferred from the current runtime or graph execution context
+    """
+
+    def __init__(
+        self,
+        fn: Union[mlrun.runtimes.RemoteRuntime, str, None] = None,
+        project_name: str = "",
+        **kwargs,
+    ):
+        super().__init__(url="", **kwargs)
+        self.rundb = None
+        self.fn = fn
+        self.project_name = project_name
+
+    def post_init(self, mode="sync", **kwargs) -> None:
+        self.rundb = mlrun.get_run_db()
+        if not isinstance(self.fn, (mlrun.runtimes.RemoteRuntime, str)):
+            raise mlrun.errors.MLRunInvalidArgumentTypeError(
+                "Parameter 'fn' must be of type mlrun.runtimes.RemoteRuntime or str."
+            )
+
+        if not self.fn:
+            raise mlrun.errors.MLRunRuntimeError(
+                "Parameter 'fn' have to be initialized."
+            )
+
+        if isinstance(self.fn, str):
+            project, uri, tag, hash_key = parse_versioned_object_uri(self.fn)
+
+            if self.project_name and project:
+                if self.project_name != project:
+                    raise mlrun.errors.MLRunRuntimeError(
+                        "Project name can only be set once: either in 'project_name' or in the function URI."
+                    )
+
+            project = project or self.project_name or mlrun.mlconf.active_project
+
+            try:
+                self.fn = self.rundb.get_function(
+                    name=uri, project=project, tag=tag, hash_key=hash_key
+                )
+                if isinstance(self.fn, dict):
+                    self.fn = mlrun.runtimes.RemoteRuntime.from_dict(self.fn)
+
+            except mlrun.MLRunNotFoundError as e:
+                raise e
+
+        if not isinstance(self.fn, mlrun.runtimes.RemoteRuntime):
+            raise mlrun.errors.MLRunRuntimeError(
+                f"Failed reading function '{self.fn}' from DB\n"
+                "Verify that the function URI is correct and that the function is stored properly."
+            )
+
+        url = self.fn.get_url()
+
+        if not url:
+            raise mlrun.errors.MLRunRuntimeError(
+                f"Could not determine the function URL for '{self.fn.metadata.name}'. \n"
+                "Make sure the function is deployed and reachable."
+            )
+
+        self.url = url
+        super().post_init(mode=mode, **kwargs)

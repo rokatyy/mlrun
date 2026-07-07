@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import base64
 import json
 import pathlib
@@ -20,7 +20,7 @@ import typing
 import unittest.mock
 from base64 import b64encode
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import deepdiff
 import fastapi.testclient
@@ -145,8 +145,8 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
     def _create_project(
         self,
         client: fastapi.testclient.TestClient,
-        project_name: typing.Optional[str] = None,
-        default_function_node_selector: typing.Optional[dict] = None,
+        project_name: str | None = None,
+        default_function_node_selector: dict | None = None,
     ):
         services.api.tests.unit.api.utils.create_project(
             client=client,
@@ -308,8 +308,8 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
 
     def _generate_security_context(
         self,
-        run_as_user: typing.Optional[int] = None,
-        run_as_group: typing.Optional[int] = None,
+        run_as_user: int | None = None,
+        run_as_group: int | None = None,
     ) -> k8s_client.V1SecurityContext:
         return k8s_client.V1SecurityContext(
             run_as_user=run_as_user,
@@ -317,9 +317,9 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
         )
 
     def _mock_create_namespaced_pod(self):
-        def _generate_pod(namespace, pod):
+        def _generate_pod(namespace, pod, **kwargs):
             terminated_container_state = client.V1ContainerStateTerminated(
-                finished_at=datetime.now(timezone.utc), exit_code=0
+                finished_at=datetime.now(UTC), exit_code=0
             )
             container_state = client.V1ContainerState(
                 terminated=terminated_container_state
@@ -380,7 +380,7 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
             return_value=client.V1PodList(items=[])
         )
         get_k8s_helper().v1api.read_namespaced_pod_log = unittest.mock.Mock(
-            return_value="Mocked pod logs"
+            return_value=unittest.mock.Mock(data=b"Mocked pod logs")
         )
 
     def _mock_create_namespaced_custom_object(self):
@@ -454,7 +454,7 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
         runtime.run(
             name=self.name,
             project=self.project,
-            artifact_path=self.artifact_path,
+            output_path=self.artifact_path,
             auth_info=mlrun.common.schemas.AuthInfo(),
             **kwargs,
         )
@@ -556,8 +556,11 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
     @staticmethod
     def _assert_pod_env_from_secrets(pod_env, expected_variables):
         for env_variable in pod_env:
-            if isinstance(env_variable, dict) and env_variable.setdefault(
-                "valueFrom", None
+            # valueFrom can be secretKeyRef, but also configMapKeyRef/fieldRef/resourceFieldRef
+            if (
+                isinstance(env_variable, dict)
+                and "valueFrom" in env_variable
+                and "secretKeyRef" in env_variable["valueFrom"]
             ):
                 # Nuclio spec comes in as a dict, with some differences from the V1EnvVar - convert it.
                 value_from = client.V1EnvVarSource(
@@ -740,6 +743,7 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
         expected_labels=None,
         expected_env_from_secrets=None,
         expected_args=None,
+        expected_tolerations=None,
     ):
         if assert_create_pod_called:
             create_pod_mock = get_k8s_helper().v1api.create_namespaced_pod
@@ -807,10 +811,25 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
                 == {}
             )
         if expected_affinity:
+            pod_affinity = mlrun.k8s_utils.sanitize_k8s_objects(pod.spec.affinity)
+            expected_affinity = mlrun.k8s_utils.sanitize_k8s_objects(expected_affinity)
             assert (
                 deepdiff.DeepDiff(
-                    pod.spec.affinity.to_dict(),
-                    expected_affinity.to_dict(),
+                    pod_affinity,
+                    expected_affinity,
+                    ignore_order=True,
+                )
+                == {}
+            )
+        if expected_tolerations:
+            pod_tolerations = mlrun.k8s_utils.sanitize_k8s_objects(pod.spec.tolerations)
+            expected_tolerations = mlrun.k8s_utils.sanitize_k8s_objects(
+                expected_tolerations
+            )
+            assert (
+                deepdiff.DeepDiff(
+                    pod_tolerations,
+                    expected_tolerations,
                     ignore_order=True,
                 )
                 == {}
@@ -1008,12 +1027,14 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
             tolerations=preemptible_tolerations,
         )
         logger.info(
-            "constrain -> allow, with preemptible node selector and affinity and tolerations,"
-            " expecting affinity and node selector to be removed and only preemptible tolerations to stay"
+            "constrain -> allow, with preemptible node selector, "
+            "expecting node selector to remain and preemptible tolerations to be added"
         )
         runtime.with_preemption_mode(mlrun.common.schemas.PreemptionModes.allow.value)
         self.execute_function(runtime)
-        self.assert_node_selection(tolerations=preemptible_tolerations)
+        self.assert_node_selection(
+            tolerations=preemptible_tolerations, node_selector=preemptible_node_selector
+        )
 
         logger.info(
             "allow -> allow, with not preemptible node selector and preemptible tolerations, expecting to stay"
@@ -1264,11 +1285,11 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
             affinity=self._generate_preemptible_affinity(),
         )
         logger.info(
-            "constrain -> allow with preemptible node selector and affinity, expecting both to be removed"
+            "constrain -> allow with preemptible node selector, expecting to remain the same"
         )
         runtime.with_preemption_mode(mlrun.common.schemas.PreemptionModes.allow.value)
         self.execute_function(runtime)
-        self.assert_node_selection()
+        self.assert_node_selection(node_selector=preemptible_node_selector)
 
         logger.info(
             "allow -> allow, with not preemptible node selector, expecting to stay"
@@ -1403,8 +1424,7 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
         )
 
         logger.info(
-            "constrain -> allow, with not preemptible tolerations and preemptible affinity, "
-            "expecting only not preemptible tolerations"
+            "constrain -> allow, with non preemptible tolerations, expected to stay the same"
         )
         runtime.with_preemption_mode(
             mode=mlrun.common.schemas.PreemptionModes.allow.value
@@ -1430,18 +1450,15 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
         self.execute_function(runtime)
         self.assert_node_selection(affinity=self._generate_preemptible_anti_affinity())
 
-        logger.info("prevent -> none, expecting to stay the same")
+        logger.info("prevent -> none, expecting to not have any affinity")
         runtime.with_preemption_mode(mlrun.common.schemas.PreemptionModes.none.value)
         self.execute_function(runtime)
-        self.assert_node_selection(affinity=self._generate_preemptible_anti_affinity())
+        self.assert_node_selection(affinity=None)
 
-        logger.info(
-            "none, enrich with tolerations expecting anti-affinity to stay and tolerations to be added"
-        )
+        logger.info("none, enrich with tolerations, expecting tolerations to be added")
         runtime.with_node_selection(tolerations=self._generate_tolerations())
         self.execute_function(runtime)
         self.assert_node_selection(
-            affinity=self._generate_preemptible_anti_affinity(),
             tolerations=self._generate_tolerations(),
         )
 
@@ -1457,13 +1474,10 @@ class TestRuntimeBase(services.api.tests.unit.conftest.MockedK8sHelper):
             tolerations=self._generate_tolerations(),
         )
 
-        logger.info(
-            "constrain -> none, expecting preemptible affinity to stay and user's tolerations"
-        )
+        logger.info("constrain -> none, expecting user's tolerations")
         runtime.with_preemption_mode(mlrun.common.schemas.PreemptionModes.none.value)
         self.execute_function(runtime)
         self.assert_node_selection(
-            affinity=self._generate_preemptible_affinity(),
             tolerations=self._generate_tolerations(),
         )
 

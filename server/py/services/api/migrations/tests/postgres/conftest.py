@@ -1,0 +1,43 @@
+# Copyright 2025 Iguazio
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import os
+
+import pytest
+import sqlalchemy.orm
+
+import mlrun
+
+import framework.utils.db.utils
+import framework.utils.singletons.db
+
+
+@pytest.fixture(scope="session")
+def alembic_session(
+    _postgres_engine: sqlalchemy.engine.Engine,
+) -> sqlalchemy.engine.Engine:
+    os.environ["MLRUN_HTTPDB__DSN"] = _postgres_engine.url.render_as_string(
+        hide_password=False,
+    )
+    mlrun.mlconf.reload()
+    framework.utils.singletons.db.initialize_db()
+    return _postgres_engine.execution_options(isolation_level="AUTOCOMMIT")
+
+
+@pytest.fixture(scope="session")
+def db_util(
+    mysql_db_session: sqlalchemy.orm.Session,
+) -> framework.utils.db.utils.DBUtil:
+    util = framework.utils.db.utils.DBUtil()
+    util.wait_for_db_liveness()
+    return util

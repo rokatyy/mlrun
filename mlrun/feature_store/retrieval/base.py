@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import abc
 import typing
 from datetime import datetime
@@ -21,10 +21,9 @@ import pandas as pd
 import mlrun
 from mlrun.datastore.targets import CSVTarget, ParquetTarget
 from mlrun.feature_store.feature_set import FeatureSet
-from mlrun.feature_store.feature_vector import JoinGraph
+from mlrun.feature_store.feature_vector_utils import JoinGraph, OfflineVectorResponse
 
 from ...utils import logger, str_to_timestamp
-from ..feature_vector import OfflineVectorResponse
 
 
 class BaseMerger(abc.ABC):
@@ -53,6 +52,9 @@ class BaseMerger(abc.ABC):
         self._origin_alias = dict()
         self._entity_rows_node_name = "__mlrun__$entity_rows$"
 
+    def close(self):
+        pass
+
     def _append_drop_column(self, key):
         if key and key not in self._drop_columns:
             self._drop_columns.append(key)
@@ -66,9 +68,9 @@ class BaseMerger(abc.ABC):
 
     def _update_alias(
         self,
-        key: typing.Optional[str] = None,
-        val: typing.Optional[str] = None,
-        dictionary: typing.Optional[dict] = None,
+        key: str | None = None,
+        val: str | None = None,
+        dictionary: dict | None = None,
     ):
         if dictionary is not None:
             # adding dictionary to alias
@@ -419,8 +421,8 @@ class BaseMerger(abc.ABC):
         entity_timestamp_column: str,
         featuresets: list,
         featureset_dfs: list,
-        keys: typing.Optional[list] = None,
-        join_types: typing.Optional[list] = None,
+        keys: list | None = None,
+        join_types: list | None = None,
     ):
         """join the entities and feature set features into a result dataframe"""
 
@@ -549,8 +551,8 @@ class BaseMerger(abc.ABC):
             self,
             name: str,
             order: int,
-            left_keys: typing.Optional[list[str]] = None,
-            right_keys: typing.Optional[list[str]] = None,
+            left_keys: list[str] | None = None,
+            right_keys: list[str] | None = None,
         ):
             self.name = name
             self.left_keys = left_keys if left_keys is not None else []
@@ -760,10 +762,10 @@ class BaseMerger(abc.ABC):
         self,
         feature_set: FeatureSet,
         feature_set_name: list[str],
-        column_names: typing.Optional[list[str]] = None,
-        start_time: typing.Optional[typing.Union[str, datetime]] = None,
-        end_time: typing.Optional[typing.Union[str, datetime]] = None,
-        time_column: typing.Optional[str] = None,
+        column_names: list[str] | None = None,
+        start_time: typing.Union[str, datetime] | None = None,
+        end_time: typing.Union[str, datetime] | None = None,
+        time_column: str | None = None,
         additional_filters=None,
     ):
         """
@@ -784,7 +786,7 @@ class BaseMerger(abc.ABC):
         self,
         df,
         rename_col_dict: dict[str, str],
-        columns: typing.Optional[list[str]] = None,
+        columns: list[str] | None = None,
     ):
         """
         rename the columns of the df according to rename_col_dict, and select only `columns` if it is not none

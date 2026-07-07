@@ -11,13 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from urllib.parse import urlparse
+
 import storey
 from mergedeep import merge
 from storey import V3ioDriver
 
 import mlrun
-import mlrun.model_monitoring.helpers
+import mlrun.common.model_monitoring.helpers
 from mlrun.datastore.base import DataStore
+from mlrun.datastore.datastore_profile import (
+    DatastoreProfileKafkaStream,
+    DatastoreProfilePostgreSQL,
+    datastore_profile_read,
+)
 
 from ..platforms.iguazio import parse_path
 from .utils import (
@@ -38,13 +45,25 @@ def get_url_and_storage_options(path, external_storage_options=None):
         storage_options = merge(external_storage_options, storage_options)
     else:
         storage_options = storage_options or external_storage_options
-    return url, DataStore._sanitize_storage_options(storage_options)
+    return url, DataStore._sanitize_options(storage_options)
 
 
-class TDEngineStoreyTarget(storey.TDEngineTarget):
-    def __init__(self, *args, **kwargs):
-        kwargs["url"] = mlrun.model_monitoring.helpers.get_tsdb_connection_string()
-        super().__init__(*args, **kwargs)
+class TimescaleDBStoreyTarget(storey.TimescaleDBTarget):
+    def __init__(self, *args, url: str, **kwargs):
+        if url.startswith("ds://"):
+            datastore_profile = datastore_profile_read(url)
+            if not isinstance(datastore_profile, DatastoreProfilePostgreSQL):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    f"Unexpected datastore profile type: {type(datastore_profile)}. "
+                    "Only DatastoreProfilePostgreSQL is supported"
+                )
+            # Use the shared helper to determine the correct database name
+            # This ensures consistency with TimescaleDBConnector's database naming
+            database = mlrun.common.model_monitoring.helpers.get_tsdb_database_name(
+                datastore_profile.database
+            )
+            url = datastore_profile.dsn(database=database)
+        super().__init__(*args, dsn=url, **kwargs)
 
 
 class StoreyTargetUtils:
@@ -69,7 +88,12 @@ class StoreyTargetUtils:
 
 class ParquetStoreyTarget(storey.ParquetTarget):
     def __init__(self, *args, **kwargs):
+        alt_key_name = kwargs.pop("alternative_v3io_access_key", None)
         args, kwargs = StoreyTargetUtils.process_args_and_kwargs(args, kwargs)
+        storage_options = kwargs.get("storage_options", {})
+        if storage_options and storage_options.get("v3io_access_key") and alt_key_name:
+            if alt_key := mlrun.get_secret_or_env(alt_key_name):
+                storage_options["v3io_access_key"] = alt_key
         super().__init__(*args, **kwargs)
 
 
@@ -89,17 +113,20 @@ class StreamStoreyTarget(storey.StreamTarget):
             raise mlrun.errors.MLRunInvalidArgumentError("StreamTarget requires a path")
 
         _, storage_options = get_url_and_storage_options(uri)
-        endpoint, path = parse_path(uri)
+        _, path = parse_path(uri)
 
         access_key = storage_options.get("v3io_access_key")
-        storage = V3ioDriver(
-            webapi=endpoint or mlrun.mlconf.v3io_api, access_key=access_key
-        )
+
+        if alt_key_name := kwargs.pop("alternative_v3io_access_key", None):
+            if alt_key := mlrun.get_secret_or_env(alt_key_name):
+                access_key = alt_key
+
+        storage = V3ioDriver(access_key=access_key)
 
         if storage_options:
             kwargs["storage"] = storage
         if args:
-            args[0] = endpoint
+            args[0] = path
         if "stream_path" in kwargs:
             kwargs["stream_path"] = path
 
@@ -108,28 +135,38 @@ class StreamStoreyTarget(storey.StreamTarget):
 
 class KafkaStoreyTarget(storey.KafkaTarget):
     def __init__(self, *args, **kwargs):
+        kwargs.pop("alternative_v3io_access_key", None)
         path = kwargs.pop("path")
-        attributes = kwargs.pop("attributes", None)
+        attributes = kwargs.pop("attributes", {})
         if path and path.startswith("ds://"):
-            datastore_profile = (
-                mlrun.datastore.datastore_profile.datastore_profile_read(path)
-            )
+            datastore_profile = datastore_profile_read(path)
+            if not isinstance(
+                datastore_profile,
+                DatastoreProfileKafkaStream,
+            ):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    f"Unsupported datastore profile type: {type(datastore_profile)}"
+                )
+
             attributes = merge(attributes, datastore_profile.attributes())
-            brokers = attributes.pop(
-                "brokers", attributes.pop("bootstrap_servers", None)
+            brokers = attributes.pop("brokers", None)
+            # Override the topic with the one in the url (if any)
+            parsed = urlparse(path)
+            topic = (
+                parsed.path.strip("/") if parsed.path else datastore_profile.get_topic()
             )
-            topic = datastore_profile.topic
         else:
-            brokers = attributes.pop(
-                "brokers", attributes.pop("bootstrap_servers", None)
-            )
+            brokers = attributes.pop("brokers", None)
             topic, brokers = parse_kafka_url(path, brokers)
 
         if not topic:
             raise mlrun.errors.MLRunInvalidArgumentError("KafkaTarget requires a topic")
         kwargs["brokers"] = brokers
         kwargs["topic"] = topic
-        super().__init__(*args, **kwargs, **attributes)
+
+        attributes = mlrun.datastore.utils.KafkaParameters(attributes).producer()
+
+        super().__init__(*args, **kwargs, producer_options=attributes)
 
 
 class NoSqlStoreyTarget(storey.NoSqlTarget):
@@ -140,10 +177,9 @@ class RedisNoSqlStoreyTarget(storey.NoSqlTarget):
     def __init__(self, *args, **kwargs):
         path = kwargs.pop("path")
         endpoint, uri = mlrun.datastore.targets.RedisNoSqlTarget.get_server_endpoint(
-            path,
-            kwargs.pop("credentials_prefix", None),
+            path
         )
-        kwargs["path"] = endpoint + "/" + uri
+        kwargs["path"] = f"{endpoint}/{uri}"
         super().__init__(*args, **kwargs)
 
 

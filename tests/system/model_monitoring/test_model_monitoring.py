@@ -16,51 +16,59 @@ import json
 import os
 import pickle
 import string
-import typing
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import UTC, datetime, timedelta
 from random import choice, randint, uniform
 from time import monotonic, sleep
-from typing import Optional, Union
+from uuid import uuid4
 
 import fsspec
 import numpy as np
 import pandas as pd
 import pytest
+import v3io
 import v3iofs
 from sklearn.datasets import load_diabetes, load_iris, make_classification
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
-from sklearn.svm import SVC
+from v3io.dataplane.response import HttpResponseError as V3ioHttpResponseError
 
 import mlrun.artifacts.model
+import mlrun.common.schemas.alert as alert_objects
 import mlrun.common.schemas.model_monitoring
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
 import mlrun.feature_store
-import mlrun.model_monitoring.api
 import mlrun.runtimes.mounts
 import mlrun.runtimes.utils
 import mlrun.serving.routers
 import mlrun.utils
-from mlrun.datastore import get_stream_pusher
-from mlrun.datastore.datastore_profile import DatastoreProfileV3io
+from mlrun.common.schemas import EndpointMode, EndpointType
+from mlrun.common.schemas.model_monitoring.model_endpoints import (
+    ModelEndpoint,
+    ModelEndpointList,
+)
 from mlrun.model import BaseMetadata
-from mlrun.model_monitoring.helpers import get_result_instance_fqn, get_stream_path
+from mlrun.model_monitoring.helpers import (
+    get_output_stream,
+    get_result_instance_fqn,
+)
 from mlrun.runtimes import BaseRuntime
+from mlrun.serving import ModelRunnerStep
 from mlrun.utils.v3io_clients import get_frames_client
 from tests.system.base import TestMLRunSystem
 
-from . import get_tsdb_datastore_profile_from_env
+from . import TestMLRunSystemModelMonitoring
 
 
 def mock_random_endpoint(
     project_name: str,
     name: str,
-    function_name: Optional[str] = "function-1",
-    function_uid: Optional[str] = None,
-    function_tag: Optional[str] = "v1",
-    model_name: Optional[str] = None,
-    model_uid: Optional[str] = None,
+    function_name: str | None = "function-1",
+    function_tag: str | None = "v1",
+    model_path: str | None = None,
     add_labels=True,
+    endpoint_type: EndpointType = EndpointType.NODE_EP,
+    mode: EndpointMode | None = None,
 ) -> mlrun.common.schemas.model_monitoring.ModelEndpoint:
     def random_labels():
         return {f"{choice(string.ascii_letters)}": randint(0, 100) for _ in range(1, 5)}
@@ -70,15 +78,14 @@ def mock_random_endpoint(
             name=name,
             project=project_name,
             labels=random_labels() if add_labels else {},
+            endpoint_type=endpoint_type,
+            mode=mode,
         ),
         spec=mlrun.common.schemas.model_monitoring.ModelEndpointSpec(
             function_name=function_name,
             function_tag=function_tag,
-            function_uid=function_uid,
-            model_name=model_name,
-            model_uid=model_uid,
+            model_path=model_path,
             model_class="modelcc",
-            model_tag="latest",
         ),
         status=mlrun.common.schemas.model_monitoring.ModelEndpointStatus(
             monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled,
@@ -87,24 +94,21 @@ def mock_random_endpoint(
 
 
 # Marked as enterprise because of v3io mount and pipelines
-@TestMLRunSystem.skip_test_if_env_not_configured
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
 @pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestModelEndpointsOperations(TestMLRunSystem):
+class TestModelEndpointsOperations(TestMLRunSystemModelMonitoring):
     """Applying basic model endpoint CRUD operations through MLRun API"""
 
     project_name = "mm-app-project"
+    image = None  # uses mlrun.mlconf.function_defaults.image_by_kind at runtime
 
     def setup_method(self, method):
         super().setup_method(method)
         if method.__name__ == "test_list_endpoints_without_creds":
             return
-        self.project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
+        function = mlrun.new_function(name="function-1", kind="serving", tag="v1")
+        function.save(versioned=False)
+        self.set_mm_credentials()
 
     @pytest.mark.parametrize("by_uid", [True, False])
     def test_clear_endpoint(self, by_uid):
@@ -145,11 +149,11 @@ class TestModelEndpointsOperations(TestMLRunSystem):
 
     def test_store_endpoint_update_existing(self):
         """Validates the process of create and update a basic model endpoint"""
-
+        function = mlrun.new_function(name="function-1", kind="serving", tag="latest")
+        function.save(versioned=False)
         model_endpoint = mock_random_endpoint(
             self.project_name,
             "testing",
-            function_name="function1",
             function_tag=None,  # latest is the default
         )
         db = mlrun.get_run_db()
@@ -193,7 +197,7 @@ class TestModelEndpointsOperations(TestMLRunSystem):
             name=endpoint_before_update.metadata.name,
             project=endpoint_before_update.metadata.project,
             attributes=attributes,
-            function_name="function1",
+            function_name="function-1",
             function_tag="latest",
         )
         endpoint_after_update = db.get_model_endpoint(
@@ -203,6 +207,33 @@ class TestModelEndpointsOperations(TestMLRunSystem):
         )
         assert endpoint_after_update.status.monitoring_mode == "enabled"
         assert endpoint_after_update.spec.model_class == "modelcc-3"
+
+    def test_alert_name_uniqueness(self):
+        model_endpoint = mock_random_endpoint(
+            self.project_name,
+            "testing",
+            function_name="function1",
+            function_tag=None,  # latest is the default
+        )
+        db = mlrun.get_run_db()
+        model_endpoint = db.create_model_endpoint(model_endpoint=model_endpoint)
+        mep_id = model_endpoint.metadata.uid
+        #  in regular case we should have notifications, but we do not save the alert configs so it is not required.
+        alert_configs = self.project.create_model_monitoring_alert_configs(
+            name="test",
+            summary="test",
+            endpoints=ModelEndpointList(endpoints=[model_endpoint]),
+            events=[alert_objects.EventKind.DATA_DRIFT_DETECTED],
+            notifications=[],
+            result_names=[
+                f"{mep_id}.app.result.result1",
+                f"{mep_id}.app.result.result2",
+            ],
+        )
+        assert len(alert_configs) == 2
+        alert_names = sorted([alert_config.name for alert_config in alert_configs])
+        assert alert_names[0] == f"test--{mep_id}_app_result1"
+        assert alert_names[1] == f"test--{mep_id}_app_result2"
 
     def test_list_endpoints_on_empty_project(self):
         endpoints_out = self.project.list_model_endpoints()
@@ -242,6 +273,50 @@ class TestModelEndpointsOperations(TestMLRunSystem):
         endpoints_intersect = in_endpoint_names.intersection(out_endpoint_names)
         assert len(endpoints_intersect) == number_of_endpoints
 
+    def test_list_endpoints_mode(self):
+        db = mlrun.get_run_db()
+
+        number_of_real_time_eps = 2
+        number_of_batch_eps = 3
+        real_time_eps = [
+            mock_random_endpoint(
+                self.project_name, f"real-time-{i}", mode=EndpointMode.REAL_TIME
+            )
+            for i in range(number_of_real_time_eps)
+        ]
+
+        batch_eps = [
+            mock_random_endpoint(
+                self.project_name,
+                f"batch-{i}",
+                endpoint_type=EndpointType.BATCH_EP,
+                mode=EndpointMode.BATCH,
+            )
+            for i in range(number_of_batch_eps)
+        ]
+
+        for endpoint in real_time_eps + batch_eps:
+            db.create_model_endpoint(endpoint)
+
+        eps = self.project.list_model_endpoints().endpoints
+        assert len(eps) == number_of_real_time_eps + number_of_batch_eps
+
+        real_time_eps = self.project.list_model_endpoints(
+            modes=EndpointMode.REAL_TIME
+        ).endpoints
+
+        assert len(real_time_eps) == number_of_real_time_eps
+
+        batch_eps = self.project.list_model_endpoints(
+            modes=EndpointMode.BATCH
+        ).endpoints
+        assert len(batch_eps) == number_of_batch_eps
+
+        real_time_and_batch = self.project.list_model_endpoints(
+            modes=[EndpointMode.REAL_TIME, EndpointMode.BATCH]
+        ).endpoints
+        assert len(real_time_and_batch) == number_of_real_time_eps + number_of_batch_eps
+
     def test_labels(self):
         db = mlrun.get_run_db()
         endpoint_name = "testing-endpoint"
@@ -257,6 +332,7 @@ class TestModelEndpointsOperations(TestMLRunSystem):
         endpoint = mock_random_endpoint(
             self.project_name, endpoint_name, add_labels=False
         )
+        endpoint.metadata.uid = out_endpoint.metadata.uid
         db.create_model_endpoint(
             endpoint,
             creation_strategy=mm_constants.ModelEndpointCreationStrategy.INPLACE,
@@ -282,8 +358,8 @@ class TestModelEndpointsOperations(TestMLRunSystem):
 
         endpoints_out = self.project.list_model_endpoints(latest_only=False).endpoints
         assert len(endpoints_out) == number_of_endpoints
-        created: Optional[datetime] = None
-        uid: Optional[str] = None
+        created: datetime | None = None
+        uid: str | None = None
         for mep in endpoints_out:
             if not created or mep.metadata.created < created:
                 created = mep.metadata.created
@@ -300,23 +376,41 @@ class TestModelEndpointsOperations(TestMLRunSystem):
     def test_list_endpoints_filter(self):
         number_of_endpoints = 5
         db = mlrun.get_run_db()
-
+        function = mlrun.new_function(name="filterme", kind="serving", tag="v45")
+        function.save(versioned=False)
+        function = mlrun.new_function(name="filter-function", kind="serving", tag="v45")
+        function.save(versioned=False)
+        function = mlrun.new_function(name="filter-function", kind="serving", tag="v1")
+        function.save(versioned=False)
+        model_obj = self.project.log_model(
+            "filterme",
+            model_dir=str(self.assets_path),
+            model_file="model.pkl",
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            outputs=[mlrun.feature_store.Feature(name="l1", value_type="float")],
+            inputs=[mlrun.feature_store.Feature(name="f1", value_type="float")],
+            tag="latest",
+        )
         for i in range(number_of_endpoints):
             endpoint = mock_random_endpoint(
-                self.project_name, name=f"testing-{i}", function_tag=None
+                self.project_name,
+                name=f"testing-{i}",
             )
 
             if i < 1:
-                endpoint.spec.model_name = "filterme"
+                endpoint.spec.model_path = (
+                    f"store://models/{self.project_name}/{model_obj.key}:latest"
+                )
                 endpoint.spec.function_tag = "v45"
-            if i < 2:
+            if i < 3:
+                endpoint.spec.function_name = "filter-function"
                 endpoint.metadata.name = "test-filter"
-                endpoint.spec.function_name = "filter_function"
-
             if i < 4:
                 endpoint.metadata.labels = {"filtermex": "1", "filtermey": "2"}
 
-            db.create_model_endpoint(model_endpoint=endpoint)
+            db.create_model_endpoint(
+                model_endpoint=endpoint, creation_strategy="archive"
+            )
 
         all_meps = self.project.list_model_endpoints()
         assert len(all_meps.endpoints) == number_of_endpoints
@@ -325,19 +419,24 @@ class TestModelEndpointsOperations(TestMLRunSystem):
         assert len(filter_model.endpoints) == 1
 
         filter_functions = self.project.list_model_endpoints(
-            function_name="filter_function", function_tag="v45"
+            function_name="filter-function", function_tag="v45"
         )
         assert len(filter_functions.endpoints) == 1
 
         filter_functions = self.project.list_model_endpoints(
-            function_name="filter_function", function_tag="latest"
+            function_name="filter-function", function_tag="v1"
         )
-        assert len(filter_functions.endpoints) == 1
+        assert len(filter_functions.endpoints) == 2
 
         filter_functions_latest = self.project.list_model_endpoints(
-            name="test-filter", latest_only=True
+            names="test-filter", latest_only=True
         )
         assert len(filter_functions_latest.endpoints) == 2
+
+        filter_functions_latest = self.project.list_model_endpoints(
+            names="test-filter",
+        )
+        assert len(filter_functions_latest.endpoints) == 3
 
         filter_labels = db.list_model_endpoints(
             self.project_name, labels=["filtermex=1"]
@@ -357,13 +456,43 @@ class TestModelEndpointsOperations(TestMLRunSystem):
     @pytest.mark.parametrize("creation_strategy", ["archive", "inplace", "overwrite"])
     def test_creation_strategy(self, creation_strategy):
         db = mlrun.get_run_db()
-        model_endpoint = mock_random_endpoint(
-            self.project_name, "testing", model_name="model-1"
+        model_obj = self.project.log_model(
+            "my-model",
+            model_dir=str(self.assets_path),
+            model_file="model.pkl",
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            outputs=[mlrun.feature_store.Feature(name="l1", value_type="float")],
+            inputs=[mlrun.feature_store.Feature(name="f1", value_type="float")],
+            tag="latest",
         )
-        db.create_model_endpoint(model_endpoint, creation_strategy)
-        model_endpoint = mock_random_endpoint(
-            self.project_name, "testing", model_name="model-2"
+
+        model_obj_2 = self.project.log_model(
+            "my-model-2",
+            model_dir=str(self.assets_path),
+            model_file="model.pkl",
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            outputs=[
+                mlrun.feature_store.Feature(name="l1", value_type="float"),
+                mlrun.feature_store.Feature(name="l2", value_type="float"),
+            ],
+            inputs=[mlrun.feature_store.Feature(name="f1", value_type="float")],
+            tag="latest",
         )
+        model_endpoint = mock_random_endpoint(
+            self.project_name,
+            "testing",
+            model_path=f"store://models/{self.project_name}/{model_obj.key}:latest",
+        )
+        created_model_endpoint = db.create_model_endpoint(
+            model_endpoint, creation_strategy
+        )
+        model_endpoint = mock_random_endpoint(
+            self.project_name,
+            "testing",
+            model_path=f"store://models/{self.project_name}/{model_obj_2.key}:latest",
+        )
+        if creation_strategy == "inplace":
+            model_endpoint.metadata.uid = created_model_endpoint.metadata.uid
         db.create_model_endpoint(model_endpoint, creation_strategy)
 
         endpoints_out = self.project.list_model_endpoints().endpoints
@@ -373,29 +502,362 @@ class TestModelEndpointsOperations(TestMLRunSystem):
                 latest_only=True
             ).endpoints
 
-        assert len(endpoints_out) == 1
-        assert endpoints_out[0].spec.model_name == "model-2"
+        mm_fs = db.list_feature_sets(self.project_name)
+        if (
+            creation_strategy == mm_constants.ModelEndpointCreationStrategy.OVERWRITE
+            or creation_strategy == mm_constants.ModelEndpointCreationStrategy.INPLACE
+        ):
+            assert len(mm_fs) == 1
+        else:
+            assert len(mm_fs) == 2
 
-        mep = mlrun.get_run_db().get_model_endpoint(
-            project=endpoints_out[0].metadata.project,
-            name=endpoints_out[0].metadata.name,
-            endpoint_id=endpoints_out[0].metadata.uid,
-            feature_analysis=True,
+        assert len(endpoints_out) == 1
+        assert endpoints_out[0].spec.model_name == "my-model-2"
+
+        if creation_strategy == mm_constants.ModelEndpointCreationStrategy.INPLACE:
+            created_model_endpoint = db.create_model_endpoint(
+                model_endpoint, creation_strategy
+            )
+            db_model_endpoint = db.get_model_endpoint(
+                project=self.project_name,
+                name=model_endpoint.metadata.name,
+                function_name="function-1",
+                function_tag="v1",
+            )
+            assert created_model_endpoint.spec.feature_names is not None
+            assert (
+                db_model_endpoint.spec.feature_names
+                == created_model_endpoint.spec.feature_names
+            )
+            assert created_model_endpoint.spec.monitoring_feature_set_uri is not None
+            assert (
+                db_model_endpoint.spec.monitoring_feature_set_uri
+                == created_model_endpoint.spec.monitoring_feature_set_uri
+            )
+            assert created_model_endpoint.spec.label_names is not None
+            assert (
+                db_model_endpoint.spec.label_names
+                == created_model_endpoint.spec.label_names
+            )
+
+    def test_mep_with_model(self):
+        model_obj = self.project.log_model(
+            "my-model",
+            model_dir=str(self.assets_path),
+            model_file="model.pkl",
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            outputs=[mlrun.feature_store.Feature(name="l1", value_type="float")],
+            inputs=[mlrun.feature_store.Feature(name="f1", value_type="float")],
+            tag="latest",
         )
 
-        assert mep.status.drift_measures_timestamp is not None
-        assert mep.status.current_stats_timestamp is not None
+        model_obj_2 = self.project.log_model(
+            "my-model-2",
+            model_dir=str(self.assets_path),
+            model_file="model.pkl",
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            outputs=[
+                mlrun.feature_store.Feature(name="l1", value_type="float"),
+                mlrun.feature_store.Feature(name="l2", value_type="float"),
+            ],
+            inputs=[mlrun.feature_store.Feature(name="f1", value_type="float")],
+            tag="latest",
+        )
+
+        model_endpoint = mock_random_endpoint(
+            self.project_name,
+            "testing",
+            model_path=f"store://models/{self.project_name}/{model_obj.key}:latest",
+        )
+
+        db = mlrun.get_run_db()
+        db.create_model_endpoint(model_endpoint)
+
+        mep = db.get_model_endpoint(
+            project=model_endpoint.metadata.project,
+            name=model_endpoint.metadata.name,
+            function_name=model_endpoint.spec.function_name,
+            function_tag=model_endpoint.spec.function_tag,
+        )
+        assert mep.spec.feature_names == ["f1"]
+        assert mep.spec.label_names == ["l1"]
+
+        model_endpoint_2 = mock_random_endpoint(
+            self.project_name,
+            "testing",
+            model_path=f"store://models/{self.project_name}/{model_obj_2.key}:latest",
+        )
+        model_endpoint_2.metadata.uid = mep.metadata.uid
+
+        db.create_model_endpoint(model_endpoint_2)  # in-place update
+        mep_2 = db.get_model_endpoint(
+            project=model_endpoint_2.metadata.project,
+            name=model_endpoint_2.metadata.name,
+            function_name=model_endpoint_2.spec.function_name,
+            function_tag=model_endpoint_2.spec.function_tag,
+        )
+        assert mep_2.spec.feature_names == ["f1"]
+        assert mep_2.spec.label_names == ["l1"]
+
+        model_endpoint_3 = mock_random_endpoint(
+            self.project_name,
+            "testing",
+            model_path=f"store://models/{self.project_name}/{model_obj_2.key}:latest",
+        )
+        db.create_model_endpoint(
+            model_endpoint_3,
+            creation_strategy=mm_constants.ModelEndpointCreationStrategy.OVERWRITE,
+        )  # overwrite
+        mep_3 = db.get_model_endpoint(
+            project=model_endpoint_2.metadata.project,
+            name=model_endpoint_2.metadata.name,
+            function_name=model_endpoint_2.spec.function_name,
+            function_tag=model_endpoint_2.spec.function_tag,
+        )
+        assert mep_3.spec.feature_names == ["f1"]
+        assert mep_3.spec.label_names == ["l1", "l2"]
+
+    def test_mep_with_llm(self):
+        model_obj = self.project.log_model(
+            "my-model",
+            model_dir=str(self.assets_path),
+            model_file="model.pkl",
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            outputs=[mlrun.feature_store.Feature(name="l1", value_type="float")],
+            inputs=[mlrun.feature_store.Feature(name="f1", value_type="float")],
+            tag="latest",
+        )
+
+        llm_prompt = self.project.log_llm_prompt(
+            "my-llm-prompt",
+            prompt_template=[
+                {"role": "user", "content": "What is the capital of France?"}
+            ],
+            artifact_path=f"v3io:///projects/{self.project.metadata.name}",
+            model_artifact=model_obj,
+        )
+
+        model_endpoint = mock_random_endpoint(
+            self.project_name,
+            "llm-testing",
+            model_path=f"store://llm-prompts/{self.project_name}/{llm_prompt.key}:latest",
+        )
+
+        db = mlrun.get_run_db()
+        db.create_model_endpoint(model_endpoint)
+
+        mep = db.get_model_endpoint(
+            project=model_endpoint.metadata.project,
+            name=model_endpoint.metadata.name,
+            function_name=model_endpoint.spec.function_name,
+            function_tag=model_endpoint.spec.function_tag,
+            feature_analysis=True,
+        )
+        assert mep.spec.feature_names == ["f1"]
+        assert mep.spec.label_names == ["l1"]
+        assert mep.spec.model_name == "my-llm-prompt"
+        assert mep.spec.model_uri == llm_prompt.get_store_url(with_tag=False)
+
+    def test_mep_with_model_runner(self):
+        function = mlrun.code_to_function(
+            name="function_with_model",
+            kind="serving",
+            tag="latest",
+            project=self.project_name,
+            filename=str(self.assets_path / "models.py"),
+            image=self.image,
+        )
+        function.save(versioned=False)
+        graph = function.set_topology("flow", engine="async")
+        model_runner_step = mlrun.serving.states.ModelRunnerStep(name="model-runner")
+        model_runner_step.add_model(
+            model_class="IncModel",
+            endpoint_name="my-model-1",
+            execution_mechanism="naive",
+            inc=1,
+        )
+        model_runner_step.add_model(
+            model_class="IncModel",
+            endpoint_name="my-model-2",
+            execution_mechanism="naive",
+            inc=2,
+        )
+        graph.to(name="echo", class_name="Echo").to(
+            model_runner_step, "runner"
+        ).respond()
+        function.set_tracking()
+        function.deploy()
+
+        model_endpoints = (
+            mlrun.get_run_db()
+            .list_model_endpoints(
+                self.project_name,
+            )
+            .endpoints
+        )
+
+        assert len(model_endpoints) == 2, (
+            f"Expected 2 endpoints, got {len(model_endpoints)}"
+        )
+        assert (
+            model_endpoints[0].metadata.name == "my-model-1"
+            and model_endpoints[1].metadata.name == "my-model-2"
+        ), "expected model endpoints with the names my-model-1 and my-model-2"
+
+    @pytest.mark.parametrize("multiple_models", (True, False))
+    def test_mrs_direct_batch_input(self, multiple_models):
+        function = mlrun.code_to_function(
+            name="function_with_model",
+            kind="serving",
+            tag="latest",
+            project=self.project_name,
+            filename=str(self.assets_path / "models.py"),
+            image=self.image,
+        )
+        graph = function.set_topology("flow", engine="async")
+        step = graph
+        model_runner_step = ModelRunnerStep(name="my_model_runner")
+
+        inputs_raw_list = [{"x": 1}, {"x": 2}, {"x": 3}, {"x": 4}, {"x": 5}]
+        invalid_raw_list = [{"z": 1}, {"z": 2}, {"z": 3}, {"z": 4}, {"z": 5}]
+        wrapped_inputs = [{"input": item} for item in inputs_raw_list]
+        wrapped_invalid = [{"input": item} for item in invalid_raw_list]
+
+        endpoint_name = "my_model_1"
+        endpoint_name2 = "my_model_2"
+
+        artifact_path1 = f"v3io:///projects/{self.project.metadata.name}/test_mrs_direct_batch_input/{uuid.uuid4()}"
+        artifact_path2 = f"v3io:///projects/{self.project.metadata.name}/test_mrs_direct_batch_input/{uuid.uuid4()}"
+        f"v3io:///projects/{self.project.metadata.name}/{uuid.uuid4()}"
+        model_obj = self.project.log_model(
+            "my-model",
+            model_dir=str(self.assets_path),
+            model_file="linear_model.pkl",
+            artifact_path=artifact_path1,
+            tag="latest",
+            upload=True,
+        )
+        model_path = model_obj.target_path + model_obj.model_file
+        model_runner_step.add_model(
+            model_class="BatchedModel",
+            execution_mechanism="naive",
+            endpoint_name=endpoint_name,
+            model_path=model_path,
+        )
+
+        if multiple_models:
+            model_obj2 = self.project.log_model(
+                "my-model2",
+                model_dir=str(self.assets_path),
+                model_file="linear_model2.pkl",
+                artifact_path=artifact_path2,
+                tag="latest",
+                upload=True,
+            )
+            model_path2 = model_obj2.target_path + model_obj2.model_file
+            model_runner_step.add_model(
+                model_class="BatchedModel",
+                endpoint_name=endpoint_name2,
+                execution_mechanism="naive",
+                model_path=model_path2,
+            )
+        step.to(model_runner_step).respond()
+        function.deploy()
+        with pytest.raises(
+            RuntimeError,
+            match=".*The feature names should match those that were passed during fit.*",
+        ):
+            function.invoke("/", invalid_raw_list)
+        with pytest.raises(
+            RuntimeError,
+            match=".*The feature names should match those that were passed during fit.*",
+        ):
+            function.invoke("/", wrapped_invalid)
+        resp = function.invoke("/", body=inputs_raw_list)
+        resp2 = function.invoke("/", body=wrapped_inputs)
+        for respond in (resp, resp2):
+            if multiple_models:
+                assert respond == {
+                    endpoint_name: [3.0, 5.0, 7.0, 9.0, 11.0],
+                    endpoint_name2: [5.0, 8.0, 11.0, 14.0, 17.0],
+                }
+            else:
+                assert respond == [3.0, 5.0, 7.0, 9.0, 11.0]
+
+    def test_create_user_model_endpoint(self):
+        """
+        create_user_model_endpoint creates a USER_EP endpoint via the project API and
+        the endpoint is immediately retrievable from the DB.
+        Covers both the direct-params path and the ModelEndpointInstruction path.
+        """
+        from mlrun.common.schemas.model_monitoring.constants import EndpointType
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        db = mlrun.get_run_db()
+
+        # --- direct params ---
+        name, uid = self.project.create_user_model_endpoint(
+            "user-ep-direct",
+            input_schema=["f1", "f2"],
+            output_schema=["label"],
+        )
+        assert name == "user-ep-direct"
+        assert uid is not None
+        ep = db.get_model_endpoint(
+            name="user-ep-direct",
+            project=self.project_name,
+            endpoint_id=uid,
+        )
+        assert ep.metadata.endpoint_type == EndpointType.USER_EP
+        assert ep.spec.feature_names == ["f1", "f2"]
+        assert ep.spec.label_names == ["label"]
+
+        # --- ModelEndpointInstruction path ---
+        instruction = ModelEndpointInstruction(
+            name="user-ep-instr",
+            input_schema=["a", "b"],
+            output_schema=["out"],
+        )
+        name2, uid2 = self.project.create_user_model_endpoint(
+            model_endpoint_instruction=instruction,
+        )
+        assert name2 == "user-ep-instr"
+        assert uid2 is not None
+        ep2 = db.get_model_endpoint(
+            name="user-ep-instr",
+            project=self.project_name,
+            endpoint_id=uid2,
+        )
+        assert ep2.metadata.endpoint_type == EndpointType.USER_EP
+        assert ep2.spec.feature_names == ["a", "b"]
+        assert ep2.spec.label_names == ["out"]
+
+    def test_create_user_model_endpoint_nonexistent_function_raises(self):
+        """create_user_model_endpoint raises MLRunNotFoundError for unknown function name or tag."""
+        with pytest.raises(mlrun.errors.MLRunNotFoundError):
+            self.project.create_user_model_endpoint(
+                "ep-bad-fn",
+                function_name="no-such-function",
+            )
+
+        with pytest.raises(mlrun.errors.MLRunNotFoundError):
+            self.project.create_user_model_endpoint(
+                "ep-bad-tag",
+                function_name="function-1",
+                function_tag="no-such-tag",
+            )
 
 
-@TestMLRunSystem.skip_test_if_env_not_configured
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
 @pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestBasicModelMonitoring(TestMLRunSystem):
+class TestBasicModelMonitoring(TestMLRunSystemModelMonitoring):
     """Deploy and apply monitoring on a basic pre-trained model"""
 
     project_name = "pr-basic-model-monitoring"
     # Set image to "<repo>/mlrun:<tag>" for local testing
-    image: Optional[str] = None
+    image: str | None = None
 
     @pytest.mark.timeout(540)
     def test_basic_model_monitoring(self) -> None:
@@ -408,13 +870,7 @@ class TestBasicModelMonitoring(TestMLRunSystem):
         # Deploy Model Servers
         project = self.project
 
-        project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-            replace_creds=True,  # remove once ML-7501 is resolved
-        )
+        self.set_mm_credentials()
 
         iris = load_iris()
         train_set = pd.DataFrame(
@@ -476,17 +932,27 @@ class TestBasicModelMonitoring(TestMLRunSystem):
             sleep(choice([0.01, 0.04]))
 
         sleep(15)
-        endpoints_list = mlrun.get_run_db().list_model_endpoints(self.project_name)
-        assert len(endpoints_list.endpoints) == 1
 
-        endpoint = endpoints_list.endpoints[0]
+        # ensure we don't get metrics we didn't ask for (ML-9793)
+        endpoint = (
+            mlrun.get_run_db()
+            .list_model_endpoints(
+                self.project_name, metric_list=["error_count"], tsdb_metrics=True
+            )
+            .endpoints[0]
+        )
+        assert endpoint.status.last_request is None
+        assert endpoint.status.avg_latency is None
 
+        endpoint = (
+            mlrun.get_run_db().list_model_endpoints(self.project_name).endpoints[0]
+        )
         assert not endpoint.spec.feature_stats
 
         self._assert_model_endpoint_tags_and_labels(
             endpoint=endpoint,
             model_name=model_name,
-            tag="some-tag",
+            tags=["some-tag", "latest"],
             labels=labels,
         )
         _validate_model_uri(model_obj=model_obj, model_endpoint=endpoint)
@@ -503,16 +969,414 @@ class TestBasicModelMonitoring(TestMLRunSystem):
         )
         assert metric_fqn == expected_metric_fqn
 
+    @pytest.mark.parametrize("with_training_set", [False, True])
+    def test_monitoring_with_model_runner_dict_infer(self, with_training_set: bool):
+        function = mlrun.code_to_function(
+            name="function_with_model",
+            kind="serving",
+            tag="latest",
+            project=self.project_name,
+            filename=str(self.assets_path / "models.py"),
+            image=self.image,
+        )
+        self.set_mm_credentials()
+
+        # Log a model artifact
+        train_set = None
+        if with_training_set:
+            iris = load_iris()
+            train_set = pd.DataFrame(
+                data=np.c_[iris["data"], iris["target"]],
+                columns=iris.feature_names + ["label"],
+            )
+        model_name = "sklearn_RandomForestClassifier"
+        # Upload the model through the projects API so that it is available to the serving function
+        model = self.project.log_model(
+            model_name,
+            model_dir=os.path.relpath(self.assets_path),
+            model_file="model.pkl",
+            training_set=train_set,
+            artifact_path=f"v3io:///projects/{self.project.name}",
+            label_column="label" if with_training_set else None,
+        )
+        function.save(versioned=False)
+        graph = function.set_topology("flow", engine="async")
+        model_runner_step = mlrun.serving.states.ModelRunnerStep(name="model-runner")
+        model_runner_step.add_model(
+            model_class="MyDictModel",
+            endpoint_name="model",
+            execution_mechanism="naive",
+            input_path="dict_inputs",
+            result_path="dict_outputs",
+            model_artifact=model.uri,
+        )
+        model_runner_step.add_model(
+            model_class="MyModel",
+            endpoint_name="model-1",
+            input_path="inputs",
+            result_path="outputs",
+            execution_mechanism="naive",
+            model_artifact=model.uri,
+        )
+        graph.to(model_runner_step, "runner").respond()
+        function.set_tracking()
+        self.project.enable_model_monitoring(
+            deploy_histogram_data_drift_app=False, image=self.image
+        )
+        function.deploy()
+        function.invoke(
+            "/",
+            body={
+                "dict_inputs": {
+                    "sepal length (cm)": 0.5,
+                    "sepal width (cm)": 1.2,
+                    "petal length (cm)": 0.5,
+                    "petal width (cm)": 1.1,
+                },
+                "inputs": [[0.5, 1.2, 0.5, 1.1]],
+            },
+        )
+        sleep(5)
+        model_endpoints = (
+            mlrun.get_run_db()
+            .list_model_endpoints(
+                self.project_name,
+            )
+            .endpoints
+        )
+
+        assert model_endpoints[0].metadata.name == "model"
+        assert model_endpoints[0].spec.feature_names == [
+            "sepal_length_cm",
+            "sepal_width_cm",
+            "petal_length_cm",
+            "petal_width_cm",
+        ]
+        assert model_endpoints[0].spec.label_names == ["label"]
+
+        assert model_endpoints[1].metadata.name == "model-1"
+        assert (
+            model_endpoints[1].spec.feature_names
+            == [
+                "f0",
+                "f1",
+                "f2",
+                "f3",
+            ]
+            if not with_training_set
+            else [
+                "sepal_length_cm",
+                "sepal_width_cm",
+                "petal_length_cm",
+                "petal_width_cm",
+            ]
+        )
+        assert (
+            model_endpoints[1].spec.label_names == ["p0"]
+            if not with_training_set
+            else ["label"]
+        )
+
+    @pytest.mark.parametrize("with_training_set", [False, True])
+    def test_monitoring_with_model_runner_batch_infer(self, with_training_set: bool):
+        function_name = "function-with-model"
+        endpoint_name = "model-1"
+        function = mlrun.code_to_function(
+            name=function_name,
+            kind="serving",
+            tag="latest",
+            project=self.project_name,
+            filename=str(self.assets_path / "models.py"),
+            image=self.image,
+        )
+        self.set_mm_credentials()
+
+        # Log a model artifact
+        train_set = None
+        if with_training_set:
+            iris = load_iris()
+            train_set = pd.DataFrame(
+                data=np.c_[iris["data"], iris["target"]],
+                columns=iris.feature_names + ["label"],
+            )
+        model_name = "sklearn_RandomForestClassifier"
+        # Upload the model through the projects API so that it is available to the serving function
+        model = self.project.log_model(
+            model_name,
+            model_dir=os.path.relpath(self.assets_path),
+            model_file="model.pkl",
+            training_set=train_set,
+            artifact_path=f"v3io:///projects/{self.project.name}",
+            label_column="label" if with_training_set else None,
+        )
+        function.save(versioned=False)
+        graph = function.set_topology("flow", engine="async")
+        model_runner_step = mlrun.serving.states.ModelRunnerStep(name="model-runner")
+        model_runner_step.add_model(
+            model_class="MyModel",
+            endpoint_name=endpoint_name,
+            input_path="inputs",
+            result_path="outputs",
+            execution_mechanism="naive",
+            model_artifact=model.uri,
+        )
+        graph.to(model_runner_step, "runner").respond()
+        function.set_tracking()
+        self.project.enable_model_monitoring(
+            deploy_histogram_data_drift_app=False,
+            image=self.image,
+        )
+        function.deploy()
+        response = function.invoke(
+            "/",
+            body=[
+                {"inputs": [5.1, 3.5, 1.4, 0.2]},
+                {"inputs": [4.9, 3.0, 1.4, 0.2]},
+                {"inputs": [4.7, 3.2, 1.3, 0.2]},
+            ],
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=".*X has 3 features, but RandomForestClassifier is expecting 4 features as input*",
+        ):
+            function.invoke(
+                "/",
+                body=[
+                    {"inputs": [5.1, 3.5, 1.4]},
+                    {"inputs": [4.9, 3.0, 1.4]},
+                    {"inputs": [4.7, 3.2, 1.3]},
+                ],
+            )
+
+        sleep(5)
+        endpoint = (
+            mlrun.get_run_db()
+            .list_model_endpoints(
+                self.project_name, metric_list=["error_count"], tsdb_metrics=True
+            )
+            .endpoints[0]
+        )
+        expected_feature_names = (
+            ["f0", "f1", "f2", "f3"]
+            if not with_training_set
+            else [
+                "sepal_length_cm",
+                "sepal_width_cm",
+                "petal_length_cm",
+                "petal_width_cm",
+            ]
+        )
+        assert expected_feature_names == endpoint.spec.feature_names
+        assert len(response["inputs"]) == 3
+        assert response["outputs"] == [0, 0, 0]
+        assert (
+            endpoint.spec.label_names == ["p0"] if not with_training_set else ["label"]
+        )
+        sleep(180)
+        mep = mlrun.db.get_run_db().get_model_endpoint(
+            name=endpoint_name,
+            project=self.project.name,
+            function_name=function_name,
+            function_tag="latest",
+            feature_analysis=True,
+            tsdb_metrics=True,
+        )
+        tsdb_client = mlrun.model_monitoring.get_tsdb_connector(
+            project=self.project.name, profile=self.mm_tsdb_profile
+        )
+        predications = tsdb_client._get_records(
+            table=mm_constants.V3IOTSDBTables.PREDICTIONS, start="now-50m", end="now"
+        )
+        assert len(predications) == 1
+        predication_dict = predications.head(1).to_dict(orient="records")[0]
+        assert (
+            predication_dict["effective_sample_count"]
+            == predication_dict["estimated_prediction_count"]
+            == 3
+        )
+
+        v3io_df = pd.read_parquet(
+            f"v3io:///projects/{self.project.name}/artifacts/model-endpoints/parquet/key={mep.metadata.uid}"
+        )
+        assert len(v3io_df) == 3
+        expected_identical_fields = [
+            "endpoint_name",
+            "timestamp",
+            "request_id",
+            "effective_sample_count",
+            "estimated_prediction_count",
+        ]
+        # Compare each row to the first row
+        assert (
+            (
+                v3io_df[expected_identical_fields]
+                == v3io_df[expected_identical_fields].iloc[0]
+            )
+            .all(axis=1)
+            .all()
+        )
+        v3io_dict = v3io_df.head(1).to_dict(orient="records")[0]
+        assert (
+            v3io_dict["effective_sample_count"]
+            == v3io_dict["estimated_prediction_count"]
+            == 3
+        )
+        error_df = tsdb_client.get_error_count(endpoint_ids=mep.metadata.uid)
+        assert len(error_df) == 1
+        error_dict = error_df.head(1).to_dict(orient="records")[0]
+        assert error_dict["error_count"] == 1
+
+    @pytest.mark.timeout(480)
+    def test_monitoring_with_streaming_model_runner(self):
+        """Test that model monitoring correctly captures outputs from MRS with
+        both streaming and non-streaming models.
+
+        This test verifies that:
+        1. A Collector step is inserted between the streaming MRS and MM steps
+        2. The MonitoringPreProcessor aggregates the collected streaming chunks
+        3. Model endpoints are created and record monitoring events
+        4. TSDB predictions and parquet data are written correctly
+        5. Streaming and non-streaming models coexist in the same MRS
+        """
+        function_name = "streaming-mm-test"
+        streaming_endpoint = "streaming-model"
+        inc_endpoint_1 = "inc-model-1"
+        inc_endpoint_2 = "inc-model-2"
+
+        function = mlrun.code_to_function(
+            name=function_name,
+            kind="serving",
+            tag="latest",
+            project=self.project_name,
+            filename=str(self.assets_path / "models.py"),
+            image=self.image,
+        )
+        function.spec.replicas = 1
+
+        self.set_mm_credentials()
+
+        # Set up ModelRunnerStep with streaming + non-streaming models.
+        # Use MyModelSelector to select models via a "models" key in the
+        # request body, so we can target the streaming model alone or both
+        # non-streaming models together.
+        graph = function.set_topology("flow", engine="async")
+        model_runner_step = mlrun.serving.states.ModelRunnerStep(
+            name="model-runner",
+            model_runner_selector="MyModelSelector",
+        )
+        model_runner_step.add_model(
+            model_class="StreamingModel",
+            endpoint_name=streaming_endpoint,
+            execution_mechanism="naive",
+            num_chunks=3,
+        )
+        model_runner_step.add_model(
+            model_class="IncModel",
+            endpoint_name=inc_endpoint_1,
+            execution_mechanism="naive",
+            inc=1,
+        )
+        model_runner_step.add_model(
+            model_class="IncModel",
+            endpoint_name=inc_endpoint_2,
+            execution_mechanism="naive",
+            inc=2,
+        )
+        graph.to(model_runner_step, "runner").respond()
+
+        # Enable streaming and monitoring
+        function.set_streaming(enabled=True)
+        function.set_tracking()
+        self.project.enable_model_monitoring(
+            deploy_histogram_data_drift_app=False,
+            **({} if self.image is None else {"image": self.image}),
+        )
+
+        function.deploy()
+
+        # Invoke streaming model alone (mixing streaming + non-streaming is not
+        # supported and would raise StreamingError)
+        function.invoke("/", body={"prompt": "test", "models": streaming_endpoint})
+
+        # Invoke both non-streaming models together
+        function.invoke(
+            "/",
+            body={"n": 1, "models": f"{inc_endpoint_1},{inc_endpoint_2}"},
+        )
+
+        # Wait for monitoring data to be processed
+        sleep(180)
+
+        # Verify all three model endpoints were created
+        model_endpoints = (
+            mlrun.get_run_db().list_model_endpoints(self.project_name).endpoints
+        )
+        endpoint_names_found = [ep.metadata.name for ep in model_endpoints]
+        for expected_name in [
+            streaming_endpoint,
+            inc_endpoint_1,
+            inc_endpoint_2,
+        ]:
+            assert expected_name in endpoint_names_found, (
+                f"Expected endpoint '{expected_name}' not found. "
+                f"Found: {endpoint_names_found}"
+            )
+
+        # Verify last_request is set for all endpoints
+        for ep_name in [streaming_endpoint, inc_endpoint_1, inc_endpoint_2]:
+            mep = mlrun.get_run_db().get_model_endpoint(
+                name=ep_name,
+                project=self.project_name,
+                function_name=function_name,
+                function_tag="latest",
+                feature_analysis=True,
+                tsdb_metrics=True,
+            )
+            assert mep.status.last_request is not None, (
+                f"Expected last_request to be set for endpoint '{ep_name}'"
+            )
+
+        # Verify TSDB predictions table has records for all 3 endpoints
+        tsdb_client = mlrun.model_monitoring.get_tsdb_connector(
+            project=self.project_name, profile=self.mm_tsdb_profile
+        )
+        predictions = tsdb_client._get_records(
+            table=mm_constants.V3IOTSDBTables.PREDICTIONS,
+            start="now-50m",
+            end="now",
+        )
+        assert len(predictions) == 3
+
+        # Verify parquet predictions for the streaming endpoint
+        streaming_mep = mlrun.get_run_db().get_model_endpoint(
+            name=streaming_endpoint,
+            project=self.project_name,
+            function_name=function_name,
+            function_tag="latest",
+        )
+        v3io_df = pd.read_parquet(
+            f"v3io:///projects/{self.project_name}/artifacts/"
+            f"model-endpoints/parquet/key={streaming_mep.metadata.uid}"
+        )
+        assert len(v3io_df) == 1
+        v3io_dict = v3io_df.head(1).to_dict(orient="records")[0]
+        assert v3io_dict["endpoint_name"] == streaming_endpoint
+        assert (
+            v3io_dict["effective_sample_count"]
+            == v3io_dict["estimated_prediction_count"]
+            == 1
+        )
+
     def _assert_model_endpoint_tags_and_labels(
         self,
         endpoint: mlrun.common.schemas.ModelEndpoint,
         model_name: str,
-        tag: str,
+        tags: list[str],
         labels: dict[str, str],
     ) -> None:
         assert endpoint.metadata.labels == labels
         assert endpoint.spec.model_name == model_name
-        assert endpoint.spec.model_tag == tag
+        assert endpoint.spec.model_tags == tags
 
 
 @pytest.mark.skip(reason="Chronically fails, see ML-5820")
@@ -571,9 +1435,7 @@ class TestModelMonitoringRegression(TestMLRunSystem):
         )
 
         # Request (get or create) the offline dataset from the feature store and save to a parquet target
-        mlrun.feature_store.get_offline_features(
-            fv, target=mlrun.datastore.targets.ParquetTarget()
-        )
+        fv.get_offline_features(target=mlrun.datastore.targets.ParquetTarget())
 
         # Train the model using the auto trainer from the hub
         train = mlrun.import_function("hub://auto-trainer", new_name="train")
@@ -792,7 +1654,7 @@ class TestVotingModelMonitoring(TestMLRunSystem):
 
         # Simulating valid requests
         t_end = monotonic() + simulation_time
-        start_time = datetime.now(timezone.utc)
+        start_time = datetime.now(UTC)
         data_sent = 0
         while monotonic() < t_end:
             data_point = choice(iris_data)
@@ -844,7 +1706,9 @@ class TestVotingModelMonitoring(TestMLRunSystem):
             )
 
         # list model endpoints and perform analysis for each endpoint
-        endpoints_list = mlrun.get_run_db().list_model_endpoints(self.project_name)
+        endpoints_list = mlrun.get_run_db().list_model_endpoints(
+            self.project_name, tsdb_metrics=True
+        )
 
         for endpoint in endpoints_list:
             # Validate that the model endpoint record has been updated through the stream process
@@ -950,129 +1814,9 @@ class TestVotingModelMonitoring(TestMLRunSystem):
         assert fields_dict["active"] == "boolean"
 
 
-@TestMLRunSystem.skip_test_if_env_not_configured
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
 @pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestBatchDrift(TestMLRunSystem):
-    """Record monitoring parquet results and trigger the monitoring batch drift job analysis. This flow tests
-    the monitoring process of the batch infer job function that can be imported from the functions hub.
-    """
-
-    project_name = "pr-batch-drift"
-    # Set image to "<repo>/mlrun:<tag>" for local testing
-    image: Optional[str] = None
-
-    def custom_setup(self):
-        mlrun.runtimes.utils.global_context.set(None)
-
-    def test_batch_drift(self):
-        # Main validations:
-        # 1 - Generate new model endpoint record through get_or_create_model_endpoint() within MLRun SDK
-        # 2 - Write monitoring parquet result to the relevant context
-        # 3 - Register and trigger monitoring batch drift job
-        # 4 - Log monitoring artifacts
-
-        # Generate project and context (context will be used for logging the artifacts)
-        project = self.project
-        context = mlrun.get_or_create_ctx(name="batch-drift-context")
-
-        # Log a model artifact
-        iris = load_iris()
-        train_set = pd.DataFrame(
-            data=np.c_[iris["data"], iris["target"]],
-            columns=(
-                [
-                    "sepal_length_cm",
-                    "sepal_width_cm",
-                    "petal_length_cm",
-                    "petal_width_cm",
-                    "p0",
-                ]
-            ),
-        )
-        model_name = "sklearn_RandomForestClassifier"
-        # Upload the model through the projects API so that it is available to the serving function
-        model = project.log_model(
-            model_name,
-            model_dir=os.path.relpath(self.assets_path),
-            model_file="model.pkl",
-            training_set=train_set,
-            artifact_path=f"v3io:///projects/{project.name}",
-            label_column="p0",
-        )
-
-        # Deploy model monitoring infra
-        project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
-        project.enable_model_monitoring(
-            base_period=1,
-            deploy_histogram_data_drift_app=True,
-            **({} if self.image is None else {"image": self.image}),
-            wait_for_deployment=True,
-        )
-
-        # Generate a dataframe that will be written as a monitoring parquet
-        # This dataframe is basically replacing the result set that is being generated through the batch infer function
-        infer_results_df = pd.DataFrame(
-            {
-                "sepal_length_cm": [-500, -500],
-                "sepal_width_cm": [-500, -500],
-                "petal_length_cm": [-500, -500],
-                "petal_width_cm": [-500, -500],
-                "p0": [0, 0],
-            }
-        )
-        infer_results_df[mlrun.common.schemas.EventFieldType.TIMESTAMP] = (
-            mlrun.utils.datetime_now()
-        )
-
-        # Record results and trigger the monitoring batch job
-        model_endpoint = mlrun.model_monitoring.api.record_results(
-            project=project.metadata.name,
-            model_path=project.get_artifact_uri(
-                key=model_name, category="model", tag="latest"
-            ),
-            model_endpoint_name="batch-drift-test",
-            function_name="batch-drift-function",
-            context=context,
-            infer_results_df=infer_results_df,
-        )
-
-        # Wait for the controller, app and writer to complete
-        sleep(130)
-
-        model_endpoint = mlrun.model_monitoring.api.get_or_create_model_endpoint(
-            project=project.name,
-            endpoint_id=model_endpoint.metadata.uid,
-            model_endpoint_name="batch-drift-test",
-            function_name="batch-drift-function",
-        )
-        # Validate that model_uri is based on models prefix
-        _validate_model_uri(model_obj=model, model_endpoint=model_endpoint)
-
-        # Validate that the artifacts were logged in the project
-        artifacts = project.list_artifacts(
-            labels={
-                "mlrun/producer-type": "model-monitoring-app",
-                "mlrun/app-name": "histogram-data-drift",
-                "mlrun/endpoint-id": model_endpoint.metadata.uid,
-            }
-        )
-        assert len(artifacts) == 2
-        assert {art["metadata"]["key"] for art in artifacts} == {
-            "drift_table_plot",
-            "features_drift_results",
-        }
-
-
-@TestMLRunSystem.skip_test_if_env_not_configured
-@pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestModelMonitoringKafka(TestMLRunSystem):
+class TestModelMonitoringKafka(TestMLRunSystemModelMonitoring):
     """Deploy a basic iris model configured with kafka stream"""
 
     brokers = (
@@ -1084,7 +1828,7 @@ class TestModelMonitoringKafka(TestMLRunSystem):
 
     project_name = "pr-kafka-model-monitoring"
     # Set image to "<repo>/mlrun:<tag>" for local testing
-    image: Optional[str] = None
+    image: str | None = None
 
     @pytest.mark.timeout(300)
     @pytest.mark.skipif(
@@ -1127,13 +1871,7 @@ class TestModelMonitoringKafka(TestMLRunSystem):
             ),
         )
 
-        project.set_model_monitoring_credentials(
-            stream_path=f"kafka://{self.brokers}",
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
-
+        self.set_mm_credentials()
         # enable model monitoring
         serving_fn.set_tracking()
 
@@ -1182,229 +1920,193 @@ class TestModelMonitoringKafka(TestMLRunSystem):
 
         # Validate that the model endpoint metrics were updated as indication for the sanity of the flow
         model_endpoint = mlrun.get_run_db().list_model_endpoints(
-            project=self.project_name
+            project=self.project_name, tsdb_metrics=True
         )[0]
 
         assert model_endpoint.status.metrics["generic"]["latency_avg_5m"] > 0
         assert model_endpoint.status.metrics["generic"]["predictions_count_5m"] > 0
 
 
-@TestMLRunSystem.skip_test_if_env_not_configured
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
 @pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestInferenceWithSpecialChars(TestMLRunSystem):
-    project_name = "pr-infer-special-chars"
-    name_prefix = "infer-monitoring"
-    # Set image to "<repo>/mlrun:<tag>" for local testing
-    image: Optional[str] = None
+class TestKafkaConsumerGroupMigration(TestMLRunSystemModelMonitoring):
+    """Verify Kafka consumer-group offset migration on upgrade.
 
-    @classmethod
-    def custom_setup_class(cls) -> None:
-        # todo testsssss
-        cls.classif = SVC()
-        cls.model_name = "classif_model"
-        cls.columns = ["feat 1", "b (C)", "Last   for df "]
-        cls.y_name = "class (0-4) "
-        cls.num_rows = 20
-        cls.num_cols = len(cls.columns)
-        cls.num_classes = 5
-        cls.x_train, cls.x_test, cls.y_train, cls.y_test = cls._generate_data()
-        cls.training_set = cls.x_train.join(cls.y_train)
-        cls.test_set = cls.x_test.join(cls.y_test)
-        cls.infer_results_df = cls.test_set
-        cls.infer_results_df[mlrun.common.schemas.EventFieldType.TIMESTAMP] = (
-            mlrun.utils.datetime_now()
-        )
-        cls.function_name = f"{cls.name_prefix}-function"
-        cls.model_endpoint_name = f"{cls.name_prefix}-test"
-        cls._train()
+    Simulates a legacy cluster (MM functions all sharing the ``"serving"``
+    consumer group) by pre-creating the stream topic and committing
+    offsets under ``"serving"``, then enabling model monitoring with the
+    new code and checking:
 
-    def custom_setup(self) -> None:
-        mlrun.runtimes.utils.global_context.set(None)
-        # Set the model monitoring credentials
-        self.project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
-
-    @classmethod
-    def _generate_data(cls) -> list[Union[pd.DataFrame, pd.Series]]:
-        rng = np.random.default_rng(seed=23)
-        x = pd.DataFrame(rng.random((cls.num_rows, cls.num_cols)), columns=cls.columns)
-        y = pd.Series(np.arange(cls.num_rows) % cls.num_classes, name=cls.y_name)
-        assert cls.num_rows > cls.num_classes
-        return train_test_split(x, y, train_size=0.6, random_state=4)
-
-    @classmethod
-    def _train(cls) -> None:
-        cls.classif.fit(
-            cls.x_train,
-            cls.y_train,  # pyright: ignore[reportGeneralTypeIssues]
-        )
-
-    def _get_monitoring_feature_set(self) -> mlrun.feature_store.FeatureSet:
-        model_endpoint = mlrun.get_run_db().get_model_endpoint(
-            project=self.project_name,
-            name=self.model_endpoint_name,
-            function_name=self.function_name,
-            function_tag="latest",
-        )
-        return mlrun.feature_store.get_feature_set(
-            model_endpoint.spec.monitoring_feature_set_uri
-        )
-
-    def _test_feature_names(self) -> None:
-        feature_set = self._get_monitoring_feature_set()
-        features = feature_set.spec.features
-        feature_names = [feat.name for feat in features]
-        feature_names.sort()
-        columns_feature_names = [
-            mlrun.feature_store.api.norm_column_name(feat)
-            for feat in self.columns
-            + [self.y_name]
-            + mm_constants.FeatureSetFeatures.list()
-        ]
-        columns_feature_names.sort()
-        assert feature_names == columns_feature_names
-
-        df = pd.read_parquet(
-            f"v3io:///projects/{self.project.name}/artifacts/model-endpoints/parquet"
-        )
-        assert all(feature in df.columns for feature in feature_names)
-
-    def test_inference_feature_set(self) -> None:
-        self.project.log_model(  # pyright: ignore[reportOptionalMemberAccess]
-            self.model_name,
-            body=pickle.dumps(self.classif),
-            model_file="classif.pkl",
-            framework="sklearn",
-            training_set=self.training_set,
-            label_column=self.y_name,
-        )
-
-        # TODO: activate ad-hoc mode when ML-5792 is done
-        # self.project.enable_model_monitoring(
-        #     **({} if self.image is None else {"image": self.image}),
-        # )
-
-        mlrun.model_monitoring.api.record_results(
-            project=self.project_name,
-            model_path=self.project.get_artifact_uri(
-                key=self.model_name, category="model", tag="latest"
-            ),
-            model_endpoint_name=self.model_endpoint_name,
-            function_name=self.function_name,
-            context=mlrun.get_or_create_ctx(name=f"{self.name_prefix}-context"),  # pyright: ignore[reportGeneralTypeIssues]
-            infer_results_df=self.infer_results_df,
-            # TODO: activate ad-hoc mode when ML-5792 is done
-        )
-
-        self._test_feature_names()
-
-
-@TestMLRunSystem.skip_test_if_env_not_configured
-@pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestModelInferenceTSDBRecord(TestMLRunSystem):
-    """
-    Test that batch inference records results to V3IO TSDB when tracking is
-    enabled and the selected model does not have a serving endpoint.
+    1. The per-function group (``serving_<topic>``) receives the legacy
+       offsets verbatim.
+    2. The legacy ``"serving"`` group is left untouched (migration is a
+       copy, not a move).
+    3. Re-enabling MM a second time is an idempotent no-op.
     """
 
-    project_name = "infer-model-tsdb"
-    name_prefix = "infer-model-only"
-    # Set image to "<repo>/mlrun:<tag>" for local testing
-    image: Optional[str] = None
+    brokers = (
+        os.environ["MLRUN_SYSTEM_TESTS_KAFKA_BROKERS"]
+        if "MLRUN_SYSTEM_TESTS_KAFKA_BROKERS" in os.environ
+        and os.environ["MLRUN_SYSTEM_TESTS_KAFKA_BROKERS"]
+        else None
+    )
 
-    @classmethod
-    def custom_setup_class(cls) -> None:
-        dataset = load_iris()
-        cls.train_set = pd.DataFrame(
-            dataset.data,  # pyright: ignore[reportGeneralTypeIssues]
-            columns=[
-                "sepal_length_cm",
-                "sepal_width_cm",
-                "petal_length_cm",
-                "petal_width_cm",
-            ],
-        )
-        cls.model_name = "clf_model"
+    project_name = "pr-kafka-mig"
+    image: str | None = None
 
-        cls.infer_results_df = cls.train_set.copy()
+    _LEGACY_GROUP = "serving"
+    _LEGACY_OFFSET = 17
+    _NUM_PARTITIONS = 2
 
-    def custom_setup(self) -> None:
-        mlrun.runtimes.utils.global_context.set(None)
-
-    def _log_model(self) -> str:
-        model = self.project.log_model(  # pyright: ignore[reportOptionalMemberAccess]
-            self.model_name,
-            model_dir=os.path.relpath(self.assets_path),
-            model_file="model.pkl",
-            training_set=self.train_set,
-            artifact_path=f"v3io:///projects/{self.project_name}",
-        )
-        return model.uri
-
-    @classmethod
-    def _test_v3io_tsdb_record(cls) -> None:
-        tsdb_client = mlrun.model_monitoring.get_tsdb_connector(
-            project=cls.project_name, profile=get_tsdb_datastore_profile_from_env()
+    def _stream_topic(self) -> str:
+        return mlrun.common.model_monitoring.helpers.get_kafka_topic(
+            project=self.project_name,
+            function_name=mm_constants.MonitoringFunctionNames.STREAM,
         )
 
-        df: pd.DataFrame = tsdb_client._get_records(
-            table=mm_constants.V3IOTSDBTables.APP_RESULTS,
-            start="now-5m",
-            end="now",
+    def _expected_new_group(self, topic: str) -> str:
+        return f"{self._LEGACY_GROUP}_{topic}"
+
+    def _create_topic(self, topic: str) -> None:
+        import kafka
+        import kafka.admin
+        import kafka.errors
+
+        admin = kafka.admin.KafkaAdminClient(bootstrap_servers=self.brokers)
+        try:
+            try:
+                admin.create_topics(
+                    [
+                        kafka.admin.NewTopic(
+                            topic,
+                            num_partitions=self._NUM_PARTITIONS,
+                            replication_factor=1,
+                        )
+                    ]
+                )
+            except kafka.errors.TopicAlreadyExistsError:
+                pass
+        finally:
+            admin.close()
+
+    def _delete_groups_and_topic(self, topic: str, groups: list[str]) -> None:
+        import kafka
+        import kafka.admin
+        import kafka.errors
+
+        admin = kafka.admin.KafkaAdminClient(bootstrap_servers=self.brokers)
+        try:
+            try:
+                admin.delete_consumer_groups(groups)
+            except kafka.errors.KafkaError:
+                pass
+            try:
+                admin.delete_topics([topic])
+            except kafka.errors.UnknownTopicOrPartitionError:
+                pass
+        finally:
+            admin.close()
+
+    def _commit_offsets(self, group: str, topic: str, offset: int) -> dict[int, int]:
+        import kafka
+        import kafka.structs
+
+        consumer = kafka.KafkaConsumer(
+            bootstrap_servers=self.brokers,
+            group_id=group,
+            enable_auto_commit=False,
+        )
+        try:
+            # A freshly-created topic isn't always visible to the consumer
+            # immediately — broker metadata propagation takes a moment.
+            partitions: set[int] | None = None
+            for _ in range(30):
+                partitions = consumer.partitions_for_topic(topic)
+                if partitions:
+                    break
+                sleep(1)
+            assert partitions, f"Topic {topic!r} has no partitions after metadata wait"
+            to_commit = {
+                kafka.TopicPartition(topic, p): kafka.structs.OffsetAndMetadata(
+                    offset, "", -1
+                )
+                for p in partitions
+            }
+            consumer.commit(to_commit)
+            return {tp.partition: om.offset for tp, om in to_commit.items()}
+        finally:
+            consumer.close()
+
+    def _read_committed_offsets(self, group: str, topic: str) -> dict[int, int]:
+        import kafka
+        import kafka.admin
+
+        admin = kafka.admin.KafkaAdminClient(bootstrap_servers=self.brokers)
+        try:
+            all_offsets = admin.list_consumer_group_offsets(group)
+            return {
+                tp.partition: om.offset
+                for tp, om in all_offsets.items()
+                if tp.topic == topic
+            }
+        finally:
+            admin.close()
+
+    @pytest.mark.timeout(600)
+    @pytest.mark.skipif(
+        not brokers, reason="MLRUN_SYSTEM_TESTS_KAFKA_BROKERS not defined"
+    )
+    def test_legacy_offsets_are_migrated_and_idempotent(self):
+        topic = self._stream_topic()
+        new_group = self._expected_new_group(topic)
+
+        # Ensure a clean slate — the test may re-run on the same cluster
+        # and stale groups/topics would skew the assertions.
+        self._delete_groups_and_topic(topic, [self._LEGACY_GROUP, new_group])
+
+        # 1. Seed the legacy state: topic exists with committed offsets
+        #    under the shared "serving" group (what the legacy code produced).
+        self._create_topic(topic)
+        seeded = self._commit_offsets(
+            group=self._LEGACY_GROUP, topic=topic, offset=self._LEGACY_OFFSET
+        )
+        assert len(seeded) == self._NUM_PARTITIONS, (
+            f"Expected {self._NUM_PARTITIONS} legacy offsets, got {seeded}"
         )
 
-        assert not df.empty, "No TSDB data"
-        assert (
-            len(df) == 1
-        ), "Expects a single result from the histogram data drift app in the TSDB"
-        assert set(df.application_name) == {
-            "histogram-data-drift"
-        }, "The application name is different than expected"
-        assert df.endpoint_id.nunique() == 1, "Expects a single model endpoint"
-        assert set(df.result_name) == {
-            "general_drift",
-        }, "The result is different than expected"
-
-    def test_record(self) -> None:
-        self.project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
+        # 2. Enable MM. For the stream function, create_topics() raises
+        #    TopicAlreadyExistsError → tolerant branch → migration runs.
+        self.set_mm_credentials()
         self.project.enable_model_monitoring(
-            base_period=1,
-            deploy_histogram_data_drift_app=True,
+            deploy_histogram_data_drift_app=False,
             **({} if self.image is None else {"image": self.image}),
-            wait_for_deployment=True,
         )
 
-        model_uri = self._log_model()
-
-        mlrun.model_monitoring.api.record_results(
-            project=self.project_name,
-            infer_results_df=self.infer_results_df,
-            model_path=model_uri,
-            model_endpoint_name=f"{self.name_prefix}-test",
-            context=mlrun.get_or_create_ctx(name=f"{self.name_prefix}-context"),  # pyright: ignore[reportGeneralTypeIssues]
-            # TODO: activate ad-hoc mode when ML-5792 is done
+        # 3. Per-function group should now carry the legacy offsets verbatim.
+        migrated = self._read_committed_offsets(group=new_group, topic=topic)
+        assert migrated == seeded, (
+            f"Migration must copy offsets from {self._LEGACY_GROUP!r} to "
+            f"{new_group!r}: expected {seeded}, got {migrated}"
         )
 
-        sleep(130)
+        # Legacy group is a copy source, not a move source — untouched.
+        legacy_after = self._read_committed_offsets(
+            group=self._LEGACY_GROUP, topic=topic
+        )
+        assert legacy_after == seeded, (
+            "Legacy group offsets must be preserved after migration"
+        )
 
-        self._test_v3io_tsdb_record()
+        # Idempotency of the migration helper itself (the short-circuit on
+        # the already-populated new group) is exercised by the unit tests
+        # in ``test_deployment.py``. Re-calling ``enable_model_monitoring``
+        # here is blocked by MLRun's own "already deployed" guard and is
+        # outside the scope of this test.
 
 
-@TestMLRunSystem.skip_test_if_env_not_configured
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
 @pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestModelEndpointWithManyFeatures(TestMLRunSystem):
+class TestModelEndpointWithManyFeatures(TestMLRunSystemModelMonitoring):
     """Log a model with 500 features and validate the model endpoint feature stats."""
 
     project_name = "pr-many-features-model-monitoring"
@@ -1412,12 +2114,7 @@ class TestModelEndpointWithManyFeatures(TestMLRunSystem):
     def test_model_endpoint_with_many_features(self) -> None:
         project = self.project
 
-        project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
+        self.set_mm_credentials()
 
         # Generate a model with 500 features
         x, y = make_classification(n_samples=1000, n_features=500, random_state=42)
@@ -1439,24 +2136,44 @@ class TestModelEndpointWithManyFeatures(TestMLRunSystem):
         )
 
         # Generate a model endpoint
-        model_endpoint = mlrun.model_monitoring.api.get_or_create_model_endpoint(
-            project=project.name,
-            model_path=model_obj.uri,
-            function_name="dummy_func",
-            model_endpoint_name="dummy_ep",
+        db = mlrun.get_run_db()
+        out_model_endpoint = db.create_model_endpoint(
+            mlrun.common.schemas.ModelEndpoint(
+                metadata=mlrun.common.schemas.ModelEndpointMetadata(
+                    name="dummy_ep",
+                    project=project.name,
+                    endpoint_type=mlrun.common.schemas.model_monitoring.EndpointType.BATCH_EP,
+                    mode=mlrun.common.schemas.model_monitoring.EndpointMode.BATCH_LEGACY,
+                ),
+                spec=mlrun.common.schemas.ModelEndpointSpec(
+                    function_name="dummy_func",
+                    function_tag="latest",
+                    model_path=model_obj.uri,
+                ),
+                status=mlrun.common.schemas.ModelEndpointStatus(
+                    monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled,
+                ),
+            )
+        )
+        model_endpoint = db.get_model_endpoint(
+            name=out_model_endpoint.metadata.name,
+            project=out_model_endpoint.metadata.project,
+            function_name=out_model_endpoint.spec.function_name,
+            function_tag=out_model_endpoint.spec.function_tag,
+            endpoint_id=out_model_endpoint.metadata.uid,
+            feature_analysis=True,
         )
 
         assert len(model_endpoint.spec.feature_stats) == 501
 
 
-@TestMLRunSystem.skip_test_if_env_not_configured
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
 @pytest.mark.enterprise
-@pytest.mark.model_monitoring
-class TestModelEndpointGetMetrics(TestMLRunSystem):
+class TestModelEndpointGetMetrics(TestMLRunSystemModelMonitoring):
     """Test get_model_endpoint_monitoring_metrics functionality."""
 
     project_name = "model-endpoint-get-metrics"
-    image: typing.Optional[str] = None
+    image: str | None = None
 
     @staticmethod
     def _generate_event(
@@ -1466,10 +2183,8 @@ class TestModelEndpointGetMetrics(TestMLRunSystem):
         event_kind="result",
         app_name="my_app",
     ):
-        start_infer_time = datetime.isoformat(datetime(2024, 1, 1, tzinfo=timezone.utc))
-        end_infer_time = datetime.isoformat(
-            datetime(2024, 1, 1, second=1, tzinfo=timezone.utc)
-        )
+        start_infer_time = datetime.isoformat(datetime(2024, 1, 1, tzinfo=UTC))
+        end_infer_time = datetime.isoformat(datetime(2024, 1, 1, second=1, tzinfo=UTC))
         event_value = 123
         event_name_key = f"{event_kind}_name"
         event_value_key = f"{event_kind}_value"
@@ -1495,14 +2210,11 @@ class TestModelEndpointGetMetrics(TestMLRunSystem):
         return data
 
     def test_get_model_endpoint_metrics(self):
-        self.project.set_model_monitoring_credentials(
-            stream_path=os.getenv("MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION"),
-            tsdb_connection=os.getenv(
-                "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION"
-            ),
-        )
+        self.set_mm_credentials()
 
-        self.project.enable_model_monitoring(image=self.image or "mlrun/mlrun")
+        self.project.enable_model_monitoring(
+            image=self.image or mlrun.mlconf.function_defaults.image_by_kind.job
+        )
         db = mlrun.get_run_db()
         model_endpoint = mock_random_endpoint(self.project_name, "testing")
         model_endpoint = db.create_model_endpoint(model_endpoint)
@@ -1510,8 +2222,12 @@ class TestModelEndpointGetMetrics(TestMLRunSystem):
         model_endpoint2 = mock_random_endpoint(self.project_name, "testing2")
         model_endpoint2 = db.create_model_endpoint(model_endpoint2)
 
+        model_endpoint3 = mock_random_endpoint(self.project_name, "testing3")
+        model_endpoint3 = db.create_model_endpoint(model_endpoint3)
+
         mep_uid = model_endpoint.metadata.uid
         mep2_uid = model_endpoint2.metadata.uid
+        mep3_uid = model_endpoint3.metadata.uid
         mep_name = model_endpoint.metadata.name
         mep2_name = model_endpoint2.metadata.name
 
@@ -1520,12 +2236,11 @@ class TestModelEndpointGetMetrics(TestMLRunSystem):
         )
         writer._wait_for_function_deployment(db=writer._get_db())
 
-        stream_uri = get_stream_path(
+        output_stream = get_output_stream(
             project=self.project.metadata.name,
             function_name=mm_constants.MonitoringFunctionNames.WRITER,
-            profile=DatastoreProfileV3io(name="tmp"),
+            profile=self.mm_stream_profile,
         )
-        output_stream = get_stream_pusher(stream_uri)
 
         output_stream.push(
             self._generate_event(
@@ -1569,7 +2284,7 @@ class TestModelEndpointGetMetrics(TestMLRunSystem):
             ),
         )
         # wait for the nuclio function to check for the stream inputs
-        sleep(15)
+        sleep(45)
         expected_for_mep1 = [
             "invocations",
             "metric1",
@@ -1614,26 +2329,185 @@ class TestModelEndpointGetMetrics(TestMLRunSystem):
             [result.name for result in intersection_events_by_type[results_key]]
         )
 
+        # test that intersection with mep with no metrics returns only invocations metric and nor results
+        intersection_events_empty = self._run_db.get_metrics_by_multiple_endpoints(
+            project=self.project.name,
+            endpoint_ids=[mep_uid, mep3_uid],
+            events_format=mm_constants.GetEventsFormat.INTERSECTION,
+        )
+        assert ["invocations"] == [
+            metric.name for metric in intersection_events_empty[metrics_key]
+        ]
+        assert [] == [metric.name for metric in intersection_events_empty[results_key]]
+
         # get nonexistent MEP IDs:
         result_for_non_exist = self._run_db.get_model_endpoint_monitoring_metrics(
             project=self.project.name, endpoint_id="not_exist", type="results"
         )
         assert result_for_non_exist == []
 
-        result_for_non_exist = self._run_db.get_metrics_by_multiple_endpoints(
-            project=self.project.name, endpoint_ids=["not_exist"], type="results"
-        )
-        assert result_for_non_exist == {"not_exist": []}
+        with pytest.raises(mlrun.errors.MLRunNotFoundError) as err:
+            self._run_db.get_metrics_by_multiple_endpoints(
+                project=self.project.name, endpoint_ids=[uuid4().hex], type="results"
+            )
+        assert "were not found in project" in str(err.value)
 
-        intersection_results_for_non_exist = (
+        with pytest.raises(mlrun.errors.MLRunNotFoundError) as err:
             self._run_db.get_metrics_by_multiple_endpoints(
                 project=self.project.name,
-                endpoint_ids=["not_exist", "not_exist2"],
+                endpoint_ids=[uuid4().hex, uuid4().hex],
                 events_format=mm_constants.GetEventsFormat.INTERSECTION,
                 type="results",
             )
+        assert "were not found in project" in str(err.value)
+
+
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
+@pytest.mark.enterprise
+class TestModelMonitoringOverJob(TestMLRunSystemModelMonitoring):
+    """Test get_model_endpoint_monitoring_metrics functionality."""
+
+    project_name = "model-monitoring-over-job"
+    image = None  # uses mlrun.mlconf.function_defaults.image_by_kind at runtime
+
+    @pytest.mark.parametrize("with_timestamp_column", [False, True])
+    def test_job_from_serving_runtime_with_model_tracking(self, with_timestamp_column):
+        function = self.project.set_function(
+            func=str(self.assets_path / "function_with_model.py"),
+            name="test",
+            kind="serving",
+            image=self.image,
         )
-        assert intersection_results_for_non_exist[results_key] == []
+        graph = function.set_topology("flow", engine="async")
+
+        model_runner_step = ModelRunnerStep(name="my_model_runner")
+        model_runner_step.add_model(
+            endpoint_name="my_model",
+            model_class="DummyModel",
+            execution_mechanism="naive",
+            model_endpoint_creation_strategy=mm_constants.ModelEndpointCreationStrategy.OVERWRITE,
+        )
+
+        graph.to(model_runner_step).to(
+            name="parquet",
+            class_name="storey.ParquetTarget",
+            path=f"v3io:///projects/{self.project_name}/out.parquet",
+        )
+
+        function.set_tracking()
+
+        self.set_mm_credentials()
+        self.project.enable_model_monitoring(
+            deploy_histogram_data_drift_app=False,
+            **({} if self.image is None else {"image": self.image}),
+        )
+
+        job = function.to_job()
+
+        with open(str(self.assets_path / "test_data.csv")) as f:
+            csv_content = f.read()
+
+        v3io_client = v3io.Client(endpoint=mlrun.mlconf.v3io_api)
+        try:
+            v3io_client.object.put(
+                "projects", f"{self.project_name}/in.csv", body=csv_content
+            )
+            inputs = {"data": f"v3io:///projects/{self.project_name}/in.csv"}
+            params = {}
+            if with_timestamp_column:
+                params["timestamp_column"] = "time"
+            start_time = datetime.now(UTC)  # any time zone will do
+            self.project.run_function(job, inputs=inputs, params=params, local=False)
+            end_time = datetime.now(UTC)
+            read_back_df = pd.read_parquet(
+                f"v3io:///projects/{self.project_name}/out.parquet"
+            )
+            assert "extra" in read_back_df.columns, (
+                "Extra column was not added by model"
+            )
+
+            model_endpoints = (
+                mlrun.get_run_db().list_model_endpoints(self.project_name).endpoints
+            )
+
+            assert len(model_endpoints) == 1
+            assert model_endpoints[0].metadata.name == "my_model"
+            assert model_endpoints[0].metadata.endpoint_type == EndpointType.BATCH_EP
+
+            container, stream_path = self.get_stream_path(
+                mm_constants.MonitoringFunctionNames.STREAM
+            )
+            describe_output = v3io_client.stream.describe(
+                container,
+                stream_path,
+            ).output
+            shard_count = describe_output.shard_count
+            read_back_records = []
+            for shard in range(shard_count):
+                try:
+                    location = v3io_client.stream.seek(
+                        container, stream_path, shard, "EARLIEST"
+                    ).output.location
+                except V3ioHttpResponseError as response_error:
+                    if response_error.status_code == 404:
+                        continue
+                    raise response_error
+                while True:
+                    get_records_result = v3io_client.stream.get_records(
+                        container, stream_path, shard, location
+                    ).output
+                    location = get_records_result.next_location
+                    for record in get_records_result.records:
+                        read_back_records.append(json.loads(record.data))
+                    if get_records_result.records_behind_latest == 0:
+                        break
+            assert len(read_back_records) == 5
+            earliest_time_in_dataset = datetime(2020, 1, 1, 1, tzinfo=UTC)
+            latest_time_in_dataset = datetime(2020, 1, 1, 4, tzinfo=UTC)
+            for record in read_back_records:
+                if record.get("kind") == "batch_complete":
+                    assert "endpoint_id" in record
+                    assert record["kind"] == "batch_complete"
+                    assert record["project"] == self.project_name
+                    if with_timestamp_column:
+                        assert record["first_timestamp"] == "2020-01-01T01:00:00+00:00"
+                        assert record["last_timestamp"] == "2020-01-01T04:00:00+00:00"
+                    else:
+                        first_timestamp = datetime.fromisoformat(
+                            record["first_timestamp"]
+                        )
+                        last_timestamp = datetime.fromisoformat(
+                            record["last_timestamp"]
+                        )
+                        assert end_time > last_timestamp > first_timestamp > start_time
+                    assert (
+                        end_time
+                        > datetime.fromisoformat(record["batch_completion_time"])
+                        > start_time
+                    )
+                else:
+                    assert {
+                        "model",
+                        "model_class",
+                        "when",
+                        "request",
+                        "resp",
+                        "endpoint_id",
+                    }.issubset(record)
+                    assert record.get("error") is None
+                    assert (
+                        record["request"]["inputs"][0] + [123]
+                        == record["resp"]["outputs"][0]
+                    )
+                    when = datetime.fromisoformat(record["when"])
+                    if with_timestamp_column:
+                        assert (
+                            latest_time_in_dataset >= when >= earliest_time_in_dataset
+                        )
+                    else:
+                        assert end_time > when > start_time
+        finally:
+            v3io_client.close()
 
 
 def _validate_model_uri(model_obj, model_endpoint):
@@ -1651,3 +2525,547 @@ def _validate_model_uri(model_obj, model_endpoint):
     )
 
     assert model_endpoint.spec.model_uri == model_artifact_uri
+
+
+class TestLLModelWithMonitoring(TestMLRunSystemModelMonitoring):
+    """Test LLModel serving with model monitoring enabled."""
+
+    project_name = "llmodel-monitoring-5"
+    image: str | None = (
+        None  # uses mlrun.mlconf.function_defaults.image_by_kind at runtime
+    )
+
+    def test_mep_with_remote_model(self):
+        self.set_mm_credentials()
+        self.project.enable_model_monitoring(
+            base_period=1, deploy_histogram_data_drift_app=False, image=self.image
+        )
+        model_name = "my_model"
+        model_url = "mock://my-model-url"
+        default_config = {"model_version": "4"}
+        model_artifact = self.project.log_model(
+            model_name,
+            model_url=model_url,
+            default_config=default_config,
+        )
+        llm_prompt = self.project.log_llm_prompt(
+            "my-llm-prompt",
+            prompt_template=[
+                {"role": "user", "content": "What is the capital of France?"}
+            ],
+            model_artifact=model_artifact,
+        )
+        function = mlrun.code_to_function(
+            name="function_with_model",
+            kind="serving",
+            tag="latest",
+            project=self.project_name,
+            filename=str(self.assets_path / "models.py"),
+            image=self.image,
+        )
+        graph = function.set_topology("flow", engine="async")
+        graph.add_shared_model(
+            model_class="LLModel",
+            execution_mechanism="naive",
+            result_path="result",
+            name="shared-model",
+            model_artifact=model_artifact,
+        )
+        model_runner_step = mlrun.serving.states.ModelRunnerStep(
+            name="model-runner-step"
+        )
+        model_runner_step.add_model(
+            model_class="MyRemoteModel",
+            execution_mechanism="naive",
+            endpoint_name="my-model-1",
+            model_artifact=model_artifact,
+            inputs=["prompt"],
+            outputs=["prompt"],
+        )
+        model_runner_step.add_shared_model_proxy(
+            endpoint_name="my-model-2",
+            model_artifact=llm_prompt.uri,
+        )
+        model_runner_step.add_model(
+            model_class="LLModel",
+            execution_mechanism="naive",
+            endpoint_name="my-model-3",
+            model_artifact=llm_prompt.uri,
+        )
+        graph.to(model_runner_step, "runner").respond()
+        function.set_tracking()
+
+        function.deploy()
+
+        response = function.invoke(
+            f"v2/models/{model_name}/infer",
+            json.dumps({"prompt": "What is the capital of france?"}),
+        )
+
+        assert response["my-model-1"]["default_config"] == default_config
+        assert response["my-model-1"]["url"] == model_url
+        assert response["my-model-1"]["prompt"] == "What is the capital of france?"
+
+        assert (
+            response["my-model-2"]["result"]["answer"]
+            == "You are using a mock model provider, no actual inference is performed."
+        )
+        assert response["my-model-2"]["result"]["usage"] == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        assert (
+            response["my-model-3"]["answer"]
+            == "You are using a mock model provider, no actual inference is performed."
+        )
+        assert response["my-model-3"]["usage"] == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+        sleep(45)
+        meps = self.project.list_model_endpoints(tsdb_metrics=True)
+        assert len(meps.endpoints) == 3, (
+            f"Expected 3 endpoints, got {len(meps.endpoints)}"
+        )
+        mep_2: ModelEndpoint = self.project.list_model_endpoints(
+            names="my-model-2"
+        ).endpoints[0]
+        assert mep_2.spec.label_names == ["answer", "usage"]
+        assert mep_2.spec.model_class == "LLModel"
+
+        mep_3: ModelEndpoint = self.project.list_model_endpoints(
+            names="my-model-3"
+        ).endpoints[0]
+        assert mep_3.spec.label_names == ["answer", "usage"]
+        assert mep_3.spec.model_class == "LLModel"
+
+        for mep in meps.endpoints:
+            # make sure stream processing worked and last_request is set
+            assert mep.status.last_request is not None
+
+
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
+@pytest.mark.enterprise
+class TestGetModelMonitoringURL(TestMLRunSystemModelMonitoring):
+    """
+    System / CRUD tests for get_model_monitoring_url.
+
+    Validates the full call chain:
+      project.get_model_monitoring_url()
+        → GET /projects/{project}/model-monitoring/stream-pod-http-url
+          → services.api.crud.Functions.get_function (real DB)
+            → resolves URL from nuclio status
+    """
+
+    project_name = "pr-mm-get-url"
+    image: str | None = None
+
+    def test_raises_before_monitoring_is_enabled(self) -> None:
+        """CRUD raises when the stream function has not been deployed / is not ready."""
+        with pytest.raises(
+            (mlrun.errors.MLRunNotFoundError, mlrun.errors.MLRunPreconditionFailedError)
+        ):
+            self.project.get_model_monitoring_url()
+
+    @pytest.mark.timeout(600)
+    def test_returns_url_after_enable_model_monitoring(self) -> None:
+        """
+        After enable_model_monitoring the stream pod is deployed with an HTTP trigger.
+        The CRUD endpoint must resolve and return the internal cluster URL.
+
+        Note: the returned URL is only reachable from within the cluster (internal
+        invocation URL) — it is not accessible from outside.
+        """
+        self.set_mm_credentials()
+        self.project.enable_model_monitoring(
+            deploy_histogram_data_drift_app=False,
+            wait_for_deployment=True,
+            **({} if self.image is None else {"image": self.image}),
+        )
+
+        # Stream is now ready — get_model_monitoring_url should return the internal URL.
+        url = self.project.get_model_monitoring_url()
+
+        assert url is not None, (
+            "get_model_monitoring_url() returned None — the HTTP trigger was not added "
+            "to the stream function or the internal_invocation_urls are not populated."
+        )
+        # The URL must be an internal cluster URL (http, not https; no public hostname).
+        assert url.startswith("http://"), (
+            f"Expected an internal http:// URL, got: {url!r}"
+        )
+        assert "://" not in url.replace("http://", ""), (
+            f"URL looks external (contains a second scheme), got: {url!r}"
+        )
+
+
+def _assert_endpoint_exists(
+    project,
+    name: str,
+    function_name: str | None = None,
+    function_tag: str = "latest",
+) -> None:
+    endpoints = project.list_model_endpoints(names=name).endpoints
+    assert len(endpoints) >= 1, f"Expected at least one model endpoint named {name!r}"
+    if function_name is not None:
+        ep = endpoints[0]
+        assert ep.spec.function_name == function_name, (
+            f"Endpoint {name!r} not linked to function: "
+            f"spec.function_name={ep.spec.function_name!r}, expected {function_name!r}"
+        )
+        assert ep.spec.function_tag == function_tag, (
+            f"Endpoint {name!r} not linked to function tag: "
+            f"spec.function_tag={ep.spec.function_tag!r}, expected {function_tag!r}"
+        )
+
+
+def _assert_endpoints_exist(
+    project,
+    names: set,
+    function_name: str | None = None,
+    function_tag: str = "latest",
+) -> None:
+    endpoints = project.list_model_endpoints().endpoints
+    by_name = {ep.metadata.name: ep for ep in endpoints}
+    assert names.issubset(by_name.keys()), (
+        f"Expected {names} in DB, found: {set(by_name)}"
+    )
+    if function_name is not None:
+        for n in names:
+            ep = by_name[n]
+            assert ep.spec.function_name == function_name, (
+                f"Endpoint {n!r} not linked to function: "
+                f"spec.function_name={ep.spec.function_name!r}, expected {function_name!r}"
+            )
+            assert ep.spec.function_tag == function_tag, (
+                f"Endpoint {n!r} not linked to function tag: "
+                f"spec.function_tag={ep.spec.function_tag!r}, expected {function_tag!r}"
+            )
+
+
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
+@pytest.mark.enterprise
+class TestNuclioAppModelEndpointCreation(TestMLRunSystemModelMonitoring):
+    """
+    System / CRUD tests for model endpoint creation during nuclio function deployment.
+
+    Full sequence:
+      1. enable_model_monitoring  (deploys stream pod with HTTP trigger — done ONCE per class)
+      2. code_to_function(kind="nuclio") + setup_model_monitoring()
+      3. deploy()
+      4. assert MODEL_MONITORING_URL / MODEL_ENDPOINT_UID env vars are injected
+      5. assert model endpoint(s) exist in the DB
+    """
+
+    project_name = "pr-nuclio-me-creation"
+    image: str | None = None
+
+    @classmethod
+    def setup_class(cls):
+        # enable_model_monitoring runs ONCE before any test method, so it is
+        # NOT subject to per-test @pytest.mark.timeout limits.
+        super().setup_class()
+        project = mlrun.get_or_create_project(
+            cls.project_name, "./", allow_cross_project=True
+        )
+        project.register_datastore_profile(cls.mm_tsdb_profile)
+        project.register_datastore_profile(cls.mm_stream_profile)
+        project.set_model_monitoring_credentials(
+            tsdb_profile_name=cls.mm_tsdb_profile.name,
+            stream_profile_name=cls.mm_stream_profile.name,
+        )
+        project.enable_model_monitoring(
+            deploy_histogram_data_drift_app=False,
+            wait_for_deployment=True,
+            **({} if cls.image is None else {"image": cls.image}),
+        )
+
+    def teardown_method(self, method):
+        # Keep the project alive so the monitoring stream pod persists across
+        # test methods — only clean up at class teardown.
+        self._logger.info(
+            f"Tearing down test {self.__class__.__name__}::{method.__name__}"
+        )
+        self.custom_teardown()
+        self._logger.info(
+            f"Finished tearing down test {self.__class__.__name__}::{method.__name__}"
+        )
+
+    @classmethod
+    def custom_teardown_class(cls):
+        try:
+            cls._run_db.delete_project(
+                cls.project_name,
+                deletion_strategy=mlrun.common.schemas.DeletionStrategy.cascading,
+            )
+        except Exception:
+            pass
+
+    def _wait_for_model_endpoint_background_task(self, timeout: int = 120) -> None:
+        """Poll every 5s until no model-endpoint-creation background tasks are running."""
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            tasks = self._run_db.list_project_background_tasks(
+                project=self.project_name,
+                state=mlrun.common.schemas.BackgroundTaskState.running,
+            )
+            if not tasks:
+                self._logger.info("No running background tasks, proceeding")
+                return
+            self._logger.info(
+                "Waiting for model endpoint background task to complete",
+                running_tasks=len(tasks),
+            )
+            sleep(5)
+        self._logger.warning(
+            "Background task wait timed out, proceeding anyway",
+            timeout=timeout,
+        )
+
+    def _deploy_nuclio_fn_with_monitoring(
+        self,
+        fn_name: str,
+        instructions: list,
+        kind: str = "nuclio",
+    ):
+        if kind == "application":
+            fn = mlrun.new_function(
+                name=fn_name,
+                kind=kind,
+                project=self.project_name,
+                image="python:3.11",
+            )
+            fn.spec.command = "python"
+            fn.spec.args = ["-m", "http.server", "8050"]
+            fn.set_probe(type="readiness", http_path="/", period_seconds=2)
+            fn.setup_model_monitoring(
+                general_model_endpoint_instructions=instructions[0],
+                extra_model_endpoint_instructions=instructions[1:]
+                if len(instructions) > 1
+                else None,
+            )
+            fn.deploy(with_mlrun=False)
+        else:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+                f.write("def handler(context, event):\n    return 'ok'\n")
+                tmpfile = f.name
+            try:
+                fn = mlrun.code_to_function(
+                    name=fn_name,
+                    filename=tmpfile,
+                    kind=kind,
+                    project=self.project_name,
+                    image=self.image,
+                )
+            finally:
+                os.unlink(tmpfile)
+            fn.setup_model_monitoring(
+                general_model_endpoint_instructions=instructions[0],
+                extra_model_endpoint_instructions=instructions[1:]
+                if len(instructions) > 1
+                else None,
+            )
+            fn.deploy()
+
+        # Reload from server to pick up env vars injected server-side during deploy
+        fn = self.project.get_function(fn_name)
+        return fn
+
+    @pytest.mark.timeout(600)
+    def test_single_endpoint_env_vars_injected(self) -> None:
+        """
+        After deploy, the function spec must contain MODEL_MONITORING_URL and
+        MODEL_ENDPOINT_UID env vars, and a model endpoint must exist in the DB.
+        """
+        from mlrun.common.schemas.model_monitoring.constants import (
+            NuclioMonitoringEnvVars,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        fn_name = "nuclio-single-ep"
+        fn = self._deploy_nuclio_fn_with_monitoring(
+            fn_name=fn_name,
+            instructions=[ModelEndpointInstruction(name="ep1")],
+        )
+
+        # Verify env vars were injected into the deployed function spec
+        # Use .get("value") — some entries use valueFrom (K8s secret refs) and have no "value" key
+        env = {e["name"]: e.get("value") for e in (fn.spec.env or [])}
+        assert NuclioMonitoringEnvVars.MODEL_MONITORING_URL in env, (
+            "MODEL_MONITORING_URL not injected"
+        )
+        # The URL must be an internal cluster URL (http://, not https or external hostname).
+        assert env[NuclioMonitoringEnvVars.MODEL_MONITORING_URL].startswith(
+            "http://"
+        ), (
+            f"Expected an internal http:// URL, got: {env[NuclioMonitoringEnvVars.MODEL_MONITORING_URL]!r}"
+        )
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINT_UID in env, (
+            "MODEL_ENDPOINT_UID not injected"
+        )
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINTS_MAP not in env, (
+            "MODEL_ENDPOINTS_MAP should not be present for a single endpoint"
+        )
+
+        # Wait for the background task that creates model endpoints to finish,
+        # then retry the check every 30s until the endpoint appears in the DB.
+        self._wait_for_model_endpoint_background_task()
+        self.wait_for_condition(
+            lambda: _assert_endpoint_exists(
+                self.project, "ep1", function_name=fn_name, function_tag="latest"
+            ),
+            retry_interval=30.0,
+            timeout=120.0,
+            condition_description="model endpoint 'ep1' to exist in DB",
+        )
+
+    @pytest.mark.timeout(600)
+    def test_multiple_endpoints_map_injected(self) -> None:
+        """
+        With two instructions, MODEL_ENDPOINTS_MAP must be injected as a JSON
+        mapping {name: uid} and two model endpoints must exist in the DB.
+        """
+        from mlrun.common.schemas.model_monitoring.constants import (
+            NuclioMonitoringEnvVars,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        fn_name = "nuclio-multi-ep"
+        fn = self._deploy_nuclio_fn_with_monitoring(
+            fn_name=fn_name,
+            instructions=[
+                ModelEndpointInstruction(name="ep1"),
+                ModelEndpointInstruction(name="ep2"),
+            ],
+        )
+
+        env = {e["name"]: e.get("value") for e in (fn.spec.env or [])}
+        assert NuclioMonitoringEnvVars.MODEL_MONITORING_URL in env
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINT_UID in env
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINTS_MAP in env, (
+            "MODEL_ENDPOINTS_MAP not injected for multiple endpoints"
+        )
+
+        endpoints_map = json.loads(env[NuclioMonitoringEnvVars.MODEL_ENDPOINTS_MAP])
+        assert set(endpoints_map.keys()) == {"ep1", "ep2"}, (
+            f"Unexpected endpoints map keys: {set(endpoints_map.keys())}"
+        )
+
+        # Wait for the background task that creates model endpoints to finish,
+        # then retry the check every 30s until both endpoints appear in the DB.
+        self._wait_for_model_endpoint_background_task()
+        self.wait_for_condition(
+            lambda: _assert_endpoints_exist(
+                self.project,
+                {"ep1", "ep2"},
+                function_name=fn_name,
+                function_tag="latest",
+            ),
+            retry_interval=30.0,
+            timeout=120.0,
+            condition_description="model endpoints 'ep1' and 'ep2' to exist in DB",
+        )
+
+
+@TestMLRunSystemModelMonitoring.skip_test_if_env_not_configured
+@pytest.mark.enterprise
+class TestApplicationRuntimeModelEndpointCreation(TestNuclioAppModelEndpointCreation):
+    """
+    Model-endpoint-creation tests using kind="application" (ApplicationRuntime).
+
+    Both runtimes go through the same server-side path in endpoints.py:
+        elif kind in (RuntimeKinds.remote, RuntimeKinds.nuclio, RuntimeKinds.application)
+            and spec.track_models
+
+    Tests are explicit (not inherited overrides) so both nuclio and application
+    variants appear in the test suite side by side.
+    """
+
+    project_name = "pr-app-me-creation"
+    image: str | None = None
+
+    @pytest.mark.timeout(600)
+    def test_single_endpoint_env_vars_injected(self) -> None:
+        from mlrun.common.schemas.model_monitoring.constants import (
+            NuclioMonitoringEnvVars,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        fn_name = "app-single-ep"
+        fn = self._deploy_nuclio_fn_with_monitoring(
+            fn_name=fn_name,
+            instructions=[ModelEndpointInstruction(name="ep1")],
+            kind="application",
+        )
+
+        env = {e["name"]: e.get("value") for e in (fn.spec.env or [])}
+        assert NuclioMonitoringEnvVars.MODEL_MONITORING_URL in env, (
+            "MODEL_MONITORING_URL not injected"
+        )
+        assert env[NuclioMonitoringEnvVars.MODEL_MONITORING_URL].startswith("http://")
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINT_UID in env, (
+            "MODEL_ENDPOINT_UID not injected"
+        )
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINTS_MAP not in env
+
+        self._wait_for_model_endpoint_background_task()
+        self.wait_for_condition(
+            lambda: _assert_endpoint_exists(
+                self.project, "ep1", function_name=fn_name, function_tag="latest"
+            ),
+            retry_interval=30.0,
+            timeout=120.0,
+            condition_description="model endpoint 'ep1' to exist in DB",
+        )
+
+    @pytest.mark.timeout(600)
+    def test_multiple_endpoints_map_injected(self) -> None:
+        from mlrun.common.schemas.model_monitoring.constants import (
+            NuclioMonitoringEnvVars,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        fn_name = "app-multi-ep"
+        fn = self._deploy_nuclio_fn_with_monitoring(
+            fn_name=fn_name,
+            instructions=[
+                ModelEndpointInstruction(name="ep1"),
+                ModelEndpointInstruction(name="ep2"),
+            ],
+            kind="application",
+        )
+
+        env = {e["name"]: e.get("value") for e in (fn.spec.env or [])}
+        assert NuclioMonitoringEnvVars.MODEL_MONITORING_URL in env
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINT_UID in env
+        assert NuclioMonitoringEnvVars.MODEL_ENDPOINTS_MAP in env
+
+        endpoints_map = json.loads(env[NuclioMonitoringEnvVars.MODEL_ENDPOINTS_MAP])
+        assert set(endpoints_map.keys()) == {"ep1", "ep2"}
+
+        self._wait_for_model_endpoint_background_task()
+        self.wait_for_condition(
+            lambda: _assert_endpoints_exist(
+                self.project,
+                {"ep1", "ep2"},
+                function_name=fn_name,
+                function_tag="latest",
+            ),
+            retry_interval=30.0,
+            timeout=120.0,
+            condition_description="model endpoints 'ep1' and 'ep2' to exist in DB",
+        )

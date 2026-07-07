@@ -17,6 +17,7 @@ __all__ = [
     "load_project",
     "new_project",
     "get_or_create_project",
+    "get_model_monitoring_url",
     "MlrunProject",
     "ProjectMetadata",
     "ProjectSpec",
@@ -32,12 +33,14 @@ from .pipelines import (
     load_and_run_workflow,
     load_and_run,
     pipeline_context,
+    rerun_workflow,
 )  # noqa
 from .project import (
     MlrunProject,
     ProjectMetadata,
     ProjectSpec,
     ProjectStatus,
+    get_model_monitoring_url,
     get_or_create_project,
     load_project,
     new_project,

@@ -15,7 +15,7 @@
 import re
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
-from typing import Any, Optional
+from typing import Any
 
 import pydantic.v1
 import pytest
@@ -30,15 +30,18 @@ from mlrun.common.schemas.model_monitoring.model_endpoints import (
     ModelEndpointMonitoringMetric,
     _parse_metric_fqn_to_monitoring_metric,
 )
+from mlrun.model_monitoring.db.tsdb.v3io.stream_graph_steps import (
+    _normalize_dict_for_v3io_frames,
+)
 
 
 @pytest.mark.parametrize(
     ("fqn", "expected_result", "expectation"),
     [
         (
-            "1infer-model-tsdb-t3.histogram-data-drift.result.general_drift",
+            "infer-model-tsdb-t3.histogram-data-drift.result.general_drift",
             ModelEndpointMonitoringMetric(
-                project="1infer-model-tsdb-t3",
+                project="infer-model-tsdb-t3",
                 app="histogram-data-drift",
                 type=ModelEndpointMonitoringMetricType.RESULT,
                 name="general_drift",
@@ -46,12 +49,12 @@ from mlrun.common.schemas.model_monitoring.model_endpoints import (
             does_not_raise(),
         ),
         (
-            "proj_j.app-123.metric.error-count",
+            "proj-j.app-123.metric.error_count",
             ModelEndpointMonitoringMetric(
-                project="proj_j",
+                project="proj-j",
                 app="app-123",
                 type=ModelEndpointMonitoringMetricType.METRIC,
-                name="error-count",
+                name="error_count",
             ),
             does_not_raise(),
         ),
@@ -61,7 +64,7 @@ from mlrun.common.schemas.model_monitoring.model_endpoints import (
 )
 def test_fqn_parsing(
     fqn: str,
-    expected_result: Optional[ModelEndpointMonitoringMetricType],
+    expected_result: ModelEndpointMonitoringMetricType | None,
     expectation: AbstractContextManager,
 ) -> None:
     with expectation:
@@ -69,12 +72,21 @@ def test_fqn_parsing(
 
 
 @pytest.mark.parametrize(
-    ("flat_mep", "expectation"),
+    ("flat_mep", "validate", "expectation"),
     [
-        ({"project": "proj-1", "uid": "ok_30", "name": "test"}, does_not_raise()),
-        ({}, pytest.raises(pydantic.v1.ValidationError)),
+        (
+            {
+                "project": "proj-1",
+                "uid": "81d488cf-0104-4bb4-98c4-e4fd1204e82f",
+                "name": "test",
+            },
+            True,
+            does_not_raise(),
+        ),
+        ({}, True, pytest.raises(pydantic.v1.ValidationError)),
         (
             {"project": "im-fine-10"},
+            True,
             pytest.raises(
                 pydantic.v1.ValidationError,
                 match=(
@@ -87,24 +99,28 @@ def test_fqn_parsing(
         ),
         (
             {"project": "im-fine-10", "uid": "xx' OR '1'='1", "name": "test"},
+            True,
             pytest.raises(
                 pydantic.v1.ValidationError,
-                match=(
-                    re.escape(
-                        "1 validation error for ModelEndpointMetadata\nuid\n  "
-                        "string does not match regex "
-                        '"^[a-zA-Z0-9_-]+$" (type=value_error.str.regex; pattern=^[a-zA-Z0-9_-]+$)'
-                    )
+                match=re.escape(
+                    "1 validation error for ModelEndpointMetadata\nuid\n  "
+                    "string does not match regex "
+                    '"^[a-zA-Z0-9_-]+$" (type=value_error.str.regex; pattern=^[a-zA-Z0-9_-]+$)'
                 ),
             ),
+        ),
+        (
+            {"project": "im-fine-10", "uid": "xx' OR '1'='1", "name": "test"},
+            False,
+            does_not_raise(),
         ),
     ],
 )
 def test_model_endpoint_from_flat_dict(
-    flat_mep: dict[str, Any], expectation: AbstractContextManager
+    flat_mep: dict[str, Any], validate: bool, expectation: AbstractContextManager
 ) -> None:
     with expectation:
-        ModelEndpoint.from_flat_dict(flat_mep)
+        ModelEndpoint.from_flat_dict(flat_mep, validate=validate)
 
 
 def test_project_pattern() -> None:
@@ -112,3 +128,154 @@ def test_project_pattern() -> None:
         r"^.{0,63}$",
         r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
     ], f"The `project_name` regex changed, please update {PROJECT_PATTERN=} accordingly"
+
+
+@pytest.mark.parametrize(
+    "event,expected",
+    [
+        # basic case: valid key
+        ({"validKey": 1}, {"validKey": 1}),
+        # hyphens replaced with underscores
+        ({"key-name": 42}, {"key_name": 42}),
+        # keys starting with digit
+        ({"123abc": "value"}, {"_123abc": "value"}),
+        # nested dict flattening
+        (
+            {"outer": {"inner-key": 99}},
+            {"outer:inner_key": 99},
+        ),
+        # multiple nested levels
+        (
+            {"a": {"b": {"c-key": 5}}},
+            {"a:b:c_key": 5},
+        ),
+        # mixed dicts and values
+        (
+            {"root": {"sub1": 1, "sub-2": {"deep-key": "x"}}, "plain": 7},
+            {"root:sub1": 1, "root:sub_2:deep_key": "x", "plain": 7},
+        ),
+        # key with digit prefix deep inside
+        (
+            {"root": {"123abc": {"-bad-key": 1}}},
+            {"root:_123abc:_bad_key": 1},
+        ),
+    ],
+)
+def test_normalize_dict(event, expected):
+    result = _normalize_dict_for_v3io_frames(event)
+    assert result == expected
+
+
+def test_empty_dict():
+    assert _normalize_dict_for_v3io_frames({}) == {}
+
+
+class TestModelEndpointInstruction:
+    def test_to_dict_defaults(self):
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        instr = ModelEndpointInstruction(name="my-endpoint")
+        d = instr.to_dict()
+        assert d["name"] == "my-endpoint"
+        assert d["creation_strategy"] == "inplace"
+        assert d["monitoring_mode"] == "enabled"
+        assert d["input_schema"] is None
+        assert d["output_schema"] is None
+        assert d["function_name"] is None
+        assert d["function_tag"] is None
+
+    def test_to_dict_all_fields(self):
+        from mlrun.common.schemas.model_monitoring.constants import (
+            ModelEndpointCreationStrategy,
+            ModelMonitoringMode,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        instr = ModelEndpointInstruction(
+            name="ep",
+            input_schema=["f1", "f2"],
+            output_schema=["label"],
+            function_name="my-fn",
+            function_tag="v1",
+            creation_strategy=ModelEndpointCreationStrategy.ARCHIVE,
+            monitoring_mode=ModelMonitoringMode.disabled,
+        )
+        d = instr.to_dict()
+        assert d == {
+            "name": "ep",
+            "input_schema": ["f1", "f2"],
+            "output_schema": ["label"],
+            "function_name": "my-fn",
+            "function_tag": "v1",
+            "creation_strategy": "archive",
+            "monitoring_mode": "disabled",
+        }
+
+    def test_from_dict_round_trip(self):
+        from mlrun.common.schemas.model_monitoring.constants import (
+            ModelEndpointCreationStrategy,
+            ModelMonitoringMode,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        original = ModelEndpointInstruction(
+            name="ep",
+            input_schema=["x"],
+            output_schema=["y"],
+            function_name="fn",
+            function_tag="latest",
+            creation_strategy=ModelEndpointCreationStrategy.OVERWRITE,
+            monitoring_mode=ModelMonitoringMode.disabled,
+        )
+        restored = ModelEndpointInstruction.from_dict(original.to_dict())
+        assert restored == original
+        assert restored.monitoring_mode == ModelMonitoringMode.disabled
+
+    def test_from_dict_defaults(self):
+        from mlrun.common.schemas.model_monitoring.constants import (
+            ModelEndpointCreationStrategy,
+            ModelMonitoringMode,
+        )
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        restored = ModelEndpointInstruction.from_dict({"name": "only-name"})
+        assert restored.name == "only-name"
+        assert restored.creation_strategy == ModelEndpointCreationStrategy.INPLACE
+        assert restored.monitoring_mode == ModelMonitoringMode.enabled
+        assert restored.input_schema is None
+
+    def test_spec_fields_excludes_none(self):
+        from mlrun.common.schemas.model_monitoring.model_endpoints import (
+            ModelEndpointInstruction,
+        )
+
+        # None fields must be absent from spec_fields
+        instr = ModelEndpointInstruction(name="ep")
+        assert instr.spec_fields == {}
+
+        # Populated fields must appear with mapped keys
+        instr = ModelEndpointInstruction(
+            name="ep",
+            input_schema=["f1", "f2"],
+            output_schema=["label"],
+            function_name="my-fn",
+            function_tag="v1",
+        )
+        assert instr.spec_fields == {
+            "feature_names": ["f1", "f2"],
+            "label_names": ["label"],
+            "function_name": "my-fn",
+            "function_tag": "v1",
+        }
+
+        # Partial population — only set fields appear
+        instr = ModelEndpointInstruction(name="ep", input_schema=["x"])
+        assert instr.spec_fields == {"feature_names": ["x"]}

@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import inspect
-from typing import Optional
 
+import inspect
+from typing import Any
+
+import nuclio_sdk
+
+import mlrun.errors
 from mlrun.utils import get_in, update_in
 
 # headers keys with underscore are getting ignored by werkzeug https://github.com/pallets/werkzeug/pull/2622
@@ -22,6 +25,19 @@ from mlrun.utils import get_in, update_in
 # more info https://github.com/benoitc/gunicorn/issues/2799, this comment can be removed once old keys are removed
 event_id_key = "MLRUN-EVENT-ID"
 event_path_key = "MLRUN-EVENT-PATH"
+
+
+def is_event_like(obj: Any) -> bool:
+    """Return True if obj looks like a graph event wrapper — has a `.body`
+    attribute and is not a Response. Duck-typed on `.body` so any event-like
+    class (current or future) is recognized; Response (mlrun + nuclio variants)
+    is excluded because it also has `.body` but means a final HTTP response.
+    """
+    # Response is imported lazily to avoid a circular import between
+    # mlrun.serving.server (which transitively depends on this module) and utils.
+    from mlrun.serving.server import Response
+
+    return hasattr(obj, "body") and not isinstance(obj, (Response, nuclio_sdk.Response))
 
 
 def _extract_input_data(input_path, body):
@@ -44,6 +60,66 @@ def _update_result_body(result_path, event_body, result):
     return event_body
 
 
+class _RequestContext(dict):
+    """Unified request context passed to handlers after API handler processing.
+
+    Merges parameters from body_map (JSONPath extraction), path templates, query
+    string, and system-injected URL info into a single dict.  The original event
+    body is preserved as :attr:`original_body`.
+
+    When a downstream :class:`TaskStep` receives this object it calls the handler
+    as ``fn(original_body, **params)`` so handlers can declare named parameters::
+
+        def handler(body, model_name, version, **kwargs): ...
+
+    Priority order (highest wins): path > query > body_map.
+    Conflicts between path/query/body_map raise :exc:`MLRunBadRequestError`.
+    System-injected ``url_params`` (``mlrun_`` prefix) are merged last without
+    conflict checking.
+    """
+
+    def __init__(
+        self,
+        original_body: Any = None,
+        path_params: dict[str, str] | None = None,
+        query_params: dict[str, str | list[str]] | None = None,
+        body_params: dict[str, Any] | None = None,
+        url_params: dict[str, Any] | None = None,
+    ):
+        merged: dict[str, Any] = {}
+        sources = [
+            ("body_map", body_params or {}),
+            ("query", query_params or {}),
+            ("path", path_params or {}),
+        ]
+
+        param_sources: dict[str, list[str]] = {}
+        for source_name, params in sources:
+            for key, value in params.items():
+                if key in merged:
+                    param_sources.setdefault(key, []).append(source_name)
+                else:
+                    param_sources[key] = [source_name]
+                merged[key] = value
+
+        conflicts = {k: v for k, v in param_sources.items() if len(v) > 1}
+        if conflicts:
+            conflict_details = ", ".join(
+                f"{k} (from {' + '.join(srcs)})" for k, srcs in conflicts.items()
+            )
+            raise mlrun.errors.MLRunBadRequestError(
+                f"Parameter name conflict detected. Same parameter appears in multiple "
+                f"request sources: {conflict_details}. Parameters must be unique across "
+                f"path, query, and body_map."
+            )
+
+        if url_params:
+            merged.update(url_params)
+
+        super().__init__(merged)
+        self.original_body = original_body
+
+
 class StepToDict:
     """auto serialization of graph steps to a python dictionary"""
 
@@ -58,8 +134,8 @@ class StepToDict:
 
     def to_dict(
         self,
-        fields: Optional[list] = None,
-        exclude: Optional[list] = None,
+        fields: list | None = None,
+        exclude: list | None = None,
         strip: bool = False,
     ):
         """convert the step object to a python dictionary"""
@@ -113,8 +189,8 @@ class RouterToDict(StepToDict):
 
     def to_dict(
         self,
-        fields: Optional[list] = None,
-        exclude: Optional[list] = None,
+        fields: list | None = None,
+        exclude: list | None = None,
         strip: bool = False,
     ):
         return super().to_dict(exclude=["routes"], strip=strip)

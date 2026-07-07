@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import typing
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, ClassVar, Literal, Union
 
 import pandas as pd
 import pydantic.v1
+
+if TYPE_CHECKING:
+    import v3io_frames.client
 
 import mlrun.common.schemas.model_monitoring as mm_schemas
 import mlrun.model_monitoring.db.tsdb.helpers
@@ -26,7 +29,7 @@ from mlrun.utils import logger
 
 
 class TSDBConnector(ABC):
-    type: typing.ClassVar[str]
+    type: ClassVar[str]
 
     def __init__(self, project: str) -> None:
         """
@@ -59,6 +62,16 @@ class TSDBConnector(ABC):
         """
         pass
 
+    def apply_writer_steps(self, graph, after, **kwargs) -> None:
+        """
+        Apply TSDB steps on the provided writer graph. Throughout these steps, the graph stores metrics / results.
+        This data is being used by mlrun UI and the monitoring dashboards in grafana.
+        There are 2 different key metric dictionaries that are being generated throughout these steps:
+        - metrics (user-defined metrics) - model monitoring application metrics
+        - results (user-defined results) - model monitoring application results
+        """
+        pass
+
     @abstractmethod
     def handle_model_error(self, graph, **kwargs) -> None:
         """
@@ -78,6 +91,42 @@ class TSDBConnector(ABC):
 
         :raise mlrun.errors.MLRunRuntimeError: If an error occurred while writing the event.
         """
+
+    @abstractmethod
+    def get_drift_data(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> mm_schemas.ModelEndpointDriftValues:
+        """
+        Fetches drift counts per interval in the specified time range.
+
+        :param start: The start time of the query.
+        :param end:   The end time of the query.
+
+        :return: A ModelEndpointDriftValues object containing drift data.
+        """
+
+    @abstractmethod
+    def delete_tsdb_records(self, endpoint_ids: list[str]) -> None:
+        """
+        Delete model endpoint records from the TSDB connector.
+
+        :param endpoint_ids: List of model endpoint unique identifiers.
+        """
+        pass
+
+    @abstractmethod
+    def delete_application_records(
+        self, application_name: str, endpoint_ids: list[str] | None = None
+    ) -> None:
+        """
+        Delete application records from the TSDB for the given model endpoints or all if ``None``.
+
+        :param application_name: The name of the application to delete records for.
+        :param endpoint_ids:     List of model endpoint unique identifiers.
+        """
+        pass
 
     @abstractmethod
     def delete_tsdb_resources(self):
@@ -130,17 +179,17 @@ class TSDBConnector(ABC):
         start: datetime,
         end: datetime,
         metrics: list[mm_schemas.ModelEndpointMonitoringMetric],
-        type: typing.Literal["metrics", "results"],
+        type: Literal["metrics", "results"],
         with_result_extra_data: bool,
-    ) -> typing.Union[
+    ) -> Union[
         list[
-            typing.Union[
+            Union[
                 mm_schemas.ModelEndpointMonitoringResultValues,
                 mm_schemas.ModelEndpointMonitoringMetricNoData,
             ],
         ],
         list[
-            typing.Union[
+            Union[
                 mm_schemas.ModelEndpointMonitoringMetricValues,
                 mm_schemas.ModelEndpointMonitoringMetricNoData,
             ],
@@ -166,10 +215,10 @@ class TSDBConnector(ABC):
         endpoint_id: str,
         start: datetime,
         end: datetime,
-        aggregation_window: typing.Optional[str] = None,
-        agg_funcs: typing.Optional[list[str]] = None,
-        limit: typing.Optional[int] = None,
-    ) -> typing.Union[
+        aggregation_window: str | None = None,
+        agg_funcs: list[str] | None = None,
+        limit: int | None = None,
+    ) -> Union[
         mm_schemas.ModelEndpointMonitoringMetricValues,
         mm_schemas.ModelEndpointMonitoringMetricNoData,
     ]:
@@ -195,10 +244,10 @@ class TSDBConnector(ABC):
     @abstractmethod
     def get_last_request(
         self,
-        endpoint_ids: typing.Union[str, list[str]],
-        start: typing.Optional[datetime] = None,
-        end: typing.Optional[datetime] = None,
-    ) -> pd.DataFrame:
+        endpoint_ids: Union[str, list[str]],
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> Union[pd.DataFrame, dict[str, float]]:
         """
         Fetches data from the predictions TSDB table and returns the most recent request
         timestamp for each specified endpoint.
@@ -207,17 +256,20 @@ class TSDBConnector(ABC):
         :param start:           The start time for the query.
         :param end:             The end time for the query.
 
-        :return: A pd.DataFrame containing the columns [endpoint_id, last_request, last_latency].
-        If an endpoint has not been invoked within the specified time range, it will not appear in the result.
+        :return: A pd.DataFrame containing the columns [endpoint_id, last_request, last_latency] or a dictionary
+        containing the endpoint_id as the key and the last request timestamp as the value.
+        if an endpoint has not been invoked within the specified time range, it will not appear in the result (relevant
+        only to non-v3io connector).
         """
 
     @abstractmethod
     def get_drift_status(
         self,
-        endpoint_ids: typing.Union[str, list[str]],
-        start: typing.Optional[datetime] = None,
-        end: typing.Optional[datetime] = None,
-    ) -> pd.DataFrame:
+        endpoint_ids: Union[str, list[str]],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, "list[v3io_frames.client.RawFrame]"]:
         """
         Fetches data from the app-results TSDB table and returns the highest status among all
         the result in the provided time range, which by default is the last 24 hours, for each specified endpoint.
@@ -225,6 +277,8 @@ class TSDBConnector(ABC):
         :param endpoint_ids:    A list of model endpoint identifiers.
         :param start:           The start time for the query.
         :param end:             The end time for the query.
+        :param get_raw:         Whether to return the request as raw frames rather than a pandas dataframe. Defaults
+          to False. This can greatly improve performance when a dataframe isn't needed.
 
         :return: A pd.DataFrame containing the columns [result_status, endpoint_id].
         If an endpoint has not been monitored within the specified time range (last 24 hours),
@@ -234,9 +288,9 @@ class TSDBConnector(ABC):
     @abstractmethod
     def get_metrics_metadata(
         self,
-        endpoint_id: typing.Union[str, list[str]],
-        start: typing.Optional[datetime] = None,
-        end: typing.Optional[datetime] = None,
+        endpoint_id: Union[str, list[str]],
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> pd.DataFrame:
         """
         Fetches distinct metrics metadata from the metrics TSDB table for a specified model endpoints.
@@ -252,9 +306,9 @@ class TSDBConnector(ABC):
     @abstractmethod
     def get_results_metadata(
         self,
-        endpoint_id: typing.Union[str, list[str]],
-        start: typing.Optional[datetime] = None,
-        end: typing.Optional[datetime] = None,
+        endpoint_id: Union[str, list[str]],
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> pd.DataFrame:
         """
         Fetches distinct results metadata from the app-results TSDB table for a specified model endpoints.
@@ -270,16 +324,19 @@ class TSDBConnector(ABC):
     @abstractmethod
     def get_error_count(
         self,
-        endpoint_ids: typing.Union[str, list[str]],
-        start: typing.Optional[datetime] = None,
-        end: typing.Optional[datetime] = None,
-    ) -> pd.DataFrame:
+        endpoint_ids: Union[str, list[str]],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, "list[v3io_frames.client.RawFrame]"]:
         """
         Fetches data from the error TSDB table and returns the error count for each specified endpoint.
 
         :param endpoint_ids:    A list of model endpoint identifiers.
         :param start:           The start time for the query.
         :param end:             The end time for the query.
+        :param get_raw:         Whether to return the request as raw frames rather than a pandas dataframe. Defaults
+          to False. This can greatly improve performance when a dataframe isn't needed.
 
         :return: A pd.DataFrame containing the columns [error_count, endpoint_id].
         If an endpoint have not raised error within the specified time range, it will not appear in the result.
@@ -288,10 +345,11 @@ class TSDBConnector(ABC):
     @abstractmethod
     def get_avg_latency(
         self,
-        endpoint_ids: typing.Union[str, list[str]],
-        start: typing.Optional[datetime] = None,
-        end: typing.Optional[datetime] = None,
-    ) -> pd.DataFrame:
+        endpoint_ids: Union[str, list[str]],
+        start: datetime | None = None,
+        end: datetime | None = None,
+        get_raw: bool = False,
+    ) -> Union[pd.DataFrame, "list[v3io_frames.client.RawFrame]"]:
         """
         Fetches data from the predictions TSDB table and returns the average latency for each specified endpoint
         in the provided time range, which by default is the last 24 hours.
@@ -299,10 +357,101 @@ class TSDBConnector(ABC):
         :param endpoint_ids:    A list of model endpoint identifiers.
         :param start:           The start time for the query.
         :param end:             The end time for the query.
+        :param get_raw:         Whether to return the request as raw frames rather than a pandas dataframe. Defaults
+          to False. This can greatly improve performance when a dataframe isn't needed.
 
         :return: A pd.DataFrame containing the columns [avg_latency, endpoint_id].
         If an endpoint has not been invoked within the specified time range, it will not appear in the result.
         """
+
+    @abstractmethod
+    def count_results_by_status(
+        self,
+        start: Union[datetime, str] | None = None,
+        end: Union[datetime, str] | None = None,
+        endpoint_ids: Union[str, list[str]] | None = None,
+        application_names: Union[str, list[str]] | None = None,
+        result_status_list: list[int] | None = None,
+    ) -> dict[tuple[str, int], int]:
+        """
+        Read results status from the TSDB and return a dictionary of results statuses by application name.
+
+        :param start:              The start time in which to read the results. By default, the last 24 hours are read.
+        :param end:                The end time in which to read the results. Default is the current time (now).
+        :param endpoint_ids:       Optional list of endpoint ids to filter the results by. By default, all
+                                   endpoint ids are included.
+        :param application_names:  Optional list of application names to filter the results by. By default, all
+                                   application are included.
+        :param result_status_list: Optional list of result statuses to filter the results by. By default, all
+                                   result statuses are included.
+
+        :return: A dictionary where the key is a tuple of (application_name, result_status) and the value is the total
+                 number of results with that status for that application.
+                 For example:
+                 {
+                    ('app1', 1): 10,
+                    ('app1', 2): 5
+                 }
+        """
+
+    @abstractmethod
+    def count_processed_model_endpoints(
+        self,
+        start: Union[datetime, str] | None = None,
+        end: Union[datetime, str] | None = None,
+        application_names: Union[str, list[str]] | None = None,
+    ) -> dict[str, int]:
+        """
+        Count the number of processed model endpoints within a given time range for specific applications.
+        :param start:              The start time of the query. Last 24 hours is used by default.
+        :param end:                The end time of the query. The current time is used by default.
+        :param application_names:  A list of application names to filter the results by. If not provided, all
+                                   applications are included.
+        :return:                   The count of processed model endpoints.
+        """
+
+    @abstractmethod
+    def calculate_latest_metrics(
+        self,
+        start: Union[datetime, str] | None = None,
+        end: Union[datetime, str] | None = None,
+        application_names: Union[str, list[str]] | None = None,
+    ) -> list[
+        Union[mm_schemas.ApplicationResultRecord, mm_schemas.ApplicationMetricRecord]
+    ]:
+        """
+        Calculate the latest metrics and results across applications.
+        :param start:              The start time of the query. Last 24 hours is used by default.
+        :param end:                The end time of the query. The current time is used by default.
+        :param application_names:  A list of application names to filter the results by. If not provided, all
+                                   applications are included.
+        :return:                   A list containing the latest metrics and results for each application.
+                                   example::
+                                   [
+                                       {
+                                           "type": "metric",
+                                           "time": "2025-06-29 13:36:37 +00:00",
+                                           "metric_name": "hellinger_mean",
+                                           "value": 0.123456,
+                                       },
+                                        {
+                                             "type": "result",
+                                             "time": "2025-06-29 13:36:37 +00:00",
+                                             "result_name": "drift_status",
+                                             "kind": "2",
+                                             "status": 0,
+                                             "value": 15.4,
+                                        },
+                                       ...
+                                   ]
+        """
+
+    def add_basic_metrics(
+        self,
+        model_endpoint_objects: list[mlrun.common.schemas.ModelEndpoint],
+        metric_list: list[str] | None = None,
+    ) -> list[mlrun.common.schemas.ModelEndpoint]:
+        raise NotImplementedError()
 
     @staticmethod
     def df_to_metrics_values(
@@ -311,7 +460,7 @@ class TSDBConnector(ABC):
         metrics: list[mm_schemas.ModelEndpointMonitoringMetric],
         project: str,
     ) -> list[
-        typing.Union[
+        Union[
             mm_schemas.ModelEndpointMonitoringMetricValues,
             mm_schemas.ModelEndpointMonitoringMetricNoData,
         ]
@@ -324,7 +473,7 @@ class TSDBConnector(ABC):
         metrics_without_data = {metric.full_name: metric for metric in metrics}
 
         metrics_values: list[
-            typing.Union[
+            Union[
                 mm_schemas.ModelEndpointMonitoringMetricValues,
                 mm_schemas.ModelEndpointMonitoringMetricNoData,
             ]
@@ -377,7 +526,7 @@ class TSDBConnector(ABC):
         metrics: list[mm_schemas.ModelEndpointMonitoringMetric],
         project: str,
     ) -> list[
-        typing.Union[
+        Union[
             mm_schemas.ModelEndpointMonitoringResultValues,
             mm_schemas.ModelEndpointMonitoringMetricNoData,
         ]
@@ -390,7 +539,7 @@ class TSDBConnector(ABC):
         metrics_without_data = {metric.full_name: metric for metric in metrics}
 
         metrics_values: list[
-            typing.Union[
+            Union[
                 mm_schemas.ModelEndpointMonitoringResultValues,
                 mm_schemas.ModelEndpointMonitoringMetricNoData,
             ]
@@ -536,7 +685,7 @@ class TSDBConnector(ABC):
         *,
         df: pd.DataFrame,
         project: str,
-        type: typing.Union[str, mm_schemas.ModelEndpointMonitoringMetricType],
+        type: Union[str, mm_schemas.ModelEndpointMonitoringMetricType],
     ) -> dict[str, list[mm_schemas.ModelEndpointMonitoringMetric]]:
         """
         Parse a DataFrame of metrics from the TSDB into a dict of intersection metrics/results by name and application
@@ -590,20 +739,60 @@ class TSDBConnector(ABC):
         return {dict_key: metrics}
 
     @staticmethod
-    def _get_start_end(
-        start: typing.Union[datetime, None],
-        end: typing.Union[datetime, None],
-    ) -> tuple[datetime, datetime]:
-        """
-        static utils function for tsdb start end format
-        :param start:       Either None or datetime, None is handled as datetime.min(tz=timezone.utc)
-        :param end:         Either None or datetime, None is handled as datetime.now(tz=timezone.utc)
-        :return:            start datetime, end datetime
-        """
-        start = start or mlrun.utils.datetime_min()
-        end = end or mlrun.utils.datetime_now()
-        if not (isinstance(start, datetime) and isinstance(end, datetime)):
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                "Both start and end must be datetime objects"
+    def _prepare_aligned_start_end(
+        start: datetime, end: datetime
+    ) -> tuple[datetime, datetime, str]:
+        delta = end - start
+        if delta <= timedelta(hours=6):
+            interval = "10m"
+            start = start.replace(
+                minute=start.minute // 10 * 10, second=0, microsecond=0
             )
-        return start, end
+        elif delta <= timedelta(hours=72):
+            interval = "1h"
+            start = start.replace(minute=0, second=0, microsecond=0)
+        else:
+            interval = "1d"
+            start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        interval_map = {
+            "10m": timedelta(minutes=10),
+            "1h": timedelta(hours=1),
+            "1d": timedelta(days=1),
+        }
+        delta = end - start
+        interval_td = interval_map[interval]
+        end = start + (delta // interval_td) * interval_td
+        return start, end, interval
+
+    @staticmethod
+    def _df_to_drift_data(df: pd.DataFrame) -> mm_schemas.ModelEndpointDriftValues:
+        suspected_val = mm_schemas.constants.ResultStatusApp.potential_detection.value
+        detected_val = mm_schemas.constants.ResultStatusApp.detected.value
+        aggregated_df = (
+            df.groupby(["_wstart", f"max({mm_schemas.ResultData.RESULT_STATUS})"])
+            .size()  # add size column for each interval x result-status combination
+            .unstack()  # create a size column for each result-status
+            .reindex(
+                columns=[suspected_val, detected_val], fill_value=0
+            )  # ensure both columns exists
+            .fillna(0)
+            .astype(int)
+            .rename(
+                columns={
+                    suspected_val: "count_suspected",
+                    detected_val: "count_detected",
+                }
+            )
+        )
+        values = list(
+            zip(
+                aggregated_df.index,
+                aggregated_df["count_suspected"],
+                aggregated_df["count_detected"],
+            )
+        )
+        return mm_schemas.ModelEndpointDriftValues(values=values)
+
+    def add_pre_writer_steps(self, graph, after):
+        return None

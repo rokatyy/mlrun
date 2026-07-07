@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import json
 import operator
 import os
@@ -18,7 +19,7 @@ import warnings
 from base64 import b64encode
 from copy import copy
 from datetime import datetime
-from typing import Optional, Union
+from typing import Any, Literal, Union
 
 import pandas as pd
 import semver
@@ -34,6 +35,7 @@ from mlrun.datastore.utils import transform_list_filters_to_tuple
 from mlrun.secrets import SecretsStore
 from mlrun.utils import logger
 
+from ..common.schemas.function import Function
 from ..model import DataSource
 from ..platforms.iguazio import parse_path
 from ..utils import get_class, is_explicit_ack_supported
@@ -181,10 +183,10 @@ class CSVSource(BaseSourceDriver):
     def __init__(
         self,
         name: str = "",
-        path: Optional[str] = None,
-        attributes: Optional[dict[str, object]] = None,
-        key_field: Optional[str] = None,
-        schedule: Optional[str] = None,
+        path: str | None = None,
+        attributes: dict[str, object] | None = None,
+        key_field: str | None = None,
+        schedule: str | None = None,
         parse_dates: Union[None, int, str, list[int], list[str]] = None,
         **kwargs,
     ):
@@ -218,7 +220,7 @@ class CSVSource(BaseSourceDriver):
 
     def get_spark_options(self):
         store, path, _ = mlrun.store_manager.get_or_create_store(self.path)
-        spark_options = store.get_spark_options()
+        spark_options = store.get_spark_options(store.spark_url + path)
         spark_options.update(
             {
                 "path": store.spark_url + path,
@@ -308,14 +310,14 @@ class ParquetSource(BaseSourceDriver):
     def __init__(
         self,
         name: str = "",
-        path: Optional[str] = None,
-        attributes: Optional[dict[str, object]] = None,
-        key_field: Optional[str] = None,
-        time_field: Optional[str] = None,
-        schedule: Optional[str] = None,
-        start_time: Optional[Union[datetime, str]] = None,
-        end_time: Optional[Union[datetime, str]] = None,
-        additional_filters: Optional[list[Union[tuple, list]]] = None,
+        path: str | None = None,
+        attributes: dict[str, object] | None = None,
+        key_field: str | None = None,
+        time_field: str | None = None,
+        schedule: str | None = None,
+        start_time: Union[datetime, str] | None = None,
+        end_time: Union[datetime, str] | None = None,
+        additional_filters: list[Union[tuple, list]] | None = None,
     ):
         if additional_filters:
             attributes = copy(attributes) or {}
@@ -392,9 +394,7 @@ class ParquetSource(BaseSourceDriver):
         )
 
     @classmethod
-    def from_dict(
-        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
-    ):
+    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict | None = None):
         new_obj = super().from_dict(
             struct=struct, fields=fields, deprecated_fields=deprecated_fields
         )
@@ -405,7 +405,7 @@ class ParquetSource(BaseSourceDriver):
 
     def get_spark_options(self):
         store, path, _ = mlrun.store_manager.get_or_create_store(self.path)
-        spark_options = store.get_spark_options()
+        spark_options = store.get_spark_options(store.spark_url + path)
         spark_options.update(
             {
                 "path": store.spark_url + path,
@@ -458,7 +458,7 @@ class ParquetSource(BaseSourceDriver):
             if not filter_tuple:
                 continue
             col_name, op, value = filter_tuple
-            if op.lower() in ("in", "not in") and isinstance(value, (list, tuple, set)):
+            if op.lower() in ("in", "not in") and isinstance(value, list | tuple | set):
                 none_exists = False
                 value = list(value)
                 for sub_value in value:
@@ -566,18 +566,18 @@ class BigQuerySource(BaseSourceDriver):
     def __init__(
         self,
         name: str = "",
-        table: Optional[str] = None,
-        max_results_for_table: Optional[int] = None,
-        query: Optional[str] = None,
-        materialization_dataset: Optional[str] = None,
-        chunksize: Optional[int] = None,
-        key_field: Optional[str] = None,
-        time_field: Optional[str] = None,
-        schedule: Optional[str] = None,
+        table: str | None = None,
+        max_results_for_table: int | None = None,
+        query: str | None = None,
+        materialization_dataset: str | None = None,
+        chunksize: int | None = None,
+        key_field: str | None = None,
+        time_field: str | None = None,
+        schedule: str | None = None,
         start_time=None,
         end_time=None,
-        gcp_project: Optional[str] = None,
-        spark_options: Optional[dict] = None,
+        gcp_project: str | None = None,
+        spark_options: dict | None = None,
         **kwargs,
     ):
         if query and table:
@@ -766,7 +766,6 @@ class SnowflakeSource(BaseSourceDriver):
     :parameter url: URL of the snowflake cluster
     :parameter user: snowflake user
     :parameter database: snowflake database
-    :parameter schema: snowflake schema - deprecated, use db_schema
     :parameter db_schema: snowflake schema
     :parameter warehouse: snowflake warehouse
     """
@@ -778,28 +777,20 @@ class SnowflakeSource(BaseSourceDriver):
     def __init__(
         self,
         name: str = "",
-        key_field: Optional[str] = None,
-        attributes: Optional[dict[str, object]] = None,
-        time_field: Optional[str] = None,
-        schedule: Optional[str] = None,
+        key_field: str | None = None,
+        attributes: dict[str, object] | None = None,
+        time_field: str | None = None,
+        schedule: str | None = None,
         start_time=None,
         end_time=None,
-        query: Optional[str] = None,
-        url: Optional[str] = None,
-        user: Optional[str] = None,
-        database: Optional[str] = None,
-        schema: Optional[str] = None,
-        db_schema: Optional[str] = None,
-        warehouse: Optional[str] = None,
+        query: str | None = None,
+        url: str | None = None,
+        user: str | None = None,
+        database: str | None = None,
+        db_schema: str | None = None,
+        warehouse: str | None = None,
         **kwargs,
     ):
-        # TODO: Remove in 1.9.0
-        if schema:
-            warnings.warn(
-                "schema is deprecated in 1.7.0, and will be removed in 1.9.0, please use db_schema"
-            )
-        db_schema = db_schema or schema  # TODO: Remove in 1.9.0
-
         attributes = attributes or {}
         if url:
             attributes["url"] = url
@@ -852,9 +843,9 @@ class CustomSource(BaseSourceDriver):
 
     def __init__(
         self,
-        class_name: Optional[str] = None,
+        class_name: str | None = None,
         name: str = "",
-        schedule: Optional[str] = None,
+        schedule: str | None = None,
         **attributes,
     ):
         attributes = attributes or {}
@@ -932,12 +923,12 @@ class OnlineSource(BaseSourceDriver):
 
     def __init__(
         self,
-        name: Optional[str] = None,
-        path: Optional[str] = None,
-        attributes: Optional[dict[str, object]] = None,
-        key_field: Optional[str] = None,
-        time_field: Optional[str] = None,
-        workers: Optional[int] = None,
+        name: str | None = None,
+        path: str | None = None,
+        attributes: dict[str, object] | None = None,
+        key_field: str | None = None,
+        time_field: str | None = None,
+        workers: int | None = None,
     ):
         super().__init__(name, path, attributes, key_field, time_field)
         self.online = True
@@ -966,6 +957,21 @@ class OnlineSource(BaseSourceDriver):
             "This source type is not supported with ingestion service yet"
         )
 
+    @staticmethod
+    def set_explicit_ack_mode(function: Function, **extra_arguments) -> dict[str, Any]:
+        extra_arguments = extra_arguments or {}
+        engine = "sync"
+        if function.spec and hasattr(function.spec, "graph"):
+            engine = getattr(function.spec.graph, "engine", None) or engine
+        if mlrun.mlconf.is_explicit_ack_enabled() and engine == "async":
+            extra_arguments["explicit_ack_mode"] = extra_arguments.get(
+                "explicit_ack_mode", "explicitOnly"
+            )
+            extra_arguments["worker_allocation_mode"] = extra_arguments.get(
+                "worker_allocation_mode", "static"
+            )
+        return extra_arguments
+
 
 class HttpSource(OnlineSource):
     kind = "http"
@@ -987,7 +993,7 @@ class StreamSource(OnlineSource):
         seek_to="earliest",
         shards=1,
         retention_in_hours=24,
-        extra_attributes: Optional[dict] = None,
+        extra_attributes: dict | None = None,
         **kwargs,
     ):
         """
@@ -1028,15 +1034,7 @@ class StreamSource(OnlineSource):
             raise_for_status=v3io.dataplane.RaiseForStatus.never,
         )
         res.raise_for_status([409, 204])
-
-        kwargs = {}
-        engine = "async"
-        if hasattr(function.spec, "graph") and function.spec.graph.engine:
-            engine = function.spec.graph.engine
-
-        if mlrun.mlconf.is_explicit_ack_enabled() and engine == "async":
-            kwargs["explicit_ack_mode"] = "explicitOnly"
-            kwargs["worker_allocation_mode"] = "static"
+        kwargs = self.set_explicit_ack_mode(function=function)
 
         function.add_v3io_stream_trigger(
             url,
@@ -1055,16 +1053,17 @@ class KafkaSource(OnlineSource):
 
     def __init__(
         self,
-        brokers=None,
-        topics=None,
-        group="serving",
-        initial_offset="earliest",
-        partitions=None,
-        sasl_user=None,
-        sasl_pass=None,
-        attributes=None,
+        brokers: list[str] | None = None,
+        topics: list[str] | None = None,
+        group: str = "serving",
+        initial_offset: Literal["earliest", "latest"] = "earliest",
+        partitions: list[int] | None = None,
+        sasl_user: str | None = None,
+        sasl_pass: str | None = None,
+        tls_enable: bool | None = None,
+        attributes: dict | None = None,
         **kwargs,
-    ):
+    ) -> None:
         """Sets kafka source for the flow
 
         :param brokers: list of broker IP addresses
@@ -1074,6 +1073,7 @@ class KafkaSource(OnlineSource):
         :param partitions: Optional, A list of partitions numbers for which the function receives events.
         :param sasl_user: Optional, user name to use for sasl authentications
         :param sasl_pass: Optional, password to use for sasl authentications
+        :param tls_enable: Optional, if set - whether to enable TLS or not.
         :param attributes: Optional, extra attributes to be passed to kafka trigger
         """
         if isinstance(topics, str):
@@ -1087,14 +1087,15 @@ class KafkaSource(OnlineSource):
         attributes["initial_offset"] = initial_offset
         if partitions is not None:
             attributes["partitions"] = partitions
-        sasl = attributes.pop("sasl", {})
-        if sasl_user and sasl_pass:
-            sasl["enable"] = True
-            sasl["user"] = sasl_user
-            sasl["password"] = sasl_pass
-            sasl["mechanism"] = "PLAIN"
-        if sasl:
+
+        kafka_params = mlrun.datastore.utils.KafkaParameters(attributes)
+
+        if sasl := kafka_params.sasl(usr=sasl_user, pwd=sasl_pass):
             attributes["sasl"] = sasl
+
+        if tls := kafka_params.tls(tls_enable=tls_enable):
+            attributes["tls"] = tls
+
         super().__init__(attributes=attributes, **kwargs)
 
     def to_dataframe(
@@ -1118,20 +1119,12 @@ class KafkaSource(OnlineSource):
         else:
             extra_attributes = copy(self.attributes)
         partitions = extra_attributes.pop("partitions", None)
-        explicit_ack_mode = None
-        engine = "async"
-        if hasattr(function.spec, "graph") and function.spec.graph.engine:
-            engine = function.spec.graph.engine
 
-        if mlrun.mlconf.is_explicit_ack_enabled() and engine == "async":
-            explicit_ack_mode = "explicitOnly"
-            extra_attributes["workerAllocationMode"] = extra_attributes.get(
-                "worker_allocation_mode", "static"
-            )
-        else:
-            extra_attributes["workerAllocationMode"] = extra_attributes.get(
-                "worker_allocation_mode", "pool"
-            )
+        extra_attributes = self.set_explicit_ack_mode(function, **extra_attributes)
+        explicit_ack_mode = extra_attributes.get("explicit_ack_mode")
+        extra_attributes["workerAllocationMode"] = extra_attributes.get(
+            "worker_allocation_mode", "pool"
+        )
 
         trigger_kwargs = {}
 
@@ -1175,7 +1168,7 @@ class KafkaSource(OnlineSource):
         self,
         num_partitions: int = 4,
         replication_factor: int = 1,
-        topics: Optional[list[str]] = None,
+        topics: list[str] | None = None,
     ):
         """
         Create Kafka topics with the specified number of partitions and replication factor.
@@ -1202,16 +1195,9 @@ class KafkaSource(OnlineSource):
         ]
 
         kafka_admin_kwargs = {}
-        if "sasl" in self.attributes:
-            sasl = self.attributes["sasl"]
-            kafka_admin_kwargs.update(
-                {
-                    "security_protocol": "SASL_PLAINTEXT",
-                    "sasl_mechanism": sasl["mechanism"],
-                    "sasl_plain_username": sasl["user"],
-                    "sasl_plain_password": sasl["password"],
-                }
-            )
+        kafka_admin_kwargs = mlrun.datastore.utils.KafkaParameters(
+            self.attributes
+        ).admin()
 
         kafka_admin = KafkaAdminClient(bootstrap_servers=brokers, **kafka_admin_kwargs)
         try:
@@ -1234,16 +1220,16 @@ class SQLSource(BaseSourceDriver):
     def __init__(
         self,
         name: str = "",
-        chunksize: Optional[int] = None,
-        key_field: Optional[str] = None,
-        time_field: Optional[str] = None,
-        schedule: Optional[str] = None,
-        start_time: Optional[Union[datetime, str]] = None,
-        end_time: Optional[Union[datetime, str]] = None,
-        db_url: Optional[str] = None,
-        table_name: Optional[str] = None,
-        spark_options: Optional[dict] = None,
-        parse_dates: Optional[list[str]] = None,
+        chunksize: int | None = None,
+        key_field: str | None = None,
+        time_field: str | None = None,
+        schedule: str | None = None,
+        start_time: Union[datetime, str] | None = None,
+        end_time: Union[datetime, str] | None = None,
+        db_url: str | None = None,
+        table_name: str | None = None,
+        spark_options: dict | None = None,
+        parse_dates: list[str] | None = None,
         **kwargs,
     ):
         """

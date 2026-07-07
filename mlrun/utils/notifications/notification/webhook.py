@@ -15,13 +15,13 @@
 import re
 import typing
 
-import aiohttp
+import orjson
 
 import mlrun.common.schemas
 import mlrun.lists
 import mlrun.utils.helpers
 
-from .base import NotificationBase
+from .base import NotificationBase, TimedHTTPClient
 
 
 class WebhookNotification(NotificationBase):
@@ -38,13 +38,12 @@ class WebhookNotification(NotificationBase):
     async def push(
         self,
         message: str,
-        severity: typing.Optional[
-            typing.Union[mlrun.common.schemas.NotificationSeverity, str]
-        ] = mlrun.common.schemas.NotificationSeverity.INFO,
-        runs: typing.Optional[typing.Union[mlrun.lists.RunList, list]] = None,
-        custom_html: typing.Optional[typing.Optional[str]] = None,
-        alert: typing.Optional[mlrun.common.schemas.AlertConfig] = None,
-        event_data: typing.Optional[mlrun.common.schemas.Event] = None,
+        severity: typing.Union[mlrun.common.schemas.NotificationSeverity, str]
+        | None = mlrun.common.schemas.NotificationSeverity.INFO,
+        runs: typing.Union[mlrun.lists.RunList, list] | None = None,
+        custom_html: str | None = None,
+        alert: mlrun.common.schemas.AlertConfig | None = None,
+        event_data: mlrun.common.schemas.Event | None = None,
     ):
         url = self.params.get("url", None)
         method = self.params.get("method", "post").lower()
@@ -86,9 +85,12 @@ class WebhookNotification(NotificationBase):
         # we automatically handle it as `ssl=None` for their convenience.
         verify_ssl = verify_ssl and None if url.startswith("https") else None
 
-        async with aiohttp.ClientSession() as session:
+        async with TimedHTTPClient().session(json_serialize=self._encoder) as session:
             response = await getattr(session, method)(
-                url, headers=headers, json=request_body, ssl=verify_ssl
+                url,
+                headers=headers,
+                json=request_body,
+                ssl=verify_ssl,
             )
             response.raise_for_status()
 
@@ -128,3 +130,13 @@ class WebhookNotification(NotificationBase):
                     )
 
         return override_body
+
+    @property
+    def _encoder(self):
+        return lambda body: orjson.dumps(
+            body,
+            option=orjson.OPT_NAIVE_UTC
+            | orjson.OPT_SERIALIZE_NUMPY
+            | orjson.OPT_NON_STR_KEYS
+            | orjson.OPT_SORT_KEYS,
+        ).decode()

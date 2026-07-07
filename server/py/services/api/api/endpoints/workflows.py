@@ -11,13 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import collections.abc
 import copy
 import traceback
-import typing
 from http import HTTPStatus
-from typing import Optional
 
 import fastapi
 from fastapi.concurrency import run_in_threadpool
@@ -56,10 +54,10 @@ async def submit_workflow(
         framework.api.deps.authenticate_request
     ),
     db_session: Session = fastapi.Depends(framework.api.deps.get_db_session),
-    client_version: Optional[str] = fastapi.Header(
+    client_version: str | None = fastapi.Header(
         None, alias=mlrun.common.schemas.HeaderNames.client_version
     ),
-    client_python_version: Optional[str] = fastapi.Header(
+    client_python_version: str | None = fastapi.Header(
         None, alias=mlrun.common.schemas.HeaderNames.python_version
     ),
 ):
@@ -92,8 +90,15 @@ async def submit_workflow(
         framework.utils.singletons.project_member.get_project_member().get_project,
         db_session=db_session,
         name=project,
-        leader_session=auth_info.session,
+        auth_info=auth_info,
     )
+
+    # If the requesting user is the project owner, populate the OPA owner
+    # cache so the permission checks below short-circuit. This mitigates the
+    # OPA manifest propagation race on multi-pod deployments.
+    verifier = framework.utils.auth.verifier.AuthVerifier()
+    if verifier.is_project_owner(auth_info, project):
+        verifier.add_allowed_project_for_owner(project.metadata.name, auth_info)
 
     # check permission CREATE run
     await (
@@ -162,6 +167,12 @@ async def submit_workflow(
     updated_request = workflow_request.copy()
     updated_request.spec = workflow_spec
 
+    client_image = services.api.utils.helpers.resolve_client_default_kfp_image(
+        project,
+        workflow_spec,
+        client_version=client_version,
+    )
+
     # This function is for loading the project and running workflow remotely.
     # In this way we can schedule workflows (by scheduling a job that runs the workflow)
     workflow_runner: mlrun.run.KubejobRuntime = await run_in_threadpool(
@@ -173,10 +184,7 @@ async def submit_workflow(
         project=project.metadata.name,
         db_session=db_session,
         auth_info=auth_info,
-        image=services.api.utils.helpers.resolve_client_default_kfp_image(
-            project=project,
-            workflow_spec=workflow_spec,
-        ),
+        image=client_image,
     )
 
     logger.debug(
@@ -273,7 +281,7 @@ def _is_requested_schedule(
 
 def _get_workflow_by_name(
     project: mlrun.common.schemas.ProjectOut, name: str
-) -> typing.Optional[dict]:
+) -> dict | None:
     """
     Getting workflow from project by name.
 
@@ -422,3 +430,61 @@ async def get_workflow_id(
         engine=engine,
         db_session=db_session,
     )
+
+
+@router.post(
+    "/projects/{project}/workflows/{name}/runs/{uid}/set-retry-status",
+    status_code=HTTPStatus.NO_CONTENT.value,
+)
+async def set_run_retrying_status(
+    project: str,
+    uid: str,
+    name: str,
+    retrying: bool,
+    auth_info: mlrun.common.schemas.AuthInfo = fastapi.Depends(
+        framework.api.deps.authenticate_request
+    ),
+    db_session: Session = fastapi.Depends(framework.api.deps.get_db_session),
+):
+    """
+    Atomically set or clear the 'retrying' label on a workflow‐runner pod.
+
+    :param project:  MLRun project name
+    :param name:     Logical workflow name (unused here, but kept for URL consistency)
+    :param uid:      The runner's UID (not the KFP engine ID)
+    :retrying:       Whether to add or remove the “retrying” label
+    :param auth_info:   auth info of the request
+    :param db_session:  session that manages the current dialog with the database
+    """
+
+    # check update permission on runs
+    await (
+        framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
+            mlrun.common.schemas.AuthorizationResourceTypes.run,
+            project,
+            resource_name=uid,
+            action=mlrun.common.schemas.AuthorizationAction.update,
+            auth_info=auth_info,
+        )
+    )
+
+    # Check permission UPDATE workflow:
+    await (
+        framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
+            mlrun.common.schemas.AuthorizationResourceTypes.workflow,
+            project,
+            name,
+            mlrun.common.schemas.AuthorizationAction.update,
+            auth_info,
+        )
+    )
+
+    # call into your CRUD
+    await fastapi.concurrency.run_in_threadpool(
+        services.api.crud.RerunRunner().set_run_retrying_status,
+        db_session,
+        project,
+        uid,
+        retrying,
+    )
+    return {}

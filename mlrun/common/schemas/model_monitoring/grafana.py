@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+from typing import Union
 
 from pydantic.v1 import BaseModel
 
@@ -39,21 +39,27 @@ class GrafanaStringColumn(GrafanaColumn):
 
 class GrafanaTable(BaseModel):
     columns: list[GrafanaColumn]
-    rows: list[list[Optional[Union[float, int, str]]]] = []
+    rows: list[list[Union[float, int, str] | None]] = []
     type: str = "table"
 
     def add_row(self, *args):
         self.rows.append(list(args))
 
 
-class GrafanaDataPoint(BaseModel):
-    value: float
-    timestamp: int  # Unix timestamp in milliseconds
+class GrafanaModelEndpointsTable(GrafanaTable):
+    def __init__(self):
+        columns = self._init_columns()
+        super().__init__(columns=columns)
 
-
-class GrafanaTimeSeriesTarget(BaseModel):
-    target: str
-    datapoints: list[tuple[float, int]] = []
-
-    def add_data_point(self, data_point: GrafanaDataPoint):
-        self.datapoints.append((data_point.value, data_point.timestamp))
+    @staticmethod
+    def _init_columns():
+        return [
+            GrafanaColumn(text="endpoint_id", type=GrafanaColumnType.STRING),
+            GrafanaColumn(text="endpoint_name", type=GrafanaColumnType.STRING),
+            GrafanaColumn(text="endpoint_function", type=GrafanaColumnType.STRING),
+            GrafanaColumn(text="endpoint_model", type=GrafanaColumnType.STRING),
+            GrafanaColumn(text="endpoint_model_class", type=GrafanaColumnType.STRING),
+            GrafanaColumn(text="error_count", type=GrafanaColumnType.NUMBER),
+            GrafanaColumn(text="drift_status", type=GrafanaColumnType.NUMBER),
+            GrafanaColumn(text="sampling_percentage", type=GrafanaColumnType.NUMBER),
+        ]

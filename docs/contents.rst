@@ -7,7 +7,9 @@ Table of Contents
    
    index
    tutorials/index
-   install   
+   install-mlrun-ce/index  
+   setup-guide
+ 
 
        
 .. toctree::
@@ -46,7 +48,14 @@ Table of Contents
    concepts/alerts-notifications
    concepts/runs-workflows
    serving/serving-graph
+   runtimes/load-from-hub
    feature-store/feature-store
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Server configuration
+
+   server-cfg/server-metrics
      
 .. toctree::
    :maxdepth: 1

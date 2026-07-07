@@ -4,7 +4,7 @@ __pycache__/
 
 # Python virtual environments and environment files
 *venv*
-.python-version
+uv.lock
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
@@ -16,27 +16,34 @@ __pycache__/
 
 # Test results and temporary test files
 tests/test_results/
+tests/render_test_outputs/
 tests/temp*
 tests/*.pkl
 tests/project.yaml
 tests/system/env.yml
+server/py/services/api/db
+migration_tests.log
 # Coverage reports
-*.coverage
+**/*.coverage
 
 # Editors and operating system files
 # Visual Studio Code settings
 .vscode/
 # PyCharm settings
 .idea/
+# Global tags
+GPATH
+GRTAGS
+GTAGS
 # macOS Finder metadata
 .DS_Store
 
 # Secrets and credentials
 # AWS credentials and other secret files
 .aws-secrets
-credentials.txt  
-credentials.json  
-google-big-query-credentials.json  
+credentials.txt
+credentials.json
+google-big-query-credentials.json
 kubeconfig
 
 # Build artifacts and generated files
@@ -48,7 +55,8 @@ mlrun.egg-info/
 mlrun/utils/version/version.json
 Dockerfile.mlrun-test-nb
 **/Dockerfile.dockerignore
-
+server/common/compile-schemas-go
+server/py/schemas/proto/proto/
 # Dask worker spaces
 dask-worker-space/
 
@@ -79,7 +87,12 @@ docs/contributing.md
 # Local development and configuration files
 # Project configuration and environment files
 project.yaml
-automation/patch_igz/patch[_-]env.yml
+automation/patch_igz/patch[_-]env*.yml
+!automation/patch_igz/patch[_-]env_template.yml
+
+
+# Claude Code configuration files
+.claude/*
 
 # Local playground dir
 playground
@@ -91,6 +104,7 @@ playground
 hack/*.env
 
 # Database and protobuf files
+db/mlrun.db
 server/py/framework/db/mlrun.db
 server/py/schemas/proto/*pb2*.py
 
@@ -100,3 +114,11 @@ server/py/schemas/proto/*pb2*.py
 # <= 1.7.x legacy project structure
 # on >= 1.8.0, server/api has been moved to server/py/services/api
 server/api
+**/coverage_reports/*
+!**/coverage_reports/.gitkeep
+**/test-openai.yml
+**/test-huggingface.yml
+
+mlrun.env
+**/mlrun.env
+tests/system/mlrun.env

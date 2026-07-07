@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import pathlib
-from typing import Optional
 
 from fsspec.implementations.dbfs import DatabricksFile, DatabricksFileSystem
 from fsspec.registry import get_filesystem_class
@@ -82,9 +81,7 @@ class DatabricksFileSystemDisableCache(DatabricksFileSystem):
 
 # dbfs objects will be represented with the following URL: dbfs://<path>
 class DBFSStore(DataStore):
-    def __init__(
-        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
-    ):
+    def __init__(self, parent, schema, name, endpoint="", secrets: dict | None = None):
         super().__init__(parent, name, schema, endpoint, secrets=secrets)
 
     @property
@@ -104,7 +101,7 @@ class DBFSStore(DataStore):
             token=self._get_secret_or_env("DATABRICKS_TOKEN"),
             instance=self._get_secret_or_env("DATABRICKS_HOST"),
         )
-        return self._sanitize_storage_options(res)
+        return self._sanitize_options(res)
 
     def _verify_filesystem_and_key(self, key: str):
         if not self.filesystem:

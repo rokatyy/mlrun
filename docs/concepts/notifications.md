@@ -1,13 +1,19 @@
 (notifications)=
 
 # Notifications
+Notifications are used to inform you of system events on jobs, both scheduled and manually triggered.
+For regular jobs (manual and scheduled), you can receive notifications when the job finishes (`completed`, `error`, or `aborted`).
+For workflows (e.g., MLRun pipelines), you can also receive notifications when the  job starts (`running`).
 
-MLRun supports configuring notifications on jobs and scheduled jobs. This section describes the SDK for notifications.
+This section describes the notifications SDK and its usage.
 
-- [The notification object](#the-notification-object)
+**In this section**
+
+- [SDK](#sdk)
 - [Local vs. remote](#local-vs-remote)
 - [Notification parameters and secrets](#notification-parameters-and-secrets)
-- [Notification kinds](#notification-kinds)
+- [MLRun on Iguazio](#mlrun-on-iguazio)
+- [MLRun CE](#mlrun-ce)
 - [Mail notifications](#mail-notifications)
 - [Configuring notifications for runs](#configuring-notifications-for-runs)
 - [Configuring notifications for pipelines](#configuring-notifications-for-pipelines)
@@ -16,8 +22,11 @@ MLRun supports configuring notifications on jobs and scheduled jobs. This sectio
 - [Notification conditions](#notification-conditions)
 
 
-## The notification object
-See {py:class}`~mlrun.common.schemas.notification.Notification`.
+## SDK
+- {py:class}`~mlrun.common.schemas.notification.Notification`: The notification object
+- {py:class}`~mlrun.common.schemas.notification.NotificationKind`: The notification kinds
+- {py:class}`~mlrun.db.httpdb.HTTPRunDB.refresh_smtp_configuration`: Gets or refreshes the SMTP configuration from the Iguazio platform and sets it
+as the default SMTP configuration (creates an `mlrun-smtp-config` with the SMTP configuration). For privileged user: `IT Admin`.
 
 
 ## Local vs. remote
@@ -37,17 +46,43 @@ To ensure the safety of this sensitive data, the parameters are split into two o
 Either can be used to store any notification parameter. However the `secret_params` is protected by project secrets.
 When a notification is created, its `secret_params` are automatically masked and stored in an mlrun project secret.
 The name of the secret is built from the hash of the parameters themselves (so if multiple notifications use the same secret, it doesn't waste space in the project secret).
-Inside the notification's `secret_params`, you'll find a reference to the secret under the `secret` key after it's masked.
+Inside the notification's `secret_params`, there's a reference to the secret under the `secret` key after it's masked.
 For non-sensitive notification parameters, you can simply use the `params` parameter, which doesn't go through this masking process.
 It's essential to utilize `secret_params` exclusively for handling sensitive information, ensuring secure data management.
 
 
-## Notification kinds
-
-See {py:class}`~mlrun.common.schemas.notification.NotificationKind`.
-
 ## Mail notifications
-To send mail notifications, you need an existing SMTP server.
+### MLRun on Iguazio
+When MLRun is deployed on the Iguazio platform, your IT Admin can [configure the SMTP server in the Iguazio platform](https://www.iguazio.com/docs/latest-release/cluster-mgmt/deployment/post-deployment-howtos/smtp/). To use this as your default configuration, run the following (with privileged user - `IT Admin`):
+```python
+import mlrun
+
+mlrun.get_run_db().refresh_smtp_configuration()
+```
+The `refresh_smtp_configuration` method gets the SMTP configuration from the Iguazio platform and sets it
+as the default, cluster-wide, SMTP configuration (creates an `mlrun-smtp-config` secret with the SMTP configuration).
+If you edit the configuration on the Iguazio platform, run the `refresh_smtp_configuration` method again.
+
+Three parameters cannot be configured on the Iguazio platform. To set their defaults for the cluster, run these commands with the relevant values:
+```
+kubectl -n default-tenant patch secret mlrun-smtp-config -p='{"stringData":{"use_tls":"false"}}'
+kubectl -n default-tenant patch secret mlrun-smtp-config -p='{"stringData":{"start_tls":"true"}}'
+kubectl -n default-tenant patch secret mlrun-smtp-config -p='{"stringData":{"validate_certs":"false"}}'
+```
+These parameters are maintained when modifying parameters on the Iguazio platform.
+
+### MLRun CE
+In the community edition, you can use your own SMTP server.
+To configure it, manually create the `mlrun-smtp-config` Kubernetes secret with the default
+parameters for the SMTP server (`server_host`, `server_port`, `username`, `password`, `start_tls`, etc.).
+
+### Create a mail notification object
+
+The following snippet shows the format of a notification object.
+You can inherit the default `mlrun-smtp-config`, or choose to overwrite parameter/s.
+Any `params` not defined in this format will be enriched with the values in the `mlrun-smtp-config` secret.
+The only mandatory field in `params` is `email_addresses`.
+
 ```python
 mail_notification = mlrun.model.Notification(
     kind="mail",
@@ -57,45 +92,25 @@ mail_notification = mlrun.model.Notification(
     condition="",
     severity="verbose",
     params={
-        "start_tls": True,
-        "use_tls": False,
-        "validate_certs": False,
         "email_addresses": ["user.name@domain.com"],
     },
 )
 ```
-We use the [aiosmtplib](https://aiosmtplib.readthedocs.io/en/stable/) library for sending mail notifications.
-The `params` argument is a dictionary, that supports the following fields:
- - server_host (string): The SMTP server host.
- - server_port (int): The SMTP server port.
- - sender_address (string): The sender email address.
- - username (string): The username for the SMTP server.
- - password (string): The password for the SMTP server.
- - email_addresses (list of strings): The list of email addresses to send the mail to.
- - start_tls (boolean): Whether to start the TLS connection.
- - use_tls (boolean): Whether to use TLS.
- - validate_certs (boolean): Whether to validate the certificates.
+MLRun uses the [aiosmtplib](https://aiosmtplib.readthedocs.io/en/stable/) library for sending mail notifications.
+The `params` argument is a dictionary that supports the following fields:
+ - `server_host` (string): The SMTP server host
+ - `server_port` (int): The SMTP server port
+ - `sender_address` (string): The sender email address
+ - `username` (string): The username for the SMTP server
+ - `password` (string): The password for the SMTP server
+ - `email_addresses` (list of strings): The list of email addresses to send the mail to
+ - `start_tls` (boolean): Whether to start the TLS connection
+ - `use_tls` (boolean): Whether to use TLS
+ - `validate_certs` (boolean): Whether to validate the certificates
 
 You can read more about `start_tls` and `use_tls` on the  [aiosmtplib docs](https://aiosmtplib.readthedocs.io/en/stable/encryption.html).
-Missing params are enriched with default values which can be configured in the `mlrun-smtp-config` kubernetes (see below).
 
-### MLRun on Iguazio
-If MLRun is deployed on the Iguazio platform, an SMTP server already exists.
-To use it, run the following (with privileged user - `IT Admin`):
-```python
-import mlrun
-
-mlrun.get_run_db().refresh_smtp_configuration()
-```
-The `refresh_smtp_configuration` method will get the smtp configuration from the Iguazio platform and set it
-as the default smtp configuration (create a `mlrun-smtp-config` with the smtp configuration).
-If you edit the configuration on the Iguazio platform, you should run the `refresh_smtp_configuration` method again.
-
-### MLRun CE
-In the community edition, you can use your own SMTP server.
-To configure it, manually create the `mlrun-smtp-config` kubernetes secret with the default
-params for the SMTP server (`server_host`, `server_port`, `username`, `password`, etc..).
-After creating or editing the secret, refresh the mlrun SMTP configuration by running the `refresh_smtp_configuration` method.
+Email notifications on local runs must explicitly include all SMTP settings.
 
 ## Configuring notifications for runs
 
@@ -158,7 +173,7 @@ project.run(..., notifications=[notification])
 ```
 
 ### Running notifications
-MLRun can also send a `pipeline started` notification. To do that, configure a notification that includes
+MLRun can also send a `pipeline started` notification for KFP pipelines (and not for job runs). To do that, configure a notification that includes
 `when=running`. The `pipeline started` notification uses its own parameters, for
 example the webhook, credentials, etc., for the notification message.
 You can set only the webhook; the message is the default message.

@@ -11,9 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import unittest.mock
 import uuid
+from datetime import datetime
 
 import deepdiff
 import pytest
@@ -25,6 +26,7 @@ import mlrun.common.runtimes.constants
 import mlrun.common.schemas
 import mlrun.errors
 
+import framework.db.session
 import framework.utils.clients.log_collector
 import framework.utils.singletons.k8s
 import services.api.crud
@@ -137,7 +139,7 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
                 return_value=k8s_client.V1PodList(
                     items=[], metadata=k8s_client.V1ListMeta()
                 ),
-            ),
+            ) as list_namespaced_pod_mock,
             unittest.mock.patch.object(
                 services.api.runtime_handlers.BaseRuntimeHandler,
                 "_ensure_run_logs_collected",
@@ -153,7 +155,9 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
             runs = services.api.crud.Runs().list_runs(db, run_name, project=project)
             assert len(runs) == 0
             delete_namespaced_pod_mock.assert_not_called()
-            assert delete_logs_mock.call_count == 20
+            assert list_namespaced_pod_mock.call_count == 20
+            assert delete_logs_mock.call_count == 1
+            assert len(delete_logs_mock.call_args_list[0][1]["run_uids"]) == 20
 
     @pytest.mark.asyncio
     async def test_delete_runs_failure(self, db: sqlalchemy.orm.Session):
@@ -210,10 +214,98 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
                     db, name=run_name, project=project
                 )
             assert "Failed to delete 1 run(s). Error: Boom!" in str(exc.value)
-            assert delete_logs_mock.call_count == 2
+            assert delete_logs_mock.call_count == 1
+            assert len(delete_logs_mock.call_args_list[0][1]["run_uids"]) == 2
 
             runs = services.api.crud.Runs().list_runs(db, run_name, project=project)
             assert len(runs) == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_runs_uses_async_session_for_async_delete(
+        self, db: sqlalchemy.orm.Session
+    ):
+        """
+        Regression test: _delete_runs is an async method. The call site must use
+        run_async_function_with_new_db_session (not the sync run_function_with_new_db_session)
+        so the coroutine is properly awaited with an async-compatible DB session.
+        Using the sync variant would return an unawaited coroutine, leaving runs and
+        their logs undeleted.
+        """
+        project = "project-name"
+        run_name = "run-name"
+        for uid in range(3):
+            services.api.crud.Runs().store_run(
+                db,
+                {
+                    "metadata": {
+                        "name": run_name,
+                        "labels": {
+                            mlrun_constants.MLRunInternalLabels.kind: "job",
+                        },
+                        "uid": str(uid),
+                        "iteration": 0,
+                    },
+                },
+                str(uid),
+                project=project,
+            )
+
+        runs = services.api.crud.Runs().list_runs(db, run_name, project=project)
+        assert len(runs) == 3
+
+        k8s_helper = framework.utils.singletons.k8s.get_k8s_helper()
+        async_session_calls = []
+
+        # Spy on run_async_function_with_new_db_session by wrapping it; track
+        # which functions are dispatched through it so we can assert _delete_runs
+        # (an async method) is routed to the async-aware session helper and not
+        # the sync run_function_with_new_db_session.
+        original_async_fn = framework.db.session.run_async_function_with_new_db_session
+
+        async def tracking_async_fn(func, *args, **kwargs):
+            async_session_calls.append(func.__name__)
+            return await original_async_fn(func, *args, **kwargs)
+
+        with (
+            unittest.mock.patch.object(
+                k8s_helper.v1api,
+                "list_namespaced_pod",
+                return_value=k8s_client.V1PodList(
+                    items=[], metadata=k8s_client.V1ListMeta()
+                ),
+            ),
+            unittest.mock.patch.object(
+                services.api.runtime_handlers.BaseRuntimeHandler,
+                "_ensure_run_logs_collected",
+            ),
+            # _post_delete_runs triggers log deletion which requires compiled proto
+            # files not available in local unit-test environments; mock it out so the
+            # test focuses on the DB session dispatch path only.
+            unittest.mock.patch.object(
+                services.api.crud.Runs,
+                "_post_delete_runs",
+                new_callable=unittest.mock.AsyncMock,
+            ),
+            unittest.mock.patch.object(
+                framework.db.session,
+                "run_async_function_with_new_db_session",
+                side_effect=tracking_async_fn,
+            ),
+        ):
+            await services.api.crud.Runs().delete_runs(
+                db, name=run_name, project=project
+            )
+
+        # _delete_runs (async) must be dispatched via run_async_function_with_new_db_session
+        assert "_delete_runs" in async_session_calls, (
+            "_delete_runs must be called via run_async_function_with_new_db_session "
+            "so its coroutine is properly awaited; using the sync variant would silently "
+            "skip DB deletion and log cleanup"
+        )
+
+        # All runs must have been removed from the DB
+        remaining = services.api.crud.Runs().list_runs(db, run_name, project=project)
+        assert len(remaining) == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -278,6 +370,41 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
         run = services.api.crud.Runs().get_run(db, run_uid, 0, project)
         assert run["status"]["state"] == mlrun.common.runtimes.constants.RunStates.error
         assert run["status"]["error"] == "Failed to abort run, error: BOOM"
+
+    def test_store_and_get_run_missing_project(self, db: sqlalchemy.orm.Session):
+        project = "some-project"
+        uid = "some-uid"
+        run_name = "run-name"
+
+        services.api.crud.Runs().store_run(
+            db,
+            {
+                "metadata": {
+                    "name": run_name,
+                    "uid": uid,
+                    "labels": {
+                        mlrun_constants.MLRunInternalLabels.kind: "job",
+                    },
+                    "iteration": 0,
+                },
+            },
+            uid=uid,
+            project=project,
+        )
+
+        run = services.api.crud.Runs().get_run(db, uid=uid, iter=0, project=project)
+        assert run["metadata"]["name"] == run_name
+
+        # get without project should raise
+        with pytest.raises(mlrun.errors.MLRunMissingProjectError):
+            services.api.crud.Runs().get_run(db, uid=uid, iter=0)
+
+        with pytest.raises(mlrun.errors.MLRunMissingProjectError):
+            services.api.crud.Runs().get_run(db, uid=uid, iter=0, project=None)
+
+        # list without project should raise
+        with pytest.raises(mlrun.errors.MLRunMissingProjectError):
+            services.api.crud.Runs().list_runs(db, name=run_name)
 
     def test_store_run_strip_artifacts_metadata(self, db: sqlalchemy.orm.Session):
         project = "project-name"
@@ -542,9 +669,9 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
         for artifact in best_iteration_artifacts:
             framework.utils.singletons.db.get_db().store_artifact(
                 db,
-                artifact["spec"]["db_key"],
-                artifact,
-                None,
+                key=artifact["spec"]["db_key"],
+                artifact=artifact,
+                uid=None,
                 iter=best_iteration,
                 tag="latest",
                 project=project,
@@ -897,6 +1024,21 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
         iter=0,
         run_format: mlrun.common.formatters.RunFormat = None,
     ):
+        def normalize_datetime_fields(artifact):
+            "Normalize 'created' and 'updated' datetime fields in artifact metadata to a standard format."
+            for field in ["created", "updated"]:
+                value = artifact.get("metadata", {}).get(field)
+                if value:
+                    # Parse and format to "YYYY-MM-DD HH:MM:SS+00:00"
+                    try:
+                        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        artifact["metadata"][field] = dt.strftime(
+                            "%Y-%m-%d %H:%M:%S%z"
+                        ).replace("+0000", "+00:00")
+
+                    except Exception:
+                        pass  # If parsing fails, leave as is
+
         run = services.api.crud.Runs().get_run(
             db,
             run_uid,
@@ -913,17 +1055,23 @@ class TestRuns(services.api.tests.unit.conftest.MockedK8sHelper):
         def sort_by_key(e):
             return e["metadata"]["key"]
 
-        assert len(enriched_artifacts) == len(
-            artifacts
-        ), "Number of artifacts is different"
+        assert len(enriched_artifacts) == len(artifacts), (
+            "Number of artifacts is different"
+        )
         enriched_artifacts.sort(key=sort_by_key)
         artifacts.sort(key=sort_by_key)
         for artifact, enriched_artifact in zip(artifacts, enriched_artifacts):
+            normalize_datetime_fields(artifact)
+            normalize_datetime_fields(enriched_artifact)
             assert (
                 deepdiff.DeepDiff(
                     artifact,
                     enriched_artifact,
-                    exclude_paths="root['metadata']['tag']",
+                    exclude_paths=[
+                        "root['metadata']['tag']",
+                        "root['spec']['parent_uri']",
+                        "root['spec']['has_children']",
+                    ],
                 )
                 == {}
             )

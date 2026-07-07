@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import http
 import unittest.mock
 from datetime import datetime
@@ -28,7 +28,7 @@ import mlrun.runtimes
 from mlrun.utils import logger
 
 import framework.utils.background_tasks
-import framework.utils.clients.iguazio as iguazio_client
+import framework.utils.clients.iguazio.v3 as iguazio_client
 import framework.utils.notifications.notification_pusher as notification_pusher
 import services.api.api.endpoints.operations
 import services.api.crud
@@ -152,6 +152,7 @@ async def test_perform_refresh_smtp(
     monkeypatch.setattr(
         framework.utils.singletons.k8s, "get_k8s_helper", lambda: k8s_secrets_mock
     )
+    mlrun.mlconf.iguazio_api_url = "https://some-iguazio-url.com"
     await services.api.api.endpoints.operations._perform_refresh_smtp("")
     mail_notification_default_params = (
         notification_pusher.RunNotificationPusher.mail_notification_default_params
@@ -177,6 +178,7 @@ async def test_failed_perform_refresh_smtp(
         "get_smtp_configuration",
         raise_exception,
     )
+    mlrun.mlconf.iguazio_api_url = "https://some-iguazio-url.com"
     with pytest.raises(mlrun.errors.MLRunInternalServerError):
         await services.api.api.endpoints.operations._perform_refresh_smtp("")
 

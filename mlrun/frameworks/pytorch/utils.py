@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-from typing import Callable, Union
+
+from collections.abc import Callable
+from typing import Union
 
 import numpy as np
 import torch

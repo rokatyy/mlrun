@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import os
-from typing import Optional
 
 import mlrun
 import mlrun.common.constants as mlrun_constants
@@ -84,7 +82,8 @@ def generate_kfp_dag_and_resolve_project(run, project=None):
 
 
 def add_default_function_resources(
-    task: dsl.PipelineTask,
+    task,
+    function: dsl.PipelineTask,
 ) -> dsl.PipelineTask:
     __set_task_requests = {
         "cpu": task.set_cpu_request,
@@ -104,6 +103,7 @@ def add_default_function_resources(
         if resource_value:
             __set_task_limits[resource_name](resource_value)
 
+    mlrun_pipelines.common.ops._enrich_gpu_limits(function=function, task=task)
     return task
 
 
@@ -114,36 +114,42 @@ def add_function_node_selection_attributes(
         enriched_node_selector = mlrun_pipelines.common.ops._enrich_node_selector(
             function
         )
+        enriched_node_selector, enriched_tolerations, enriched_affinity = (
+            mlrun_pipelines.common.ops._enrich_preemption_mode(
+                function, enriched_node_selector
+            )
+        )
+
         if enriched_node_selector:
             for k, v in enriched_node_selector.items():
                 task = kfp_k8s.add_node_selector(task, k, v)
 
-    if getattr(function.spec, "tolerations"):
-        if hasattr(kfp_k8s, "add_toleration"):
-            for t in function.spec.tolerations:
-                task = kfp_k8s.add_toleration(
-                    task,
-                    t.key,
-                    t.operator,
-                    t.value,
-                    t.effect,
-                    t.toleration_seconds,
+        if enriched_tolerations:
+            if hasattr(kfp_k8s, "add_toleration"):
+                for t in enriched_tolerations:
+                    task = kfp_k8s.add_toleration(
+                        task,
+                        t.key,
+                        t.operator,
+                        t.value,
+                        t.effect,
+                        t.toleration_seconds,
+                    )
+            else:
+                # TODO: remove this warning as soon as KFP SDK >=2.7.0 is available for MLRun SDK
+                logger.warning(
+                    "Support for Pod tolerations is not yet available on the KFP 2 engine",
+                    project=function.metadata.project,
+                    function_name=function.metadata.name,
                 )
-        else:
-            # TODO: remove this warning as soon as KFP SDK >=2.7.0 is available for MLRun SDK
+
+        if enriched_affinity:
+            # TODO: remove this warning as soon as KFP SDK provides support for affinity management
             logger.warning(
-                "Support for Pod tolerations is not yet available on the KFP 2 engine",
+                "Support for Pod affinity is not yet available on the KFP 2 engine",
                 project=function.metadata.project,
                 function_name=function.metadata.name,
             )
-
-    # TODO: remove this warning as soon as KFP SDK provides support for affinity management
-    if getattr(function.spec, "affinity"):
-        logger.warning(
-            "Support for Pod affinity is not yet available on the KFP 2 engine",
-            project=function.metadata.project,
-            function_name=function.metadata.name,
-        )
 
     return task
 
@@ -152,8 +158,8 @@ def add_annotations(
     task: dsl.PipelineTask,
     kind: str,
     function,
-    func_url: Optional[str] = None,
-    project: Optional[str] = None,
+    func_url: str | None = None,
+    project: str | None = None,
 ):
     # TODO: remove this warning as soon as KFP SDK >=2.7.0 is available for MLRun SDK
     if not hasattr(kfp_k8s, "add_pod_annotation"):
@@ -207,6 +213,8 @@ def add_labels(task, function, scrape_metrics=False):
 def add_default_env(task):
     if hasattr(kfp_k8s, "use_field_path_as_env"):
         kfp_k8s.use_field_path_as_env(task, "MLRUN_NAMESPACE", "metadata.namespace")
+        # Inject the full pod name for runner_pod annotation.
+        kfp_k8s.use_field_path_as_env(task, "MLRUN_POD_NAME", "metadata.name")
     else:
         # TODO: remove this warning as soon as "use_field_path_as_env" is available for MLRun SDK
         logger.warning(
@@ -305,7 +313,7 @@ def generate_pipeline_node(
     task = container_component()
     task.set_display_name(name)
 
-    add_default_function_resources(task)
+    add_default_function_resources(task, function)
     add_function_node_selection_attributes(function, task)
     add_annotations(task, PipelineRunType.run, function, func_url, project_name)
     add_labels(task, function, scrape_metrics)

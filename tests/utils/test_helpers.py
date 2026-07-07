@@ -11,35 +11,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
+import json
 import re
 import unittest.mock
 from contextlib import nullcontext as does_not_raise
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pandas import Timedelta, Timestamp
 
 import mlrun.errors
+import mlrun.model
+import mlrun.runtimes.nuclio.function
 import mlrun.utils.regex
+import mlrun.utils.retryer
 import mlrun.utils.version
+import mlrun_pipelines.client
+import mlrun_pipelines.models
+from mlrun.common.schemas.hub import HubSourceType
 from mlrun.config import config
 from mlrun.datastore.store_resources import parse_store_uri
 from mlrun.utils import logger
 from mlrun.utils.helpers import (
     StorePrefix,
     enrich_image_url,
+    ensure_batch_job_suffix,
+    ensure_tz_aware,
     extend_hub_uri_if_needed,
+    get_data_from_path,
     get_parsed_docker_registry,
     get_pretty_types_names,
     get_regex_list_as_string,
+    lock_hub_uri_version,
+    merge_requirements,
     parse_artifact_uri,
+    remove_image_protocol_prefix,
+    remove_tag_from_artifact_uri,
     resolve_image_tag_suffix,
+    set_auth_token_name,
+    set_auth_user_id,
+    set_data_by_path,
+    split_path,
     str_to_timestamp,
     template_artifact_path,
     update_in,
     validate_artifact_key_name,
+    validate_function_name,
     validate_tag_name,
     validate_v3io_stream_consumer_group,
     verify_field_regex,
@@ -69,16 +88,53 @@ def test_retry_until_successful_fatal_failure():
     [
         (
             "2024-11-11 07:44:56.255000+0000",
-            datetime(2024, 11, 11, 7, 44, 56, 255000, tzinfo=timezone.utc),
+            datetime(2024, 11, 11, 7, 44, 56, 255000, tzinfo=UTC),
         ),
         (
             "2024-11-11 07:44:56+0000",
-            datetime(2024, 11, 11, 7, 44, 56, tzinfo=timezone.utc),
+            datetime(2024, 11, 11, 7, 44, 56, tzinfo=UTC),
         ),
     ],
 )
 def test_enrich_datetime_with_tz_info(d, expected: datetime):
     assert expected == mlrun.utils.helpers.enrich_datetime_with_tz_info(d)
+
+
+@pytest.mark.parametrize(
+    "dt,expected",
+    [
+        (None, None),
+        (
+            datetime(2024, 11, 11, 7, 44, 56),
+            datetime(2024, 11, 11, 7, 44, 56, tzinfo=UTC),
+        ),
+        (
+            # already tz-aware (e.g. read back from a PostgreSQL/MySQL TIMESTAMP column) - untouched
+            datetime(2024, 11, 11, 7, 44, 56, tzinfo=UTC),
+            datetime(2024, 11, 11, 7, 44, 56, tzinfo=UTC),
+        ),
+        (
+            # already tz-aware in a non-UTC offset (e.g. read back from a PostgreSQL/MySQL TIMESTAMP
+            # column) - untouched, no UTC normalization
+            datetime(2024, 11, 11, 9, 44, 56, tzinfo=timezone(timedelta(hours=2))),
+            datetime(2024, 11, 11, 9, 44, 56, tzinfo=timezone(timedelta(hours=2))),
+        ),
+    ],
+)
+def test_ensure_tz_aware(dt, expected):
+    assert ensure_tz_aware(dt) == expected
+
+
+def test_ensure_tz_aware_dialect_portable_comparison():
+    # a naive datetime as returned by SQLite for a DateTime column, and a tz-aware one as
+    # returned by PostgreSQL/MySQL for the same logical timestamp - both must compare cleanly
+    # against `now_date()` once normalized, regardless of which dialect produced them
+    naive_from_sqlite = datetime(2024, 11, 11, 7, 44, 56)
+    aware_from_postgres = datetime(2024, 11, 11, 7, 44, 56, tzinfo=UTC)
+
+    now = mlrun.utils.helpers.now_date()
+    assert now > ensure_tz_aware(naive_from_sqlite)
+    assert now > ensure_tz_aware(aware_from_postgres)
 
 
 def test_retry_until_successful_sync():
@@ -229,13 +285,30 @@ def test_spark_job_name_regex(value, expected):
     ],
 )
 def test_extend_hub_uri(rundb_mock, case):
-    hub_url = mlrun.mlconf.get_default_hub_source()
+    hub_url = mlrun.mlconf.get_default_hub_source_url_prefix(HubSourceType.functions)
     input_uri = case["input_uri"]
     expected_output = case["expected_output"]
     output, is_hub_url = extend_hub_uri_if_needed(input_uri)
     if is_hub_url:
         expected_output = hub_url + expected_output
     assert expected_output == output
+
+
+@pytest.mark.parametrize(
+    "uri, locked_version, expected",
+    [
+        ("hub://function-name", "1.2.3", "hub://function-name:1.2.3"),
+        ("hub://function-name:latest", "1.2.3", "hub://function-name:1.2.3"),
+        (
+            "hub://source/function-name:latest",
+            "2.0.0",
+            "hub://source/function-name:2.0.0",
+        ),
+        ("hub://function-name:0.0.1", "2.0.0", "hub://function-name:0.0.1"),
+    ],
+)
+def test_lock_hub_uri_version(uri, locked_version, expected):
+    assert lock_hub_uri_version(uri, locked_version) == expected
 
 
 @pytest.mark.parametrize(
@@ -571,36 +644,6 @@ def test_validate_v3io_consumer_group(value, expected):
             "images_to_enrich_registry": "some-repo/some-image,mlrun/mlrun",
         },
         {
-            "image": "mlrun/ml-base",
-            "expected_output": "ghcr.io/mlrun/ml-base:0.5.2-unstable-adsf76s",
-            "images_to_enrich_registry": "mlrun/mlrun,mlrun/ml-base,mlrun/ml-models",
-        },
-        {
-            "image": "mlrun/ml-base:0.5.2",
-            "expected_output": "ghcr.io/mlrun/ml-base:0.5.2",
-            "images_to_enrich_registry": "mlrun/mlrun:0.5.2,mlrun/ml-base:0.5.2,mlrun/ml-models:0.5.2",
-        },
-        {
-            "image": "mlrun/ml-base",
-            "expected_output": "ghcr.io/mlrun/ml-base:0.5.2-unstable-adsf76s",
-            "images_to_enrich_registry": "^mlrun/mlrun:0.5.2-unstable-adsf76s,^mlrun/ml-base:0.5.2-unstable-adsf76s",
-        },
-        {
-            "image": "quay.io/mlrun/ml-base",
-            "expected_output": "quay.io/mlrun/ml-base:0.5.2-unstable-adsf76s",
-            "images_to_enrich_registry": "^mlrun/mlrun:0.5.2-unstable-adsf76s,^mlrun/ml-base:0.5.2-unstable-adsf76s",
-        },
-        {
-            "image": "mlrun/ml-base:0.5.2-unstable-adsf76s-another-tag-suffix",
-            "expected_output": "ghcr.io/mlrun/ml-base:0.5.2-unstable-adsf76s-another-tag-suffix",
-            "images_to_enrich_registry": "^mlrun/mlrun:0.5.2-unstable-adsf76s,^mlrun/ml-base:0.5.2-unstable-adsf76s",
-        },
-        {
-            "image": "mlrun/ml-base:0.5.2-unstable-adsf76s-another-tag-suffix",
-            "expected_output": "mlrun/ml-base:0.5.2-unstable-adsf76s-another-tag-suffix",
-            "images_to_enrich_registry": "^mlrun/mlrun:0.5.2-unstable-adsf76s$,^mlrun/ml-base:0.5.2-unstable-adsf76s$",
-        },
-        {
             "image": "mlrun/mlrun",
             "expected_output": "mlrun/mlrun:0.5.2-unstable-adsf76s",
             "images_to_enrich_registry": "",
@@ -691,38 +734,38 @@ def test_validate_v3io_consumer_group(value, expected):
         },
         {
             "image": "mlrun/mlrun",
-            "client_version": "1.3.0",
-            "client_python_version": "3.7.13",
-            "images_tag": None,
-            "version": None,
-            "expected_output": "mlrun/mlrun:1.3.0-py37",
-            "images_to_enrich_registry": "",
-        },
-        {
-            "image": "mlrun/mlrun",
-            "client_version": "1.5.0",
-            "client_python_version": "3.7.13",
-            "images_tag": None,
-            "version": None,
-            "expected_output": "mlrun/mlrun:1.5.0",
-            "images_to_enrich_registry": "",
-        },
-        {
-            "image": "mlrun/mlrun",
-            "client_version": "1.3.0",
-            "client_python_version": None,
-            "images_tag": None,
-            "version": None,
-            "expected_output": "mlrun/mlrun:1.3.0",
-            "images_to_enrich_registry": "",
-        },
-        {
-            "image": "mlrun/mlrun",
-            "client_version": "1.3.0",
+            "client_version": "1.9.0",
             "client_python_version": "3.9.13",
             "images_tag": None,
             "version": None,
-            "expected_output": "mlrun/mlrun:1.3.0",
+            "expected_output": "mlrun/mlrun:1.9.0-py39",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun",
+            "client_version": "1.11.0",
+            "client_python_version": "3.7.13",
+            "images_tag": None,
+            "version": None,
+            "expected_output": "mlrun/mlrun:1.11.0",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun",
+            "client_version": "1.9.0",
+            "client_python_version": None,
+            "images_tag": None,
+            "version": None,
+            "expected_output": "mlrun/mlrun:1.9.0",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun",
+            "client_version": "1.9.0",
+            "client_python_version": "3.11.13",
+            "images_tag": None,
+            "version": None,
+            "expected_output": "mlrun/mlrun:1.9.0",
             "images_to_enrich_registry": "",
         },
         {
@@ -734,62 +777,268 @@ def test_validate_v3io_consumer_group(value, expected):
             "expected_output": "mlrun/mlrun:1.2.0",
             "images_to_enrich_registry": "",
         },
+        # image_url is "python", client_python_version is "3.9".
+        {
+            "image": "python",
+            "client_python_version": "3.9",
+            "expected_output": "dummy-repo/python:3.9",
+        },
+        # image_url is " python " (with spaces), client_python_version is "3.9".
+        {
+            "image": " python ",
+            "client_python_version": "3.9.18",
+            "expected_output": "dummy-repo/python:3.9",
+        },
+        {
+            "image": " python ",
+            "client_python_version": "3.9",
+            "expected_output": "dummy-repo/python:3.9",
+        },
+        # image_url is "python:3.8" (tag already provided), and not in "images_to_enrich_registry".
+        {
+            "image": "python:3.8",
+            "client_python_version": "3.9",
+            "expected_output": "python:3.8",
+        },
+        # image_url is "python", client_python_version is None.
+        {
+            "image": "python",
+            "client_python_version": None,
+            "expected_output": "python",
+        },
+        # image_url is "python", client_python_version is "" (empty string).
+        {
+            "image": "python",
+            "client_python_version": "",
+            "expected_output": "python",
+            "images_tag": None,
+            "version": None,
+            "client_version": None,
+        },
+        {
+            "image": "myimage",
+            "client_python_version": "3.9",
+            "expected_output": "myimage",
+        },
+        {
+            "image": "another/python",
+            "client_python_version": "3.9",
+            "expected_output": "another/python",
+        },
+        {
+            "image": "python-something",
+            "client_python_version": "3.9",
+            "expected_output": "python-something",
+        },
+        # Test with an mlrun image like "mlrun/mlrun", client_python_version="3.9", client_version="1.6.0".
+        # resolve_image_tag_suffix for 1.6.0 and py3.9 returns ""
+        {
+            "image": "mlrun/mlrun",
+            "client_python_version": "3.9",
+            "client_version": "1.6.0",
+            "version": "1.6.0",  # Mock server version
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:1.6.0",
+        },
+        {
+            "image": "mlrun/mlrun:customtag",
+            "client_python_version": "3.9",
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:customtag",
+        },
+        # version >= 1.10.0 — ml-base image is deprecated, image should be switched to mlrun/mlrun
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.10.0",
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:1.10.0",
+        },
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.10.0-rc8",
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:1.10.0-rc8",
+        },
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.11.0",
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:1.11.0",
+        },
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.10.0",
+            "client_python_version": "3.9.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun:1.10.0-py39",
+            "images_to_enrich_registry": "",
+        },
+        # version < 1.10.0 — ml-base image is still valid, image should remain unchanged
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.7.0",
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/ml-base:1.7.0",
+        },
+        {
+            "image": "mlrun/ml-base",
+            "client_version": "1.9.0",
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/ml-base:1.9.0",
+        },
+        {
+            # explicit older tag in image should keep ml-base without replacement despite newer client version
+            "image": "mlrun/ml-base:1.7.2",
+            "client_version": "1.10.0",
+            "images_tag": None,
+            "images_registry": "",
+            "expected_output": "mlrun/ml-base:1.7.2",
+        },
+        {
+            # image tag > 1.10.0, the image should be switched to mlrun/mlrun
+            "image": "mlrun/ml-base",
+            "client_version": None,
+            "images_tag": "1.10.0",
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:1.10.0",
+        },
+        {
+            # images_tag takes precedence over client_version and triggers replacement even if client_version is older
+            "image": "mlrun/ml-base",
+            "client_version": "1.9.0",
+            "images_tag": "1.10.0",
+            "images_registry": "",
+            "expected_output": "mlrun/mlrun:1.10.0",
+        },
+        {
+            "image": "mlrun/mlrun-kfp",
+            "client_version": "1.10.0",
+            "client_python_version": "3.9.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun-kfp:1.10.0-py39",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp",
+            "client_version": "1.10.0",
+            "client_python_version": "3.11.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun-kfp:1.10.0",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp",
+            "client_version": "1.10.0-rc1",
+            "client_python_version": "3.11.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun-kfp:1.10.0-rc1",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp",
+            "client_version": "1.9.0",
+            "client_python_version": "3.9.10",
+            "images_tag": None,
+            # no -py suffix as 1.9 has no dual python support
+            "expected_output": "mlrun/mlrun-kfp:1.9.0",
+            "images_to_enrich_registry": "",
+        },
+        {
+            "image": "mlrun/mlrun-kfp:1.10.0-rc37",
+            "client_version": "1.10.0-rc37",
+            "client_python_version": "3.9.13",
+            "images_tag": None,
+            "expected_output": "mlrun/mlrun-kfp:1.10.0-rc37-py39",
+            "images_to_enrich_registry": "",
+        },
     ],
 )
 def test_enrich_image(case):
-    default_images_to_enrich_registry = config.images_to_enrich_registry
-    config.images_tag = case.get("images_tag", "0.5.2-unstable-adsf76s")
-    config.images_registry = case.get("images_registry", "ghcr.io/")
-    config.vendor_images_registry = case.get("vendor_images_registry", "dummy-repo/")
-    config.images_to_enrich_registry = case.get(
-        "images_to_enrich_registry", default_images_to_enrich_registry
-    )
-    if case.get("version") is not None:
-        mlrun.utils.version.Version().get = unittest.mock.Mock(
-            return_value={"version": case["version"]}
+    # Preserve original values
+    original_images_tag = config.images_tag
+    original_images_registry = config.images_registry
+    original_vendor_images_registry = config.vendor_images_registry
+    original_images_to_enrich_registry = config.images_to_enrich_registry
+    original_version_get = mlrun.utils.version.Version().get
+
+    try:
+        # Set values from case or use defaults
+        config.images_tag = case.get("images_tag", "0.5.2-unstable-adsf76s")
+        config.images_registry = case.get("images_registry", "ghcr.io/")
+        config.vendor_images_registry = case.get(
+            "vendor_images_registry", "dummy-repo/"
         )
-    config.images_tag = case.get("images_tag", "0.5.2-unstable-adsf76s")
-    image = case["image"]
-    expected_output = case["expected_output"]
-    client_version = case.get("client_version")
-    client_python_version = case.get("client_python_version")
-    output = enrich_image_url(image, client_version, client_python_version)
-    assert output == expected_output
+        config.images_to_enrich_registry = case.get(
+            "images_to_enrich_registry", original_images_to_enrich_registry
+        )
+
+        if "version" in case:  # Allows explicitly setting version to None for mock
+            mlrun.utils.version.Version().get = unittest.mock.Mock(
+                return_value={"version": case.get("version")}
+            )
+        elif (
+            "client_version" not in case and "images_tag" not in case
+        ):  # if no versions are set, ensure server is also None
+            mlrun.utils.version.Version().get = unittest.mock.Mock(
+                return_value={"version": None}
+            )
+
+        image = case["image"]
+        expected_output = case["expected_output"]
+        client_version = case.get("client_version")
+        client_python_version = case.get("client_python_version")
+
+        output = enrich_image_url(image, client_version, client_python_version)
+        assert output == expected_output
+
+    finally:
+        # Restore original values
+        config.images_tag = original_images_tag
+        config.images_registry = original_images_registry
+        config.vendor_images_registry = original_vendor_images_registry
+        config.images_to_enrich_registry = original_images_to_enrich_registry
+        mlrun.utils.version.Version().get = original_version_get
 
 
 @pytest.mark.parametrize(
     "mlrun_version,python_version,expected",
     [
-        ("1.3.0", "3.7.13", "-py37"),
-        ("1.3.0", "3.9.13", ""),
-        ("1.3.0", None, ""),
-        ("1.3.0", "3.8.13", ""),
-        ("1.3.0", "3.9.0", ""),
-        ("1.2.0", "3.7.0", ""),
-        ("1.2.0", "3.8.0", ""),
-        ("1.3.0-rc12", "3.7.13", "-py37"),
-        ("1.3.0-rc12", "3.9.13", ""),
-        ("1.3.0-rc12", None, ""),
-        ("1.3.0-rc12", "3.8.13", ""),
-        ("1.3.1", "3.7.13", "-py37"),
-        ("1.3.1", "3.9.13", ""),
-        ("1.3.1", None, ""),
-        ("1.3.1", "3.8.13", ""),
-        ("1.3.1-rc12", "3.7.13", "-py37"),
-        ("1.3.1-rc12", "3.9.13", ""),
+        ("1.9.0", "3.9.13", "-py39"),
+        ("1.9.0", "3.11.13", ""),
+        ("1.9.0", None, ""),
+        ("1.9.0", "3.10.13", ""),
+        ("1.9.0", "3.11.0", ""),
+        ("1.8.0", "3.9.0", ""),
+        ("1.8.0", "3.10.0", ""),
+        ("1.9.0-rc12", "3.9.13", "-py39"),
+        ("1.9.0-rc12", "3.11.13", ""),
+        ("1.9.0-rc12", None, ""),
+        ("1.9.0-rc12", "3.10.13", ""),
+        ("1.9.1", "3.9.13", "-py39"),
+        ("1.9.1", "3.11.13", ""),
+        ("1.9.1", None, ""),
+        ("1.9.1", "3.10.13", ""),
+        ("1.9.1-rc12", "3.9.13", "-py39"),
+        ("1.9.1-rc12", "3.11.13", ""),
         # an example of a version which contains a suffix of commit hash and not a rc suffix (our CI uses this format)
-        ("1.3.0-zwqeiubz", "3.7.13", "-py37"),
-        ("1.3.0-zwqeiubz", "3.9.13", ""),
+        ("1.9.0-zwqeiubz", "3.9.13", "-py39"),
+        ("1.9.0-zwqeiubz", "3.11.13", ""),
         # an example of a dev version which contains `unstable` and not a rc suffix (When compiling from source without
         # defining a version)
-        ("0.0.0-unstable", "3.7.13", "-py37"),
-        ("0.0.0-unstable", "3.9.13", ""),
-        # list of versions which are later than 1.3.0, if we decide to stop supporting python 3.7 in later versions
+        ("0.0.0-unstable", "3.9.13", "-py39"),
+        ("0.0.0-unstable", "3.11.13", ""),
+        # list of versions which are later than 1.9.0, if we decide to stop supporting python 3.9 in later versions
         # we can remove them
-        ("1.4.0", "3.9.13", ""),
-        ("1.4.0", "3.7.13", "-py37"),
-        ("1.4.0-rc1", "3.7.13", "-py37"),
-        ("1.4.0-rc1", "3.9.13", ""),
+        ("1.10.0", "3.11.13", ""),
+        ("1.10.0", "3.9.13", "-py39"),
+        ("1.10.0-rc1", "3.9.13", "-py39"),
+        ("1.10.0-rc1", "3.11.13", ""),
     ],
 )
 def test_resolve_image_tag_suffix(mlrun_version, python_version, expected):
@@ -989,6 +1238,40 @@ def test_get_pretty_types_names():
         assert pretty_result == expected
 
 
+@pytest.mark.parametrize(
+    "value, expected, exception",
+    [
+        # True values
+        ("y", True, does_not_raise()),
+        ("yes", True, does_not_raise()),
+        ("t", True, does_not_raise()),
+        ("true", True, does_not_raise()),
+        ("on", True, does_not_raise()),
+        ("1", True, does_not_raise()),
+        # False values
+        ("n", False, does_not_raise()),
+        ("no", False, does_not_raise()),
+        ("f", False, does_not_raise()),
+        ("false", False, does_not_raise()),
+        ("off", False, does_not_raise()),
+        ("0", False, does_not_raise()),
+        # Invalid values
+        ("maybe", None, pytest.raises(ValueError)),
+        ("2", None, pytest.raises(ValueError)),
+        ("", None, pytest.raises(ValueError)),
+        (" ", None, pytest.raises(ValueError)),
+        # Case insensitivity
+        ("Y", True, does_not_raise()),
+        ("nO", False, does_not_raise()),
+        ("TrUe", True, does_not_raise()),
+        ("FaLsE", False, does_not_raise()),
+    ],
+)
+def test_str_to_bool(value, expected, exception):
+    with exception:
+        assert mlrun.utils.str_to_bool(value) == expected
+
+
 def test_str_to_timestamp():
     now_time = Timestamp("2021-01-01 00:01:00")
     cases = [
@@ -1066,7 +1349,8 @@ def test_create_step_backoff():
                 assert step_value, next(backoff)
 
 
-def test_retry_until_successful():
+@pytest.mark.parametrize("fatal_exception", (False, True))
+def test_retry_until_successful(fatal_exception):
     def test_run(backoff):
         call_count = {"count": 0}
         unsuccessful_mock = unittest.mock.Mock()
@@ -1086,24 +1370,146 @@ def test_retry_until_successful():
             successful_mock()
             return "Finished"
 
-        result = mlrun.utils.retry_until_successful(
-            backoff,
-            120,
-            logger,
-            True,
-            some_func,
-            call_count,
-            5,
-            [1, 8],
-            some_other_thing="Just",
-        )
-        assert result, "Finished"
-        assert unsuccessful_mock.call_count, 3
-        assert successful_mock.call_count, 1
+        with pytest.raises(Exception) if fatal_exception else does_not_raise():
+            result = mlrun.utils.retry_until_successful(
+                backoff,
+                120,
+                logger,
+                True,
+                some_func,
+                call_count,
+                5,
+                [1, 8],
+                fatal_exceptions=(Exception,) if fatal_exception else (),
+                some_other_thing="Just",
+            )
+        if not fatal_exception:
+            assert result, "Finished"
+            assert unsuccessful_mock.call_count, 3
+            assert successful_mock.call_count, 1
 
     test_run(0.02)
 
     test_run(mlrun.utils.create_linear_backoff(0.02, 0.02))
+
+
+@pytest.mark.asyncio
+async def test_async_retry_until_successful_respects_fatal_exceptions():
+    """Regression test: AsyncRetryer must stop retrying when a fatal exception is raised.
+
+    Before the fix, AsyncRetryer was missing the ``type(exc) not in self.fatal_exceptions``
+    check that the synchronous Retryer has, causing it to keep retrying even on exceptions
+    marked as fatal. This test verifies that the async retryer stops after the first fatal
+    exception and does not call the function again.
+    """
+    call_count = 0
+
+    async def failing_func():
+        nonlocal call_count
+        call_count += 1
+        raise ValueError("fatal error")
+
+    with pytest.raises(mlrun.errors.MLRunRetryExhaustedError):
+        await mlrun.utils.retry_until_successful_async(
+            0.01,
+            10,
+            logger,
+            False,
+            failing_func,
+            fatal_exceptions=(ValueError,),
+        )
+
+    # With fatal_exceptions=(ValueError,), the retryer should stop after the first call.
+    # Without the fix, it would retry many times within the 10-second timeout.
+    assert call_count == 1, (
+        f"Expected exactly 1 call (fatal exception should stop retries), got {call_count}"
+    )
+
+
+def test_retryer_backoff_progresses():
+    """Regression test: Retryer must advance through the backoff generator on each retry.
+
+    Before the fix, the `first_interval` field was never reset to None after the first
+    iteration, so `self.first_interval or next(self.backoff)` always short-circuited to
+    `self.first_interval` on every loop iteration. This caused all retry intervals to be
+    identical (equal to the initial backoff value) instead of following the configured
+    backoff progression.
+    """
+    sleep_intervals = []
+
+    def mock_sleep(seconds):
+        sleep_intervals.append(seconds)
+
+    call_count = 0
+
+    def failing_then_succeeding():
+        nonlocal call_count
+        call_count += 1
+        if call_count < 5:
+            raise Exception("not yet")
+        return "done"
+
+    with unittest.mock.patch.object(mlrun.utils.retryer.time, "sleep", mock_sleep):
+        result = mlrun.utils.helpers.retry_until_successful(
+            mlrun.utils.create_linear_backoff(base=1, coefficient=1, stop_value=100),
+            60,
+            logger,
+            False,
+            failing_then_succeeding,
+        )
+
+    assert result == "done"
+    assert call_count == 5
+    # Verify that backoff intervals are strictly increasing (not all the same)
+    # Linear backoff with base=1, coefficient=1 should produce 1, 2, 3, 4, ...
+    # The first call uses interval from _prepare (first next()), remaining come from the loop
+    assert len(sleep_intervals) == 4, (
+        f"Expected 4 sleep intervals (4 retries before success), got {len(sleep_intervals)}"
+    )
+    # With the fix, intervals should increase. Without the fix, they'd all be the same.
+    assert sleep_intervals == sorted(sleep_intervals), (
+        f"Expected non-decreasing backoff intervals, got {sleep_intervals}"
+    )
+    assert len(set(sleep_intervals)) > 1, (
+        f"Expected backoff intervals to progress (not all identical), got {sleep_intervals}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_retryer_backoff_progresses():
+    """Regression test: AsyncRetryer must advance through the backoff generator on each retry."""
+    sleep_intervals = []
+
+    async def mock_async_sleep(seconds):
+        sleep_intervals.append(seconds)
+
+    call_count = 0
+
+    async def failing_then_succeeding():
+        nonlocal call_count
+        call_count += 1
+        if call_count < 5:
+            raise Exception("not yet")
+        return "done"
+
+    with unittest.mock.patch.object(
+        mlrun.utils.retryer.asyncio, "sleep", mock_async_sleep
+    ):
+        result = await mlrun.utils.helpers.retry_until_successful_async(
+            mlrun.utils.create_linear_backoff(base=1, coefficient=1, stop_value=100),
+            60,
+            logger,
+            False,
+            failing_then_succeeding,
+        )
+
+    assert result == "done"
+    assert call_count == 5
+    assert len(sleep_intervals) == 4
+    assert sleep_intervals == sorted(sleep_intervals)
+    assert len(set(sleep_intervals)) > 1, (
+        f"Expected backoff intervals to progress (not all identical), got {sleep_intervals}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1379,3 +1785,584 @@ def test_validate_single_def_handler_valid_handler(code):
 )
 def test_join_urls(base_url, path, expected_result):
     assert mlrun.utils.helpers.join_urls(base_url, path) == expected_result
+
+
+@pytest.mark.parametrize(
+    "input_time, expected_output",
+    [
+        (None, None),
+        # no timezone
+        ("2025-01-15T11:00:00", datetime(2025, 1, 15, 11, 0, 0, tzinfo=UTC)),
+        # timezone-aware datetime (UTC+2), should convert to UTC
+        (
+            "2025-01-15T11:00:00+02:00",
+            datetime(2025, 1, 15, 9, 0, 0, tzinfo=UTC),
+        ),
+        # already in UTC
+        (
+            "2025-01-15T11:00:00+00:00",
+            datetime(2025, 1, 15, 11, 0, 0, tzinfo=UTC),
+        ),
+    ],
+)
+def test_datetime_from_iso(input_time, expected_output):
+    assert mlrun.utils.helpers.datetime_from_iso(input_time) == expected_output
+
+
+@pytest.mark.parametrize(
+    "dt, expected",
+    [
+        # Test for naive datetime (without tzinfo), should be set to UTC
+        (datetime(2025, 3, 13, 12, 30, 45, 123456), "2025-03-13 12:30:45.123456+00:00"),
+        # Test for datetime with UTC timezone info
+        (
+            datetime(2025, 3, 13, 12, 30, 45, 123456, tzinfo=UTC),
+            "2025-03-13 12:30:45.123456+00:00",
+        ),
+        # Test for datetime with a non-UTC timezone offset (+05:00), should keep the original timezone
+        (
+            datetime(
+                2025, 3, 13, 12, 30, 45, 123456, tzinfo=timezone(timedelta(hours=5))
+            ),
+            "2025-03-13 12:30:45.123456+05:00",
+        ),
+        # Test for datetime with a timezone offset (+02:00), should keep the original timezone
+        (
+            datetime(
+                2025, 3, 13, 12, 30, 45, 123456, tzinfo=timezone(timedelta(hours=2))
+            ),
+            "2025-03-13 12:30:45.123456+02:00",
+        ),
+    ],
+)
+def test_format_datetime(dt, expected):
+    assert mlrun.utils.helpers.format_datetime(dt) == expected
+
+
+@pytest.mark.parametrize(
+    "input_start_date,"
+    "input_end_date,"
+    "input_existing_filter_json,"
+    "input_experiment_id,"
+    "expected_filter_object",
+    [
+        # End date only, no existing filter
+        (
+            None,
+            "2024-11-05T15:30:00Z",
+            None,
+            None,
+            {
+                "predicates": [
+                    {
+                        "key": "created_at",
+                        "op": mlrun_pipelines.models.FilterOperations.LESS_THAN_EQUALS.value,
+                        "timestamp_value": "2024-11-05T15:30:00Z",
+                    }
+                ]
+            },
+        ),
+        # Start and end dates, no existing filter
+        (
+            "2024-10-01T00:00:00Z",
+            "2024-11-05T15:30:00Z",
+            None,
+            None,
+            {
+                "predicates": [
+                    {
+                        "key": "created_at",
+                        "op": mlrun_pipelines.models.FilterOperations.LESS_THAN_EQUALS.value,
+                        "timestamp_value": "2024-11-05T15:30:00Z",
+                    },
+                    {
+                        "key": "created_at",
+                        "op": mlrun_pipelines.models.FilterOperations.GREATER_THAN_EQUALS.value,
+                        "timestamp_value": "2024-10-01T00:00:00Z",
+                    },
+                ]
+            },
+        ),
+        # Existing filter with a 'name' predicate should be dropped; other predicates preserved
+        (
+            None,
+            "2024-11-05T15:30:00Z",
+            json.dumps(
+                {
+                    "predicates": [
+                        {
+                            "key": "name",
+                            "op": mlrun_pipelines.models.FilterOperations.IS_SUBSTRING.value,
+                            "string_value": "test-project",
+                        },
+                        {
+                            "key": "status",
+                            "op": mlrun_pipelines.models.FilterOperations.EQUALS.value,
+                            "string_value": "Succeeded",
+                        },
+                    ]
+                }
+            ),
+            None,
+            {
+                "predicates": [
+                    # 'status' preserved
+                    {
+                        "key": "name",
+                        "op": 9,
+                        "string_value": "test-project",
+                    },
+                    {
+                        "key": "status",
+                        "op": mlrun_pipelines.models.FilterOperations.EQUALS.value,
+                        "string_value": "Succeeded",
+                    },
+                    # end_date added
+                    {
+                        "key": "created_at",
+                        "op": mlrun_pipelines.models.FilterOperations.LESS_THAN_EQUALS.value,
+                        "timestamp_value": "2024-11-05T15:30:00Z",
+                    },
+                ]
+            },
+        ),
+        # Experiment ID filter added alongside dates
+        (
+            "2024-10-01T00:00:00Z",
+            "2024-11-05T15:30:00Z",
+            None,
+            "721ff4f8-d465-455e-bdab-a79857a62136",
+            {
+                "predicates": [
+                    {
+                        "key": "created_at",
+                        "op": mlrun_pipelines.models.FilterOperations.LESS_THAN_EQUALS.value,
+                        "timestamp_value": "2024-11-05T15:30:00Z",
+                    },
+                    {
+                        "key": "created_at",
+                        "op": mlrun_pipelines.models.FilterOperations.GREATER_THAN_EQUALS.value,
+                        "timestamp_value": "2024-10-01T00:00:00Z",
+                    },
+                    {
+                        "key": "experiment_id",
+                        "op": mlrun_pipelines.models.FilterOperations.IN.value,
+                        "string_values": {
+                            "values": ["721ff4f8-d465-455e-bdab-a79857a62136"]
+                        },
+                    },
+                ]
+            },
+        ),
+    ],
+)
+def test_get_kfp_list_runs_filter(
+    input_start_date: str | None,
+    input_end_date: str | None,
+    input_existing_filter_json: str | None,
+    input_experiment_id: str | None,
+    expected_filter_object: dict,
+):
+    experiment_ids = []
+    if input_experiment_id:
+        experiment_ids.append(input_experiment_id)
+    generated_filter_json: str = mlrun_pipelines.client.create_list_runs_filter(
+        start_date=input_start_date,
+        end_date=input_end_date,
+        filter_=input_existing_filter_json,
+        experiment_ids=experiment_ids,
+    )
+    generated_filter_object = json.loads(generated_filter_json)
+    assert generated_filter_object == expected_filter_object
+
+
+@pytest.mark.parametrize(
+    "date_input, expected_output, expectation",
+    [
+        # Valid date without timezone, assume UTC
+        ("2024-11-05T15:30:00", "2024-11-05T15:30:00Z", does_not_raise()),
+        # Valid date with UTC timezone
+        ("2024-11-05T15:30:00Z", "2024-11-05T15:30:00Z", does_not_raise()),
+        # Valid date with different timezone (convert to UTC)
+        ("2024-11-05T15:30:00+02:00", "2024-11-05T13:30:00Z", does_not_raise()),
+        # Valid date with timezone-aware string
+        ("2024-11-05T15:30:00-05:00", "2024-11-05T20:30:00Z", does_not_raise()),
+        # Date with timezone info but no time
+        ("2024-11-05", "2024-11-05T00:00:00Z", does_not_raise()),
+        ("2024/11/05T09:00", "2024-11-05T09:00:00Z", does_not_raise()),
+        # Invalid date format
+        ("invalid-date", "", pytest.raises(ValueError)),
+        # Overflow date (not a realistic timestamp)
+        ("9999-99-99T99:99:99Z", "", pytest.raises(ValueError)),
+    ],
+)
+def test_validate_and_convert_date(date_input, expected_output, expectation):
+    with expectation:
+        assert (
+            mlrun.utils.helpers.validate_and_convert_date(date_input) == expected_output
+        )
+
+
+@pytest.mark.parametrize(
+    "input_uri,expected_output",
+    [
+        ("store://proj/key:latest", "store://proj/key"),
+        ("key#1:dev@tree^uid", "key#1@tree^uid"),
+        ("store://key:tag", "store://key"),
+        (
+            "store://models/remote-model-project/my_model#0@tree",
+            "store://models/remote-model-project/my_model#0@tree",
+        ),
+        (
+            "store://llm-prompts/test-nuclio-runtime/my_llm#0:v1@0eb15a5a-b093-4ca3-9e7d-c22482a6c990^c4f4dcc412acd61460adf9b4a4e799567c4793c8",
+            "store://llm-prompts/test-nuclio-runtime/my_llm#0@0eb15a5a-b093-4ca3-9e7d-c22482a6c990^c4f4dcc412acd61460adf9b4a4e799567c4793c8",
+        ),
+        ("key:tag", "key"),
+        ("key#1:tag", "key#1"),
+        ("key#1@tree", "key#1@tree"),
+        ("key#1@tree^uid", "key#1@tree^uid"),
+        ("store://key#1:tag@tree", "store://key#1@tree"),
+    ],
+)
+def test_remove_tag_from_artifact_uri(input_uri, expected_output):
+    assert remove_tag_from_artifact_uri(input_uri) == expected_output
+
+
+@pytest.mark.parametrize(
+    "path, data, expected",
+    [
+        ("b", {"a": {"x": 1}, "b": 2}, 2),  # simple key with int
+        ("missing", {"x": 1}, None),  # missing key
+        (
+            "a.b.c",
+            {"a": {"b": {"c": {"value": 42}}}},
+            {"value": 42},
+        ),  # nested dict
+        ("a.missing", {"a": {"b": 1}}, {}),  # partially missing nested path
+        (None, {"x": 1, "y": 2}, {"x": 1, "y": 2}),  # path is None
+        ("x", [{"x": 1}, {"x": 2}], [1, 2]),  # list of dicts with simple key
+        (None, [1, 2, 3], [1, 2, 3]),  # list with None path
+        (None, [[1, 2], [3, 4]], [[1, 2], [3, 4]]),  # list of lists with None path
+        (
+            "a.b",
+            [{"a": {"b": 10}}, {"a": {"b": 20}}],
+            [10, 20],
+        ),  # list of dicts with nested path
+        (None, [{"x": 1}, {"y": 2}], [{"x": 1}, {"y": 2}]),  # list with None path
+        (None, ["x"], ["x"]),  # list of strings with None path
+    ],
+)
+def test_get_data_from_path_parametrized(path, data, expected):
+    path_as_list = split_path(path)
+    assert get_data_from_path(path_as_list, data) == expected
+
+
+def test_get_data_from_path_invalid_path_type():
+    # Test that invalid path type raises MLRunInvalidArgumentError
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="Expected path be of type str or list of str or None",
+    ):
+        get_data_from_path(123, {"x": 1})  # path is int, should raise error
+
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="Expected path be of type str or list of str or None",
+    ):
+        get_data_from_path(
+            {"invalid": "path"}, {"x": 1}
+        )  # path is dict, should raise error
+
+    # Test that using a path with a list of non-dict values raises error
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError,
+        match="If data is a list of non-dict values, path must be None",
+    ):
+        get_data_from_path(
+            ["x"], [1, 2, 3]
+        )  # path with list of ints, should raise error
+
+
+@pytest.mark.parametrize(
+    "path, initial_data, value, expected_data",
+    [
+        ("a", {}, 42, {"a": 42}),
+        ("a.b.c", {}, 99, {"a": {"b": {"c": 99}}}),
+        ("a.b.c", {"a": {"b": {"c": 1}}}, 2, {"a": {"b": {"c": 2}}}),
+        ("x.y", {}, "value", {"x": {"y": "value"}}),
+        ("single", {}, "only", {"single": "only"}),
+        (
+            None,
+            {"existing": "data"},
+            {"new_key": 123},
+            {"existing": "data", "new_key": 123},
+        ),
+        # List of dicts - simple path
+        (
+            "b",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            [10, 20, 30],
+            [{"a": 1, "b": 10}, {"a": 2, "b": 20}, {"a": 3, "b": 30}],
+        ),
+        # List of dicts - nested path
+        (
+            "outer.b",
+            [{"outer": {"a": 1}}, {"outer": {"a": 2}}],
+            [10, 20],
+            [{"outer": {"a": 1, "b": 10}}, {"outer": {"a": 2, "b": 20}}],
+        ),
+    ],
+)
+def test_set_data_by_path_success(path, initial_data, value, expected_data):
+    path_as_list = split_path(path)
+    set_data_by_path(path_as_list, initial_data, value)
+    assert initial_data == expected_data
+
+
+@pytest.mark.parametrize(
+    "path, initial_data, value, exc_type, exc_msg",
+    [
+        # For path=None, test that non-dict value raises ValueError
+        (None, {}, "not a dict", ValueError, "value must be a dictionary"),
+        # For invalid path types, test MLRunInvalidArgumentError is raised
+        (
+            123,
+            {},
+            "some_value",
+            mlrun.errors.MLRunInvalidArgumentError,
+            "Expected path",
+        ),
+        (
+            3.14,
+            {},
+            "some_value",
+            mlrun.errors.MLRunInvalidArgumentError,
+            "Expected path",
+        ),
+        (
+            {"not": "a path"},
+            {},
+            "some_value",
+            mlrun.errors.MLRunInvalidArgumentError,
+            "Expected path",
+        ),
+        # List length mismatch
+        (
+            "b",
+            [{"a": 1}, {"a": 2}, {"a": 3}],
+            [10, 20],
+            mlrun.errors.MLRunInvalidArgumentError,
+            "must match data list length",
+        ),
+    ],
+)
+def test_set_data_by_path_invalid_path(path, initial_data, value, exc_type, exc_msg):
+    with pytest.raises(exc_type, match=exc_msg):
+        path_as_list = split_path(path) if isinstance(path, str) else path
+        set_data_by_path(path_as_list, initial_data, value)
+
+
+@pytest.mark.parametrize(
+    "priority_reqs, reqs, expected_result",
+    [
+        (None, None, []),
+        ([], ["requests"], ["requests"]),
+        (["requests"], [], ["requests"]),
+        (
+            ["requests>=1.0", "pydantic==1.0"],
+            ["requests==2.0", "pandas"],
+            ["requests>=1.0", "pydantic==1.0", "pandas"],
+        ),
+    ],
+)
+def test_merge_requirements(priority_reqs, reqs, expected_result):
+    result = merge_requirements(reqs_priority=priority_reqs, reqs_secondary=reqs)
+    assert set(result) == set(expected_result)
+
+
+# Test ensure_batch_job_suffix
+@pytest.mark.parametrize(
+    "function_name,expected_name,expected_renamed",
+    [
+        # Normal case - suffix should be added
+        ("my-function", "my-function-batch", True),
+        # Already has suffix - should not be renamed
+        ("my-function-batch", "my-function-batch", False),
+        # Edge cases
+        (None, None, False),
+        ("", "", False),
+        # Name contains "batch" but doesn't end with "-batch"
+        ("batch-processor", "batch-processor-batch", True),
+    ],
+)
+def test_ensure_batch_job_suffix(function_name, expected_name, expected_renamed):
+    """Test that ensure_batch_job_suffix correctly adds suffix when needed."""
+    modified_name, was_renamed, suffix = ensure_batch_job_suffix(function_name)
+
+    assert modified_name == expected_name
+    assert was_renamed == expected_renamed
+    assert suffix == "-batch"
+
+
+@pytest.mark.parametrize(
+    "function_name,expected",
+    [
+        # Invalid names - uppercase letters
+        ("MyFunction", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("FUNCTION", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("myFunction", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        # Invalid names - special characters
+        ("my_function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my.function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my@function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("my#function", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        # Invalid names - starts/ends with dash
+        ("-myfunction", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("myfunction-", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        # Empty name - allowed (returns early without validation)
+        ("", does_not_raise()),
+        # Invalid names - too long (>63 characters)
+        (
+            "a" * 64,
+            pytest.raises(mlrun.errors.MLRunInvalidArgumentError),
+        ),
+        (
+            "my-very-long-function-name-that-exceeds-kubernetes-limit-of-sixtythree",
+            pytest.raises(mlrun.errors.MLRunInvalidArgumentError),
+        ),
+        # Valid names
+        ("myfunction", does_not_raise()),
+        ("my-function", does_not_raise()),
+        ("my-function-2", does_not_raise()),
+        ("function123", does_not_raise()),
+        ("123function", does_not_raise()),
+        ("a", does_not_raise()),
+        ("a1", does_not_raise()),
+        ("1a", does_not_raise()),
+        # Valid names - at the limit (63 characters)
+        ("a" * 63, does_not_raise()),
+        ("my-function-" + "a" * 50, does_not_raise()),
+    ],
+)
+def test_validate_function_name(function_name, expected):
+    """Test that validate_function_name enforces DNS-1123 label requirements."""
+    with expected:
+        validate_function_name(function_name)
+
+
+class _MockSpec:
+    """Minimal stand-in for any spec object that carries an ``auth`` attribute."""
+
+    def __init__(self, auth=None):
+        self.auth = auth
+
+
+@pytest.mark.parametrize("token_name", [None, ""])
+def test_set_auth_token_name_noop_for_empty_token(token_name):
+    """Test that None or empty token_name does not modify spec."""
+    spec = _MockSpec()
+    set_auth_token_name(spec, token_name)
+    assert spec.auth is None
+
+
+@pytest.mark.parametrize(
+    "initial_auth,expected_auth",
+    [
+        (None, {"token_name": "my-token"}),
+        ({}, {"token_name": "my-token"}),
+        ({"other_key": "value"}, {"other_key": "value", "token_name": "my-token"}),
+        ({"token_name": "old-token"}, {"token_name": "my-token"}),
+    ],
+)
+def test_set_auth_token_name_sets_token(initial_auth, expected_auth):
+    """Test that set_auth_token_name correctly sets token on various auth states."""
+    spec = _MockSpec(auth=initial_auth)
+    set_auth_token_name(spec, "my-token")
+    assert spec.auth == expected_auth
+
+
+def test_set_auth_token_name_works_with_run_spec():
+    """Test that set_auth_token_name works with actual RunSpec."""
+    spec = mlrun.model.RunSpec()
+    set_auth_token_name(spec, "my-token")
+    assert spec.auth["token_name"] == "my-token"
+
+
+def test_set_auth_token_name_works_with_nuclio_spec():
+    """Test that set_auth_token_name works with actual NuclioSpec.
+
+    Note: auth on function spec is only supported for Nuclio runtimes, not job runtimes.
+    """
+    spec = mlrun.runtimes.nuclio.function.NuclioSpec()
+    set_auth_token_name(spec, "my-token")
+    assert spec.auth["token_name"] == "my-token"
+
+
+@pytest.mark.parametrize("user_id", [None, ""])
+def test_set_auth_user_id_noop_for_empty_user_id(user_id):
+    """Test that None or empty user_id does not modify spec."""
+    spec = _MockSpec()
+    set_auth_user_id(spec, user_id)
+    assert spec.auth is None
+
+
+@pytest.mark.parametrize(
+    "initial_auth,expected_auth",
+    [
+        (None, {"user_id": "user-123"}),
+        ({}, {"user_id": "user-123"}),
+        ({"other_key": "value"}, {"other_key": "value", "user_id": "user-123"}),
+        ({"user_id": "old-user"}, {"user_id": "user-123"}),
+    ],
+)
+def test_set_auth_user_id_sets_user_id(initial_auth, expected_auth):
+    """Test that set_auth_user_id correctly sets user_id on various auth states."""
+    spec = _MockSpec(auth=initial_auth)
+    set_auth_user_id(spec, "user-123")
+    assert spec.auth == expected_auth
+
+
+def test_set_auth_user_id_works_with_run_spec():
+    """Test that set_auth_user_id works with actual RunSpec."""
+    spec = mlrun.model.RunSpec()
+    set_auth_user_id(spec, "user-123")
+    assert spec.auth["user_id"] == "user-123"
+
+
+@pytest.mark.parametrize(
+    "image, expected",
+    [
+        # http:// prefix should be stripped
+        ("http://my-registry.com/my-image:latest", "my-registry.com/my-image:latest"),
+        # https:// prefix should be stripped
+        ("https://my-registry.com/my-image:latest", "my-registry.com/my-image:latest"),
+        # no prefix should remain unchanged
+        ("my-registry.com/my-image:latest", "my-registry.com/my-image:latest"),
+        # empty string should remain empty
+        ("", ""),
+    ],
+)
+def test_remove_image_protocol_prefix(image, expected):
+    result = remove_image_protocol_prefix(image)
+    assert result == expected, (
+        f"Expected '{expected}' for image '{image}', got '{result}'"
+    )
+
+
+@pytest.mark.parametrize(
+    "handler,expected",
+    [
+        ("trainer:train_model", ("trainer", "train_model")),
+        ("my_func", ("", "my_func")),
+        ("", ("", "")),
+        (None, ("", "")),
+        # only the FIRST colon splits — partition() returns
+        # ("a", ":", "b:c"), not split's ["a", "b", "c"]
+        ("a:b:c", ("a", "b:c")),
+    ],
+)
+def test_split_handler_module_and_function(handler, expected):
+    from mlrun.utils.helpers import split_handler_module_and_function
+
+    assert split_handler_module_and_function(handler) == expected

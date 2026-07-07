@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import unittest.mock
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,6 +24,7 @@ import mlrun.common.constants as mlrun_constants
 import mlrun.common.schemas
 import tests.conftest
 from mlrun.common.runtimes.constants import PodPhases, RunStates
+from mlrun.common.types import AuthenticationMode
 from mlrun.config import config
 from mlrun.runtimes import RuntimeKinds
 from mlrun.utils import now_date
@@ -453,6 +454,10 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
     async def test_monitor_run_debouncing_non_terminal_state(
         self, db: Session, client: TestClient
     ):
+        # This test verifies that a run in a non-terminal state is not updated if it was already updated recently
+        # (i.e., within the debounce interval).
+        # It ensures the debounce logic correctly skips redundant updates for active runs.
+
         # set monitoring interval so debouncing will be active
         config.monitoring.runs.interval = 100
 
@@ -508,6 +513,57 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
             db, self.project, self.run_uid, RunStates.running
         )
 
+    @pytest.mark.asyncio
+    async def test_monitor_run_debouncing_terminal_state(
+        self, db: Session, client: TestClient
+    ):
+        # This test verifies the debounce logic when the runtime has reached a terminal state but the DB still shows a
+        # recent non-terminal update. Initially, the update should be debounced.
+
+        # Set monitoring interval so debouncing will be active
+        config.monitoring.runs.interval = 100
+
+        # Simulate record still in non-terminal state ("running")
+        self.run["status"]["state"] = RunStates.running
+        original_update_run_updated_time = (
+            framework.utils.singletons.db.get_db()._update_run_updated_time
+        )
+        framework.utils.singletons.db.get_db()._update_run_updated_time = (
+            tests.conftest.freeze(original_update_run_updated_time, now=now_date())
+        )
+        services.api.crud.Runs().store_run(
+            db, self.run, self.run_uid, project=self.project
+        )
+        framework.utils.singletons.db.get_db()._update_run_updated_time = (
+            original_update_run_updated_time
+        )
+
+        # Simulate runtime already in terminal state (extra one for the log collection)
+        self._mock_list_namespaced_pods([[self.running_job_pod]])
+
+        # Trigger monitoring - this should be debounced and not overwrite DB "running"
+        self.runtime_handler.monitor_runs(get_db(), db)
+
+        # Verify that debounce happened: state in DB should still be "running"
+        self._assert_run_reached_state(
+            db, self.project, self.run_uid, RunStates.running
+        )
+
+        # Now simulate that debounce window has passed (simulate old update)
+        debounce_period = config.monitoring.runs.interval
+        framework.utils.singletons.db.get_db()._update_run_updated_time = (
+            tests.conftest.freeze(
+                original_update_run_updated_time,
+                now=now_date() - timedelta(seconds=2 * debounce_period),
+            )
+        )
+        services.api.crud.Runs().store_run(
+            db, self.run, self.run_uid, project=self.project
+        )
+        framework.utils.singletons.db.get_db()._update_run_updated_time = (
+            original_update_run_updated_time
+        )
+
         # Mocking pod that is in terminal state (extra one for the log collection)
         self._mock_list_namespaced_pods(
             [[self.completed_job_pod], [self.completed_job_pod]]
@@ -516,10 +572,10 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
         # Mocking read log calls
         log = self._mock_read_namespaced_pod_log()
 
-        # Triggering monitor cycle
+        # Re-run monitor (now update should go through)
         self.runtime_handler.monitor_runs(get_db(), db)
 
-        # verifying monitoring was not debounced
+        # DB should now reflect the terminal state
         self._assert_run_reached_state(
             db, self.project, self.run_uid, RunStates.completed
         )
@@ -588,9 +644,7 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
         pending_scheduled_pod.status.conditions = [
             k8s_client.V1PodCondition(type="PodScheduled", status="True")
         ]
-        pending_scheduled_pod.status.start_time = datetime.now(
-            timezone.utc
-        ) - timedelta(
+        pending_scheduled_pod.status.start_time = datetime.now(UTC) - timedelta(
             seconds=framework.utils.helpers.time_string_to_seconds(
                 mlrun.mlconf.function.spec.state_thresholds.default.pending_scheduled
             )
@@ -628,7 +682,7 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
             running_overtime_labels,
             PodPhases.running,
         )
-        running_overtime_pod.status.start_time = datetime.now(timezone.utc) - timedelta(
+        running_overtime_pod.status.start_time = datetime.now(UTC) - timedelta(
             seconds=framework.utils.helpers.time_string_to_seconds(
                 mlrun.mlconf.function.spec.state_thresholds.default.executing
             )
@@ -662,9 +716,7 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
                 ),
             )
         ]
-        image_pull_backoff_pod.status.start_time = datetime.now(
-            timezone.utc
-        ) - timedelta(
+        image_pull_backoff_pod.status.start_time = datetime.now(UTC) - timedelta(
             seconds=framework.utils.helpers.time_string_to_seconds(
                 mlrun.mlconf.function.spec.state_thresholds.default.image_pull_backoff
             )
@@ -791,6 +843,485 @@ class TestKubejobRuntimeHandler(TestRuntimeHandlerBase):
         self._assert_list_namespaced_pods_calls(
             self.runtime_handler, len(list_namespaced_pods_calls)
         )
+
+    @pytest.mark.asyncio
+    async def test_monitor_run_retry(self, db: Session, client: TestClient):
+        list_namespaced_pods_calls = [
+            [self.pending_job_pod],
+            [self.running_job_pod],
+            [self.failed_job_pod],
+            # additional time for the get_logger_pods
+            [self.failed_job_pod],
+        ]
+        self._mock_list_namespaced_pods(list_namespaced_pods_calls)
+        expected_number_of_list_pods_calls = len(list_namespaced_pods_calls)
+        self._mock_read_namespaced_pod_log()
+        expected_monitor_cycles_to_reach_expected_state = (
+            expected_number_of_list_pods_calls - 1
+        )
+        self._store_run(
+            db,
+            retry_spec={
+                "count": 3,
+            },
+        )
+        for _ in range(expected_monitor_cycles_to_reach_expected_state):
+            self.runtime_handler.monitor_runs(get_db(), db)
+        self._assert_list_namespaced_pods_calls(
+            self.runtime_handler, expected_number_of_list_pods_calls
+        )
+        self._assert_run_reached_state(
+            db,
+            self.project,
+            self.run_uid,
+            RunStates.pending_retry,
+            expected_status_attrs={
+                "reason": "Some reason",
+                "status_text": "Run failed attempt 1 of 4 with error: Failed message",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_monitor_run_retry_exhausted(self, db: Session, client: TestClient):
+        # label the pods with the retry attempt (3). Without this, the pods would remain unlabeled and the monitor
+        # logic would treat them as outdated, causing them to be skipped.
+        for pod in [self.pending_job_pod, self.running_job_pod, self.failed_job_pod]:
+            pod.metadata.labels[mlrun.common.constants.MLRunInternalLabels.retry] = "3"
+
+        list_namespaced_pods_calls = [
+            [self.pending_job_pod],
+            [self.running_job_pod],
+            [self.failed_job_pod],
+            # additional time for the get_logger_pods
+            [self.failed_job_pod],
+        ]
+        self._mock_list_namespaced_pods(list_namespaced_pods_calls)
+        expected_number_of_list_pods_calls = len(list_namespaced_pods_calls)
+        self._mock_read_namespaced_pod_log()
+        expected_monitor_cycles_to_reach_expected_state = (
+            expected_number_of_list_pods_calls - 1
+        )
+        self._store_run(
+            db,
+            retry_spec={
+                "count": 3,
+            },
+            retry_count=3,
+        )
+        for _ in range(expected_monitor_cycles_to_reach_expected_state):
+            self.runtime_handler.monitor_runs(get_db(), db)
+        self._assert_list_namespaced_pods_calls(
+            self.runtime_handler, expected_number_of_list_pods_calls
+        )
+        self._assert_run_reached_state(
+            db,
+            self.project,
+            self.run_uid,
+            RunStates.error,
+            expected_status_attrs={
+                "reason": "Some reason",
+                "status_text": "Run failed after 4 attempts with error: Failed message",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_pod_deleted_before_first_attempt(
+        self, db: Session, client: TestClient
+    ):
+        # Test that a run still retries if the pod is deleted before the first retry attempt starts.
+        list_namespaced_pods_calls = [
+            [self.pending_job_pod],
+            [self.running_job_pod],
+            # simulate deleted pod
+            [],
+            [self.failed_job_pod],
+            # additional time for the get_logger_pods
+            [self.failed_job_pod],
+        ]
+        expected_number_of_list_pods_calls = len(list_namespaced_pods_calls)
+        self._mock_list_namespaced_pods(list_namespaced_pods_calls)
+        self._mock_read_namespaced_pod_log()
+
+        # Simulate that no runtime resources are found
+        self.runtime_handler._get_runtime_resources = unittest.mock.Mock(
+            return_value=[]
+        )
+        expected_monitor_cycles_to_reach_expected_state = (
+            expected_number_of_list_pods_calls - 1
+        )
+
+        # Store the run with retry spec
+        self._store_run(
+            db,
+            retry_spec={"count": 3},
+        )
+
+        for _ in range(expected_monitor_cycles_to_reach_expected_state):
+            self.runtime_handler.monitor_runs(get_db(), db)
+
+        self._assert_list_namespaced_pods_calls(
+            self.runtime_handler, expected_number_of_list_pods_calls
+        )
+
+        self._assert_run_reached_state(
+            db,
+            self.project,
+            self.run_uid,
+            RunStates.pending_retry,
+            expected_status_attrs={
+                "reason": "Some reason",
+                "status_text": "Run failed attempt 1 of 4 with error: Failed message",
+            },
+        )
+
+    @pytest.mark.parametrize(
+        "pod_retry_label, run_retry_count, expected_result",
+        [
+            # first run, no retry label means pod is valid and not outdated
+            (None, 0, False),
+            # retry count > 0 and no retry label is present, pod is outdated
+            (None, 1, True),
+            # pod attempt is older than current run retry, pod is outdated
+            ("1", 2, True),
+            # pod attempt equals current run retry, pod is still valid
+            ("2", 2, False),
+            # edge case: pod attempt label is ahead of the run's retry count.
+            # this situation shouldn't normally occur, but if it does (e.g. due to a transient state or race condition),
+            # we treat the pod as valid (not outdated) to avoid skipping an active attempt.
+            ("3", 2, False),
+        ],
+    )
+    def test_is_pod_from_outdated_retry(
+        self, pod_retry_label, run_retry_count, expected_result
+    ):
+        pod = self._generate_pod("pod", self.job_labels, PodPhases.pending)
+        if pod_retry_label is not None:
+            pod.metadata.labels[mlrun.common.constants.MLRunInternalLabels.retry] = (
+                pod_retry_label
+            )
+        self.run["status"]["retry_count"] = run_retry_count
+        assert (
+            self.runtime_handler._is_pod_from_outdated_retry(pod.to_dict(), self.run)
+            is expected_result
+        )
+
+    @pytest.mark.parametrize(
+        "initial_volume_mounts,initial_volumes,expected_secret_count",
+        [
+            # No existing volumes or mounts
+            ([], [], 1),
+            # Volume with same name already exists (should be updated, not duplicated)
+            (
+                [{"mountPath": "/var/mlrun-secrets/auth", "name": "secret"}],
+                [
+                    {
+                        "name": "secret",
+                        "secret": {"items": [], "secretName": "old-secret"},
+                    }
+                ],
+                1,
+            ),
+            # Volume with a different name already exists (should add new one)
+            (
+                [{"mountPath": "/some/other/path", "name": "other-volume"}],
+                [
+                    {
+                        "name": "other-volume",
+                        "secret": {"items": [], "secretName": "old-secret"},
+                    }
+                ],
+                2,
+            ),
+            (
+                # Existing auth secret volume should be removed and replaced
+                [{"mountPath": "/var/mlrun-secrets/auth", "name": "old-secret"}],
+                [
+                    {
+                        "name": "old-secret",
+                        "secret": {
+                            "secretName": "mlrun-auth-secrets.oldhash",
+                            "items": [{"key": "tokensFile", "path": ".igz.yml"}],
+                        },
+                    }
+                ],
+                1,
+            ),
+        ],
+    )
+    def test_mount_secret_token_to_runtime(
+        self,
+        initial_volume_mounts,
+        initial_volumes,
+        expected_secret_count,
+    ):
+        token_name = "test-token"
+        auth_info = mlrun.common.schemas.AuthInfo(user_id="test-user")
+
+        runtime = mlrun.runtimes.kubejob.KubejobRuntime()
+        runtime.spec.volume_mounts = initial_volume_mounts.copy()
+        runtime.spec.volumes = initial_volumes.copy()
+
+        mock_secret = unittest.mock.MagicMock()
+        mock_secret.metadata.name = "test-secret"
+
+        mock_helper = unittest.mock.MagicMock()
+        mock_helper._get_user_token_secret.return_value = mock_secret
+
+        mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.IGUAZIO_V4
+
+        with unittest.mock.patch(
+            "framework.utils.singletons.k8s.get_k8s_helper",
+            return_value=mock_helper,
+        ):
+            self.runtime_handler._mount_secret_token_to_runtime(
+                runtime, token_name, auth_info
+            )
+
+        secret_mounts = [
+            volume_mount
+            for volume_mount in runtime.spec.volume_mounts
+            if volume_mount["name"] == "secret"
+        ]
+        secret_volumes = [
+            volume for volume in runtime.spec.volumes if volume["name"] == "secret"
+        ]
+
+        assert len(secret_mounts) == 1
+        assert (
+            secret_mounts[0]["mountPath"]
+            == mlrun.common.constants.MLRUN_JOB_AUTH_SECRET_PATH
+        )
+
+        assert len(secret_volumes) == 1
+        assert secret_volumes[0]["secret"]["secretName"] == "test-secret"
+        assert secret_volumes[0]["secret"]["items"] == [
+            {
+                "key": "tokensFile",
+                "path": mlrun.common.constants.MLRUN_JOB_AUTH_SECRET_FILE,
+            }
+        ]
+
+        assert len(runtime.spec.volumes) == expected_secret_count
+
+        assert not any(
+            volume["secret"]["secretName"].startswith("mlrun-auth-secrets.oldhash")
+            for volume in runtime.spec.volumes
+        )
+
+    def test_mount_secret_token_to_runtime_non_existing_secret(self):
+        token_name = "test-token"
+        auth_info = mlrun.common.schemas.AuthInfo(user_id="test-user")
+
+        runtime = mlrun.runtimes.kubejob.KubejobRuntime()
+
+        mock_helper = unittest.mock.MagicMock()
+        mock_helper._get_user_token_secret.return_value = None
+
+        with unittest.mock.patch(
+            "framework.utils.singletons.k8s.get_k8s_helper",
+            return_value=mock_helper,
+        ):
+            self.runtime_handler._mount_secret_token_to_runtime(
+                runtime, token_name, auth_info
+            )
+
+        # If the secret does not exist, nothing should be mounted or added
+        assert runtime.spec.volume_mounts == []
+        assert runtime.spec.volumes == []
+
+    @pytest.mark.parametrize(
+        "initial_volume_mounts,initial_volumes,expected_volume_count",
+        [
+            # No existing volumes or mounts
+            ([], [], 1),
+            # Volume with the same name already exists (should be replaced, not duplicated)
+            (
+                [
+                    {
+                        "mountPath": mlrun_constants.MLRUN_TELEMETRY_OTLP_HEADERS_PATH,
+                        "name": "telemetry-otlp-headers",
+                    }
+                ],
+                [
+                    {
+                        "name": "telemetry-otlp-headers",
+                        "secret": {"items": None, "secretName": "old-secret"},
+                    }
+                ],
+                1,
+            ),
+            # Volume with a different name already exists (should add new one alongside)
+            (
+                [{"mountPath": "/some/other/path", "name": "other-volume"}],
+                [
+                    {
+                        "name": "other-volume",
+                        "secret": {"items": [], "secretName": "old-secret"},
+                    }
+                ],
+                2,
+            ),
+        ],
+    )
+    def test_mount_telemetry_headers_to_runtime(
+        self,
+        initial_volume_mounts,
+        initial_volumes,
+        expected_volume_count,
+    ):
+        runtime = mlrun.runtimes.kubejob.KubejobRuntime()
+        runtime.spec.volume_mounts = initial_volume_mounts.copy()
+        runtime.spec.volumes = initial_volumes.copy()
+
+        mlrun.mlconf.telemetry.headers_secret_name = "mlrun-otel-headers"
+        try:
+            self.runtime_handler._mount_telemetry_headers_to_runtime(runtime)
+        finally:
+            mlrun.mlconf.telemetry.headers_secret_name = ""
+
+        telemetry_mounts = [
+            volume_mount
+            for volume_mount in runtime.spec.volume_mounts
+            if volume_mount["name"] == "telemetry-otlp-headers"
+        ]
+        telemetry_volumes = [
+            volume
+            for volume in runtime.spec.volumes
+            if volume["name"] == "telemetry-otlp-headers"
+        ]
+
+        assert len(telemetry_mounts) == 1
+        assert (
+            telemetry_mounts[0]["mountPath"]
+            == mlrun_constants.MLRUN_TELEMETRY_OTLP_HEADERS_PATH
+        )
+        assert len(telemetry_volumes) == 1
+        assert telemetry_volumes[0]["secret"]["secretName"] == "mlrun-otel-headers"
+        assert len(runtime.spec.volumes) == expected_volume_count
+
+    def test_mount_telemetry_headers_to_runtime_when_not_configured(self):
+        runtime = mlrun.runtimes.kubejob.KubejobRuntime()
+        mlrun.mlconf.telemetry.headers_secret_name = ""
+
+        self.runtime_handler._mount_telemetry_headers_to_runtime(runtime)
+
+        # No mount should be added when headers_secret_name is blank
+        assert runtime.spec.volume_mounts == []
+        assert runtime.spec.volumes == []
+
+    @pytest.mark.parametrize(
+        "mount_otlp_secret,headers_secret_name,expect_telemetry_mount",
+        [
+            # Both flags set → mount applied
+            (True, "mlrun-otel-headers", True),
+            # mount_otlp_secret off → no mount even if the secret is configured
+            (False, "mlrun-otel-headers", False),
+            # mount_otlp_secret on but no secret name → no mount (nothing to point at)
+            (True, "", False),
+            # Neither set → no mount
+            (False, "", False),
+        ],
+    )
+    def test_add_k8s_secrets_to_spec_telemetry_gating(
+        self, mount_otlp_secret, headers_secret_name, expect_telemetry_mount
+    ):
+        """Telemetry mount fires only when both the per-function
+        `mount_otlp_secret` flag is True and the operator has configured
+        `mlconf.telemetry.headers_secret_name`."""
+        runtime = mlrun.runtimes.kubejob.KubejobRuntime()
+        mlrun.mlconf.telemetry.headers_secret_name = headers_secret_name
+
+        # Skip the unrelated global-secrets and project-secrets branches inside
+        # add_k8s_secrets_to_spec — they need a populated K8s helper that's
+        # orthogonal to telemetry gating.
+        mlrun.mlconf.secret_stores.kubernetes.global_function_env_secret_name = ""
+        mlrun.mlconf.secret_stores.kubernetes.auto_add_project_secrets = False
+
+        try:
+            self.runtime_handler.add_k8s_secrets_to_spec(
+                None,
+                runtime,
+                project_name="some-project",
+                mount_otlp_secret=mount_otlp_secret,
+            )
+        finally:
+            mlrun.mlconf.telemetry.headers_secret_name = ""
+
+        telemetry_mounts = [
+            mount
+            for mount in runtime.spec.volume_mounts
+            if mount["name"] == "telemetry-otlp-headers"
+        ]
+        if expect_telemetry_mount:
+            assert len(telemetry_mounts) == 1
+            assert (
+                telemetry_mounts[0]["mountPath"]
+                == mlrun_constants.MLRUN_TELEMETRY_OTLP_HEADERS_PATH
+            )
+        else:
+            assert telemetry_mounts == []
+
+    @pytest.mark.parametrize("kind", ["job", "serving"])
+    def test_mount_otlp_secret_round_trips_through_spec(self, kind):
+        """The spec attribute lifts to KubeResourceSpec so it works for both
+        job (KubejobRuntime) and remote/serving (NuclioSpec subclass) kinds."""
+        if kind == "job":
+            runtime = mlrun.runtimes.kubejob.KubejobRuntime()
+        else:
+            runtime = mlrun.runtimes.ServingRuntime()
+
+        # Default is False
+        assert runtime.spec.mount_otlp_secret is False
+
+        # Round-trip through to_dict / from_dict
+        runtime.spec.mount_otlp_secret = True
+        spec_dict = runtime.spec.to_dict()
+        assert spec_dict["mount_otlp_secret"] is True
+
+    def test_resolve_container_error_status_with_null_container_statuses(self):
+        # When containerStatuses is absent from the K8s API response,
+        # V1PodStatus.to_dict() sets it to None rather than omitting the key.
+        pod = k8s_client.V1Pod(
+            metadata=k8s_client.V1ObjectMeta(name="test-pod"),
+            status=k8s_client.V1PodStatus(
+                phase=PodPhases.failed,
+                container_statuses=None,
+            ),
+        ).to_dict()
+
+        reason, message = self.runtime_handler._resolve_container_error_status(pod)
+
+        assert reason == ""
+        assert message == ""
+
+    def test_resolve_container_error_status_with_terminated_container(self):
+        pod = k8s_client.V1Pod(
+            metadata=k8s_client.V1ObjectMeta(name="test-pod"),
+            status=k8s_client.V1PodStatus(
+                phase=PodPhases.failed,
+                container_statuses=[
+                    k8s_client.V1ContainerStatus(
+                        name="main",
+                        image="some/image",
+                        image_id="some-image-id",
+                        ready=False,
+                        restart_count=0,
+                        state=k8s_client.V1ContainerState(
+                            terminated=k8s_client.V1ContainerStateTerminated(
+                                exit_code=1,
+                                reason="Error",
+                                message="OOMKilled",
+                            )
+                        ),
+                    )
+                ],
+            ),
+        ).to_dict()
+
+        reason, message = self.runtime_handler._resolve_container_error_status(pod)
+
+        assert reason == "Error"
+        assert message == "OOMKilled"
 
     def _mock_list_resources_pods(self, pod=None):
         pod = pod or self.completed_job_pod

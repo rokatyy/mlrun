@@ -11,19 +11,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import urllib.parse
-from typing import Optional
 
 import semver
 
 import mlrun
 import mlrun.runtimes
+from mlrun.datastore.datastore import StoreManager
+from mlrun.runtimes.nuclio.function import validate_nuclio_version_compatibility
 from mlrun.utils import logger
 
 import framework.utils.clients.nuclio
 import framework.utils.runtimes.nuclio
 import framework.utils.singletons.k8s
+
+
+def pure_nuclio_deployed_restricted():
+    """
+    Decorator to restrict the usage of the decorated function to pure nuclio deployed runtimes only.
+    Pure nuclio deployed runtimes are runtimes that their images are not built by MLRun, but are built and deployed
+    completely by nuclio.
+    """
+
+    def decorator(callback):
+        def wrapper(function, *args, **kwargs):
+            if (
+                function.kind
+                not in mlrun.runtimes.RuntimeKinds.pure_nuclio_deployed_runtimes()
+            ):
+                return
+
+            return callback(function, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def resolve_function_http_trigger(function_spec):
@@ -34,33 +57,37 @@ def resolve_function_http_trigger(function_spec):
 
 
 def resolve_nuclio_runtime_python_image(
-    mlrun_client_version: Optional[str] = None, python_version: Optional[str] = None
+    mlrun_client_version: str | None = None, python_version: str | None = None
 ):
     if not python_version or not mlrun_client_version:
         return mlrun.mlconf.default_nuclio_runtime
 
-    # If the mlrun version is 0.0.0-<unstable>, it is a dev version,
-    # so we can't check if it is higher than 1.3.0, but if the python version was passed,
-    # it means it is 1.3.0-rc or higher, so use the image according to the python version
+    # If mlrun version is 0.0.0-<unstable>, it is a version in development,
+    # so best-effort use the client python version.
     if mlrun_client_version.startswith("0.0.0-") or "unstable" in mlrun_client_version:
-        if python_version.startswith("3.7"):
-            return "python:3.7"
+        # take the 'major.minor' version only
+        version_parts = python_version.split(".")
+        if all(part.isdigit() for part in version_parts) and len(version_parts) in [
+            2,
+            3,
+        ]:
+            return f"python:{version_parts[0]}.{version_parts[1]}"
 
         return mlrun.mlconf.default_nuclio_runtime
 
-    # if mlrun version is older than 1.3.0 we need to use the previous default runtime which is python 3.7
+    # if mlrun version is older than 1.9.0 we need to use the previous default runtime which is python 3.9
     if semver.VersionInfo.parse(mlrun_client_version) < semver.VersionInfo.parse(
-        "1.3.0-X"
+        "1.9.0-X"
     ):
-        return "python:3.7"
+        return "python:3.9"
 
-    # if mlrun version is 1.3.0 or newer and python version is 3.7 we need to use python 3.7 image
+    # if mlrun version is 1.9.0 or newer and python version is 3.9 we need to use python 3.9 image
     if semver.VersionInfo.parse(mlrun_client_version) >= semver.VersionInfo.parse(
-        "1.3.0-X"
-    ) and python_version.startswith("3.7"):
-        return "python:3.7"
+        "1.9.0-X"
+    ) and python_version.startswith("3.9"):
+        return "python:3.9"
 
-    # if none of the above conditions are met we use the default runtime which is python 3.9
+    # if none of the above conditions are met we use the default runtime which is python 3.11
     return mlrun.mlconf.default_nuclio_runtime
 
 
@@ -108,6 +135,9 @@ def enrich_function_with_ingress(config, mode, service_type):
             "workerAvailabilityTimeoutMilliseconds": 10000,  # 10 seconds
             "attributes": {},
         }
+        # Provide trigger mode for nuclio 1.15.3 and above.
+        if validate_nuclio_version_compatibility("1.15.3"):
+            http_trigger["mode"] = "sync"
 
     def enrich():
         http_trigger.setdefault("attributes", {}).setdefault("ingresses", {})["0"] = {
@@ -214,9 +244,10 @@ def is_nuclio_version_in_range(min_version: str, max_version: str) -> bool:
     return parsed_min_version <= parsed_current_version < parsed_max_version
 
 
+@pure_nuclio_deployed_restricted()
 def compile_nuclio_archive_config(
-    nuclio_spec,
     function: mlrun.runtimes.nuclio.function.RemoteRuntime,
+    nuclio_spec,
     builder_env,
     project=None,
     auth_info=None,
@@ -232,11 +263,17 @@ def compile_nuclio_archive_config(
             )
         )
 
+    auto_mount_env = _get_auto_mount_env_as_dict()
+
     def get_secret(key):
-        return builder_env.get(key) or secrets.get(key, "")
+        return (
+            builder_env.get(key) or secrets.get(key, "") or auto_mount_env.get(key, "")
+        )
 
     source = function.spec.build.source
     parsed_url = urllib.parse.urlparse(source)
+    # Nuclio has no az:// code-entry type; rewrite Azure source as archive HTTPS.
+    is_azure_source = source.startswith("az://")
     code_entry_type = ""
     if source.startswith("s3://"):
         code_entry_type = "s3"
@@ -245,6 +282,8 @@ def compile_nuclio_archive_config(
     for archive_prefix in ["http://", "https://", "v3io://", "v3ios://"]:
         if source.startswith(archive_prefix):
             code_entry_type = "archive"
+    if is_azure_source:
+        code_entry_type = "archive"
 
     if code_entry_type == "":
         raise mlrun.errors.MLRunInvalidArgumentError(
@@ -261,17 +300,26 @@ def compile_nuclio_archive_config(
 
     # archive
     if code_entry_type == "archive":
+        if is_azure_source:
+            # Nuclio can't fetch az:// directly; use a datastore-minted read-only HTTPS+SAS URL.
+            store, sub_path, _ = StoreManager().get_or_create_store(
+                source, secrets={**secrets, **(builder_env or {})}
+            )
+            source = store.get_read_only_https_url(sub_path)
+
         v3io_access_key = builder_env.get("V3IO_ACCESS_KEY", "")
         if source.startswith("v3io"):
             if not parsed_url.netloc:
                 source = mlrun.mlconf.v3io_api + parsed_url.path
             else:
-                source = f"http{source[len('v3io'):]}"
+                source = f"http{source[len('v3io') :]}"
             if auth_info and not v3io_access_key:
                 v3io_access_key = auth_info.data_session or auth_info.access_key
 
         if v3io_access_key:
-            code_entry_attributes["headers"] = {"X-V3io-Session-Key": v3io_access_key}
+            code_entry_attributes["headers"] = {
+                mlrun.common.schemas.HeaderNames.v3io_session_key: v3io_access_key
+            }
 
     # s3
     if code_entry_type == "s3":
@@ -283,6 +331,7 @@ def compile_nuclio_archive_config(
         code_entry_attributes["s3AccessKeyId"] = get_secret("AWS_ACCESS_KEY_ID")
         code_entry_attributes["s3SecretAccessKey"] = get_secret("AWS_SECRET_ACCESS_KEY")
         code_entry_attributes["s3SessionToken"] = get_secret("AWS_SESSION_TOKEN")
+        code_entry_attributes["s3Endpoint"] = get_secret("AWS_ENDPOINT_URL_S3")
 
     # git
     if code_entry_type == "git":
@@ -335,3 +384,32 @@ def parse_extra_args_to_nuclio_build_flags(extra_args: str) -> list[str]:
     if current_flag:
         build_flags_list.append(current_flag)
     return build_flags_list
+
+
+def _get_auto_mount_env_as_dict() -> dict:
+    """Return plain-value env vars produced by the configured storage auto-mount modifier.
+
+    Mirrors the logic in builder._resolve_storage_auto_mount_env but returns a plain dict
+    instead of a list of V1EnvVar so callers can do O(1) key lookups. Only plain-value
+    entries are included; valueFrom (secretKeyRef) entries are intentionally skipped
+    because those secret values are already reachable via get_project_secret_data().
+    """
+    auto_mount_type = mlrun.runtimes.pod.AutoMountType(
+        mlrun.mlconf.storage.auto_mount_type
+    )
+    modifier = auto_mount_type.get_modifier()
+    if modifier not in mlrun.runtimes.pod.AutoMountType.env_style_modifiers():
+        return {}
+    scratch = mlrun.runtimes.KubejobRuntime()
+    scratch.try_auto_mount_based_on_config()
+    result = {}
+    for env_var in scratch.spec.env or []:
+        name = env_var["name"] if isinstance(env_var, dict) else env_var.name
+        value = (
+            env_var.get("value")
+            if isinstance(env_var, dict)
+            else getattr(env_var, "value", None)
+        )
+        if value:
+            result[name] = value
+    return result

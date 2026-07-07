@@ -15,22 +15,19 @@
 import datetime
 import functools
 import os
+from collections.abc import Callable
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Callable, Optional, TypedDict, Union, cast
+from typing import TYPE_CHECKING, TypedDict, Union, cast
 
 import numpy as np
 import pandas as pd
 
 import mlrun
-import mlrun.artifacts
 import mlrun.common.model_monitoring.helpers
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
 import mlrun.data_types.infer
 import mlrun.datastore.datastore_profile
-import mlrun.model_monitoring
 import mlrun.platforms.iguazio
-import mlrun.utils.helpers
-from mlrun.common.schemas import ModelEndpoint
 from mlrun.common.schemas.model_monitoring.model_endpoints import (
     ModelEndpointMonitoringMetric,
     compose_full_name,
@@ -50,8 +47,8 @@ class _BatchDict(TypedDict):
 
 
 def _is_results_regex_match(
-    existing_result_name: Optional[str],
-    result_name_filters: Optional[list[str]],
+    existing_result_name: str | None,
+    result_name_filters: list[str] | None,
 ) -> bool:
     if existing_result_name.count(".") != 3 or any(
         part == "" for part in existing_result_name.split(".")
@@ -69,8 +66,8 @@ def _is_results_regex_match(
 
 
 def filter_results_by_regex(
-    existing_result_names: Optional[list[str]] = None,
-    result_name_filters: Optional[list[str]] = None,
+    existing_result_names: list[str] | None = None,
+    result_name_filters: list[str] | None = None,
 ) -> list[str]:
     """
     Filter a list of existing result names by a list of filters.
@@ -116,9 +113,9 @@ def filter_results_by_regex(
 def get_stream_path(
     project: str,
     function_name: str = mm_constants.MonitoringFunctionNames.STREAM,
-    stream_uri: Optional[str] = None,
-    secret_provider: Optional[Callable[[str], str]] = None,
-    profile: Optional[mlrun.datastore.datastore_profile.DatastoreProfile] = None,
+    stream_uri: str | None = None,
+    secret_provider: Callable[[str], str] | None = None,
+    profile: mlrun.datastore.datastore_profile.DatastoreProfile | None = None,
 ) -> str:
     """
     Get stream path from the project secret. If wasn't set, take it from the system configurations
@@ -137,28 +134,26 @@ def get_stream_path(
     )
 
     if isinstance(profile, mlrun.datastore.datastore_profile.DatastoreProfileV3io):
-        stream_uri = "v3io"
-    elif isinstance(
-        profile, mlrun.datastore.datastore_profile.DatastoreProfileKafkaSource
-    ):
-        stream_uri = f"kafka://{profile.brokers[0]}"
-    else:
-        raise mlrun.errors.MLRunValueError(
-            f"Received an unexpected stream profile type: {type(profile)}\n"
-            "Expects `DatastoreProfileV3io` or `DatastoreProfileKafkaSource`."
-        )
-
-    if not stream_uri or stream_uri == "v3io":
         stream_uri = mlrun.mlconf.get_model_monitoring_file_target_path(
             project=project,
             kind=mm_constants.FileTargetKind.STREAM,
             target="online",
             function_name=function_name,
         )
+        return stream_uri.replace("v3io://", f"ds://{profile.name}")
 
-    return mlrun.common.model_monitoring.helpers.parse_monitoring_stream_path(
-        stream_uri=stream_uri, project=project, function_name=function_name
-    )
+    elif isinstance(
+        profile, mlrun.datastore.datastore_profile.DatastoreProfileKafkaStream
+    ):
+        topic = mlrun.common.model_monitoring.helpers.get_kafka_topic(
+            project=project, function_name=function_name
+        )
+        return f"ds://{profile.name}/{topic}"
+    else:
+        raise mlrun.errors.MLRunValueError(
+            f"Received an unexpected stream profile type: {type(profile)}\n"
+            "Expects `DatastoreProfileV3io` or `DatastoreProfileKafkaStream`."
+        )
 
 
 def get_monitoring_parquet_path(
@@ -246,24 +241,9 @@ def get_monitoring_drift_measures_data(project: str, endpoint_id: str) -> "DataI
     )
 
 
-def get_tsdb_connection_string(
-    secret_provider: Optional[Callable[[str], str]] = None,
-) -> str:
-    """Get TSDB connection string from the project secret. If wasn't set, take it from the system
-    configurations.
-    :param secret_provider: An optional secret provider to get the connection string secret.
-    :return:                Valid TSDB connection string.
-    """
-
-    return mlrun.get_secret_or_env(
-        key=mm_constants.ProjectSecretKeys.TSDB_CONNECTION,
-        secret_provider=secret_provider,
-    )
-
-
 def _get_profile(
     project: str,
-    secret_provider: Optional[Callable[[str], str]],
+    secret_provider: Callable[[str], str] | None,
     profile_name_key: str,
 ) -> mlrun.datastore.datastore_profile.DatastoreProfile:
     """
@@ -300,7 +280,7 @@ def _get_v3io_output_stream(
     v3io_profile: mlrun.datastore.datastore_profile.DatastoreProfileV3io,
     project: str,
     function_name: str,
-    v3io_access_key: Optional[str],
+    v3io_access_key: str | None,
     mock: bool = False,
 ) -> mlrun.platforms.iguazio.OutputStream:
     stream_uri = mlrun.mlconf.get_model_monitoring_file_target_path(
@@ -320,7 +300,7 @@ def _get_v3io_output_stream(
 
 def _get_kafka_output_stream(
     *,
-    kafka_profile: mlrun.datastore.datastore_profile.DatastoreProfileKafkaSource,
+    kafka_profile: mlrun.datastore.datastore_profile.DatastoreProfileKafkaStream,
     project: str,
     function_name: str,
     mock: bool = False,
@@ -328,18 +308,9 @@ def _get_kafka_output_stream(
     topic = mlrun.common.model_monitoring.helpers.get_kafka_topic(
         project=project, function_name=function_name
     )
-    profile_attributes = kafka_profile.attributes()
-    producer_options = profile_attributes.get("producer_options", {})
-    if "sasl" in profile_attributes:
-        sasl = profile_attributes["sasl"]
-        producer_options.update(
-            {
-                "security_protocol": "SASL_PLAINTEXT",
-                "sasl_mechanism": sasl["mechanism"],
-                "sasl_plain_username": sasl["user"],
-                "sasl_plain_password": sasl["password"],
-            },
-        )
+    attributes = kafka_profile.attributes()
+    producer_options = mlrun.datastore.utils.KafkaParameters(attributes).producer()
+
     return mlrun.platforms.iguazio.KafkaOutputStream(
         brokers=kafka_profile.brokers,
         topic=topic,
@@ -351,9 +322,9 @@ def _get_kafka_output_stream(
 def get_output_stream(
     project: str,
     function_name: str = mm_constants.MonitoringFunctionNames.STREAM,
-    secret_provider: Optional[Callable[[str], str]] = None,
-    profile: Optional[mlrun.datastore.datastore_profile.DatastoreProfile] = None,
-    v3io_access_key: Optional[str] = None,
+    secret_provider: Callable[[str], str] | None = None,
+    profile: mlrun.datastore.datastore_profile.DatastoreProfile | None = None,
+    v3io_access_key: str | None = None,
     mock: bool = False,
 ) -> Union[
     mlrun.platforms.iguazio.OutputStream, mlrun.platforms.iguazio.KafkaOutputStream
@@ -385,7 +356,7 @@ def get_output_stream(
         )
 
     elif isinstance(
-        profile, mlrun.datastore.datastore_profile.DatastoreProfileKafkaSource
+        profile, mlrun.datastore.datastore_profile.DatastoreProfileKafkaStream
     ):
         return _get_kafka_output_stream(
             kafka_profile=profile,
@@ -397,7 +368,7 @@ def get_output_stream(
     else:
         raise mlrun.errors.MLRunValueError(
             f"Received an unexpected stream profile type: {type(profile)}\n"
-            "Expects `DatastoreProfileV3io` or `DatastoreProfileKafkaSource`."
+            "Expects `DatastoreProfileV3io` or `DatastoreProfileKafkaStream`."
         )
 
 
@@ -444,73 +415,6 @@ def _get_monitoring_time_window_from_controller_run(
     return batch_dict2timedelta(batch_dict)
 
 
-def update_model_endpoint_last_request(
-    project: str,
-    model_endpoint: ModelEndpoint,
-    current_request: datetime.datetime,
-    db: "RunDBInterface",
-) -> None:
-    """
-    Update the last request field of the model endpoint to be after the current request time.
-
-    :param project:         Project name.
-    :param model_endpoint:  Model endpoint object.
-    :param current_request: current request time
-    :param db:              DB interface.
-    """
-    is_batch_endpoint = (
-        model_endpoint.metadata.endpoint_type == mm_constants.EndpointType.BATCH_EP
-    )
-    if not is_batch_endpoint:
-        logger.info(
-            "Update model endpoint last request time (EP with serving)",
-            project=project,
-            endpoint_id=model_endpoint.metadata.uid,
-            name=model_endpoint.metadata.name,
-            function_name=model_endpoint.spec.function_name,
-            last_request=model_endpoint.status.last_request,
-            current_request=current_request,
-        )
-        db.patch_model_endpoint(
-            project=project,
-            endpoint_id=model_endpoint.metadata.uid,
-            name=model_endpoint.metadata.name,
-            attributes={mm_constants.EventFieldType.LAST_REQUEST: current_request},
-        )
-    else:  # model endpoint without any serving function - close the window "manually"
-        try:
-            time_window = _get_monitoring_time_window_from_controller_run(project, db)
-        except mlrun.errors.MLRunNotFoundError:
-            logger.warn(
-                "Not bumping model endpoint last request time - the monitoring controller isn't deployed yet.\n"
-                "Call `project.enable_model_monitoring()` first."
-            )
-            return
-
-        bumped_last_request = (
-            current_request
-            + time_window
-            + datetime.timedelta(
-                seconds=mlrun.mlconf.model_endpoint_monitoring.parquet_batching_timeout_secs
-            )
-        )
-        logger.info(
-            "Bumping model endpoint last request time (EP without serving)",
-            project=project,
-            endpoint_id=model_endpoint.metadata.uid,
-            last_request=model_endpoint.status.last_request,
-            current_request=current_request.isoformat(),
-            bumped_last_request=bumped_last_request,
-        )
-        db.patch_model_endpoint(
-            project=project,
-            endpoint_id=model_endpoint.metadata.uid,
-            name=model_endpoint.metadata.name,
-            function_name=model_endpoint.spec.function_name,
-            attributes={mm_constants.EventFieldType.LAST_REQUEST: bumped_last_request},
-        )
-
-
 def calculate_inputs_statistics(
     sample_set_statistics: dict, inputs: pd.DataFrame
 ) -> mlrun.common.model_monitoring.helpers.FeatureStats:
@@ -552,6 +456,22 @@ def get_result_instance_fqn(
     model_endpoint_id: str, app_name: str, result_name: str
 ) -> str:
     return f"{model_endpoint_id}.{app_name}.result.{result_name}"
+
+
+def get_alert_name_from_result_fqn(result_fqn: str):
+    """
+    :param   result_fqn: current get_result_instance_fqn format: `{model_endpoint_id}.{app_name}.result.{result_name}`
+
+    :return: shorter fqn without forbidden alert characters.
+    """
+    if result_fqn.count(".") != 3 or result_fqn.split(".")[2] != "result":
+        raise mlrun.errors.MLRunValueError(
+            f"result_fqn: {result_fqn} is not in the correct format: {{model_endpoint_id}}.{{app_name}}."
+            f"result.{{result_name}}"
+        )
+    # Name format cannot contain "."
+    # The third component is always `result`, so it is not necessary for checking uniqueness.
+    return "_".join(result_fqn.split(".")[i] for i in [0, 1, 3])
 
 
 def get_default_result_instance_fqn(model_endpoint_id: str) -> str:
@@ -596,16 +516,136 @@ def _get_monitoring_schedules_folder_path(project: str) -> str:
     )
 
 
-def _get_monitoring_schedules_file_path(*, project: str, endpoint_id: str) -> str:
+def _get_monitoring_schedules_user_folder_path(out_path: str) -> str:
+    return os.path.join(out_path, mm_constants.FileTargetKind.MONITORING_SCHEDULES)
+
+
+def _get_monitoring_schedules_file_endpoint_path(
+    *, project: str, endpoint_id: str
+) -> str:
     return os.path.join(
         _get_monitoring_schedules_folder_path(project), f"{endpoint_id}.json"
     )
 
 
-def get_monitoring_schedules_data(*, project: str, endpoint_id: str) -> "DataItem":
+def get_monitoring_schedules_endpoint_data(
+    *, project: str, endpoint_id: str
+) -> "DataItem":
     """
     Get the model monitoring schedules' data item of the project's model endpoint.
     """
     return mlrun.datastore.store_manager.object(
-        _get_monitoring_schedules_file_path(project=project, endpoint_id=endpoint_id)
+        _get_monitoring_schedules_file_endpoint_path(
+            project=project, endpoint_id=endpoint_id
+        )
     )
+
+
+def get_monitoring_schedules_chief_data(*, project: str) -> "DataItem":
+    """
+    Get the model monitoring schedules' data item of the project's model endpoint.
+    """
+    return mlrun.datastore.store_manager.object(
+        _get_monitoring_schedules_file_chief_path(project=project)
+    )
+
+
+def get_monitoring_schedules_user_application_data(
+    *, out_path: str, application: str
+) -> "DataItem":
+    """
+    Get the model monitoring schedules' data item of user application runs.
+    """
+    return mlrun.datastore.store_manager.object(
+        _get_monitoring_schedules_file_user_application_path(
+            out_path=out_path, application=application
+        )
+    )
+
+
+def _get_monitoring_schedules_file_chief_path(
+    *,
+    project: str,
+) -> str:
+    return os.path.join(
+        _get_monitoring_schedules_folder_path(project), f"{project}.json"
+    )
+
+
+def _get_monitoring_schedules_file_user_application_path(
+    *, out_path: str, application: str
+) -> str:
+    return os.path.join(
+        _get_monitoring_schedules_user_folder_path(out_path), f"{application}.json"
+    )
+
+
+def get_start_end(
+    start: Union[datetime.datetime, None],
+    end: Union[datetime.datetime, None],
+    delta: datetime.timedelta | None = None,
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """
+    static utils function for tsdb start end format
+    :param start:       Either None or datetime, None is handled as datetime.min(tz=timezone.utc) unless `delta`
+                        is provided.
+    :param end:         Either None or datetime, None is handled as datetime.now(tz=timezone.utc)
+    :param delta:       Optional timedelta to define a time span.
+                        - If both `start` and `end` are provided, `delta` is ignored.
+                        - If only one of `start` or `end` is provided, the other will be
+                          calculated using `delta`.
+                        - If neither `start` nor `end` is provided, `end` defaults to now,
+                          and `start` is calculated as `end - delta`.
+    :return:            start datetime, end datetime
+    """
+
+    if delta and start and end:
+        # If both start and end are provided, delta is ignored
+        pass
+    elif delta:
+        if start and not end:
+            end = start + delta
+        else:
+            end = end or mlrun.utils.datetime_now()
+            start = end - delta
+    else:
+        start = start or mlrun.utils.datetime_min()
+        end = end or mlrun.utils.datetime_now()
+
+    if not (
+        isinstance(start, datetime.datetime) and isinstance(end, datetime.datetime)
+    ):
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            "Both start and end must be datetime objects"
+        )
+
+    if start > end:
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            "The start time must be before the end time. Note that if end time is not provided, "
+            "the current time is used by default"
+        )
+
+    return start, end
+
+
+def validate_time_range(
+    start: datetime.datetime | None = None, end: datetime.datetime | None = None
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """
+    validate start and end parameters and set default values if needed.
+    :param start:       Either None or datetime, None is handled as datetime.now(tz=timezone.utc) - timedelta(days=1)
+    :param end:         Either None or datetime, None is handled as datetime.now(tz=timezone.utc)
+    :return:            start datetime, end datetime
+    """
+    end = end or mlrun.utils.helpers.datetime_now()
+    start = start or (end - datetime.timedelta(days=1))
+    if start.tzinfo is None or end.tzinfo is None:
+        raise mlrun.errors.MLRunInvalidArgumentTypeError(
+            "Custom start and end times must contain the timezone."
+        )
+    if start > end:
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            "The start time must be before the end time. Note that if end time is not provided, "
+            "the current time is used by default."
+        )
+    return start, end

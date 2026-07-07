@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Union
 
 import mlrun
 
@@ -39,7 +39,7 @@ class ArtifactsLibrary(ABC):
     @classmethod
     def get_plans(
         cls,
-        artifacts: Optional[Union[list[Plan], dict[str, dict], list[str]]] = None,
+        artifacts: Union[list[Plan], dict[str, dict], list[str]] | None = None,
         context: mlrun.MLClientCtx = None,
         include_default: bool = True,
         # custom_plans: dict = None, :param custom_plans: Custom user plans objects to initialize from.

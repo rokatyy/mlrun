@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from mlrun.errors import MLRunBaseError
 
 
@@ -42,6 +42,22 @@ class MLRunPackagePackingError(MLRunPackageError):
 class MLRunPackageUnpackingError(MLRunPackageError):
     """
     An error that may be raised during a `mlrun.Packager.unpack` method.
+    """
+
+    pass
+
+
+class MLRunPackageBundlingError(MLRunPackageError):
+    """
+    An error that may be raised during a `mlrun.Packager.bundle` method.
+    """
+
+    pass
+
+
+class MLRunPackageUnbundlingError(MLRunPackageError):
+    """
+    An error that may be raised during a `mlrun.Packager.unbundle` method.
     """
 
     pass

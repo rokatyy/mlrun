@@ -11,40 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import datetime
 import typing
+import uuid
 
 import pydantic.v1
-from deprecated import deprecated
 
 import mlrun.common.types
 
 from .common import ImageBuilder
+from .model_monitoring.constants import StreamTarget, TSDBTarget
 from .object import ObjectKind, ObjectStatus
-
-
-@deprecated(
-    version="1.7.0",
-    reason="mlrun.common.schemas.ProjectsFormat is deprecated and will be removed in 1.9.0. "
-    "Use mlrun.common.formatters.ProjectFormat instead.",
-    category=FutureWarning,
-)
-class ProjectsFormat(mlrun.common.types.StrEnum):
-    full = "full"
-    name_only = "name_only"
-    # minimal format removes large fields from the response (e.g. functions, workflows, artifacts)
-    # and is used for faster response times (in the UI)
-    minimal = "minimal"
-    # internal - allowed only in follower mode, only for the leader for upgrade purposes
-    leader = "leader"
 
 
 class ProjectMetadata(pydantic.v1.BaseModel):
     name: str
-    created: typing.Optional[datetime.datetime] = None
-    labels: typing.Optional[dict] = {}
-    annotations: typing.Optional[dict] = {}
+    created: datetime.datetime | None = None
+    labels: dict | None = {}
+    annotations: dict | None = {}
 
     class Config:
         extra = pydantic.v1.Extra.allow
@@ -74,50 +59,83 @@ class ProjectState(mlrun.common.types.StrEnum):
 
 
 class ProjectStatus(ObjectStatus):
-    state: typing.Optional[ProjectState]
+    state: ProjectState | None
+    op_id: uuid.UUID | None = None
+    phase: int | None = None
+    updated_at: datetime.datetime | None = None
+
+
+class ProjectMonitoringSpec(pydantic.v1.BaseModel):
+    """Project-level model monitoring configuration.
+
+    Groups model-monitoring-related project state in one place. Populated by
+    `enable_model_monitoring()` / `set_model_monitoring_credentials()`. The actual
+    profile names and credentials still live in project secrets — this struct
+    only holds typed metadata + feature flags.
+    """
+
+    # Whether model monitoring is active on the project.
+    enabled: bool = False
+    # Whether monitoring application results/metrics are also exported via OTel.
+    # Gated by the operator's `mlconf.telemetry.otlp_endpoint`; see ML-12543.
+    otlp_enabled: bool = False
+    # Stream backend type, derived from STREAM_PROFILE on credentials setup.
+    # Profile names themselves remain in project secrets.
+    stream_type: StreamTarget | None = None
+    # TSDB backend type, derived from TSDB_PROFILE.
+    tsdb_type: TSDBTarget | None = None
+
+    class Config:
+        extra = pydantic.v1.Extra.allow
 
 
 class ProjectSpec(pydantic.v1.BaseModel):
-    description: typing.Optional[str] = None
-    owner: typing.Optional[str] = None
-    goals: typing.Optional[str] = None
-    params: typing.Optional[dict] = {}
-    functions: typing.Optional[list] = []
-    workflows: typing.Optional[list] = []
-    artifacts: typing.Optional[list] = []
-    artifact_path: typing.Optional[str] = None
-    conda: typing.Optional[str] = None
-    source: typing.Optional[str] = None
-    subpath: typing.Optional[str] = None
-    origin_url: typing.Optional[str] = None
-    desired_state: typing.Optional[ProjectDesiredState] = ProjectDesiredState.online
-    custom_packagers: typing.Optional[list[tuple[str, bool]]] = None
-    default_image: typing.Optional[str] = None
-    build: typing.Optional[ImageBuilder] = None
-    default_function_node_selector: typing.Optional[dict] = {}
+    description: str | None = None
+    owner: str | None = None
+    goals: str | None = None
+    params: dict | None = {}
+    functions: list | None = []
+    workflows: list | None = []
+    artifacts: list | None = []
+    artifact_path: str | None = None
+    conda: str | None = None
+    source: str | None = None
+    subpath: str | None = None
+    origin_url: str | None = None
+    desired_state: ProjectDesiredState | None = ProjectDesiredState.online
+    custom_packagers: list[tuple[str, bool]] | None = None
+    default_image: str | None = None
+    build: ImageBuilder | None = None
+    default_function_node_selector: dict | None = {}
+    model_monitoring: ProjectMonitoringSpec = pydantic.v1.Field(
+        default_factory=ProjectMonitoringSpec
+    )
 
     class Config:
         extra = pydantic.v1.Extra.allow
 
 
 class ProjectSpecOut(pydantic.v1.BaseModel):
-    description: typing.Optional[str] = None
-    owner: typing.Optional[str] = None
-    goals: typing.Optional[str] = None
-    params: typing.Optional[dict] = {}
-    functions: typing.Optional[list] = []
-    workflows: typing.Optional[list] = []
-    artifacts: typing.Optional[list] = []
-    artifact_path: typing.Optional[str] = None
-    conda: typing.Optional[str] = None
-    source: typing.Optional[str] = None
-    subpath: typing.Optional[str] = None
-    origin_url: typing.Optional[str] = None
-    desired_state: typing.Optional[ProjectDesiredState] = ProjectDesiredState.online
-    custom_packagers: typing.Optional[list[tuple[str, bool]]] = None
-    default_image: typing.Optional[str] = None
+    description: str | None = None
+    owner: str | None = None
+    goals: str | None = None
+    params: dict | None = {}
+    functions: list | None = []
+    workflows: list | None = []
+    artifacts: list | None = []
+    artifact_path: str | None = None
+    conda: str | None = None
+    source: str | None = None
+    subpath: str | None = None
+    origin_url: str | None = None
+    desired_state: ProjectDesiredState | None = ProjectDesiredState.online
+    custom_packagers: list[tuple[str, bool]] | None = None
+    default_image: str | None = None
     build: typing.Any = None
-    default_function_node_selector: typing.Optional[dict] = {}
+    default_function_node_selector: dict | None = {}
+    model_monitoring: ProjectMonitoringSpec = pydantic.v1.Field(
+        default_factory=ProjectMonitoringSpec
+    )
 
     class Config:
         extra = pydantic.v1.Extra.allow
@@ -127,7 +145,7 @@ class Project(pydantic.v1.BaseModel):
     kind: ObjectKind = pydantic.v1.Field(ObjectKind.project, const=True)
     metadata: ProjectMetadata
     spec: ProjectSpec = ProjectSpec()
-    status: ObjectStatus = ObjectStatus()
+    status: ProjectStatus = ProjectStatus()
 
 
 # The reason we have a different schema for the response model is that we don't want to validate project.spec.build in
@@ -136,7 +154,7 @@ class ProjectOut(pydantic.v1.BaseModel):
     kind: ObjectKind = pydantic.v1.Field(ObjectKind.project, const=True)
     metadata: ProjectMetadata
     spec: ProjectSpecOut = ProjectSpecOut()
-    status: ObjectStatus = ObjectStatus()
+    status: ProjectStatus = ProjectStatus()
 
 
 class ProjectOwner(pydantic.v1.BaseModel):
@@ -155,13 +173,21 @@ class ProjectSummary(pydantic.v1.BaseModel):
     distinct_schedules_count: int = 0
     distinct_scheduled_jobs_pending_count: int = 0
     distinct_scheduled_pipelines_pending_count: int = 0
-    pipelines_completed_recent_count: typing.Optional[int] = None
-    pipelines_failed_recent_count: typing.Optional[int] = None
-    pipelines_running_count: typing.Optional[int] = None
-    updated: typing.Optional[datetime.datetime] = None
+    pipelines_completed_recent_count: int = 0
+    pipelines_failed_recent_count: int = 0
+    pipelines_running_count: int = 0
+    updated: datetime.datetime | None = None
     endpoint_alerts_count: int = 0
     job_alerts_count: int = 0
-    other_alerts_count: int = 0
+    application_alerts_count: int = 0
+    infra_alerts_count: int = 0
+    datasets_count: int = 0
+    documents_count: int = 0
+    llm_prompts_count: int = 0
+    running_model_monitoring_functions: int = 0
+    failed_model_monitoring_functions: int = 0
+    real_time_model_endpoint_count: int = 0
+    batch_model_endpoint_count: int = 0
 
 
 class IguazioProject(pydantic.v1.BaseModel):

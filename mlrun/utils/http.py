@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import time
 
@@ -24,6 +23,25 @@ import urllib3.util.retry
 from ..config import config
 from ..errors import err_to_str
 from . import logger
+
+
+class DummyCookieJar(requests.cookies.RequestsCookieJar):
+    """
+    Cookie jar that doesn't store any cookies.
+
+    This prevents identity leakage by ensuring cookies from authentication services
+    are not stored or sent in subsequent requests. Note that this does NOT affect
+    reading incoming cookies from request headers - you can still access request.cookies
+    or request.headers.get('Cookie') to read cookies sent TO your service.
+    """
+
+    def set_cookie(self, cookie, *args, **kwargs):
+        """Override to prevent storing cookies"""
+        pass
+
+    def __setitem__(self, name, value):
+        """Override to prevent storing cookies"""
+        pass
 
 
 class HTTPSessionWithRetry(requests.Session):
@@ -69,6 +87,7 @@ class HTTPSessionWithRetry(requests.Session):
         retry_on_exception=True,
         retry_on_status=True,
         retry_on_post=False,
+        retry_on_put=True,
         verbose=False,
     ):
         """
@@ -78,6 +97,8 @@ class HTTPSessionWithRetry(requests.Session):
         :param retry_on_exception:      Retry on the HTTP_RETRYABLE_EXCEPTIONS. defaults to True.
         :param retry_on_status:         Retry on error status codes. defaults to True.
         :param retry_on_post:           Retry on POST requests. defaults to False.
+        :param retry_on_put:            Whether to allow retries on PUT requests. Actual behavior may exclude specific
+                                        paths from retrying. defaults to True.
         :param verbose:                 Print debug messages.
         """
         super().__init__()
@@ -87,7 +108,10 @@ class HTTPSessionWithRetry(requests.Session):
         self.retry_on_exception = retry_on_exception
         self.verbose = verbose
         self._logger = logger.get_child("http-client")
-        self._retry_methods = self._resolve_retry_methods(retry_on_post)
+        self._retry_methods = self._resolve_retry_methods(retry_on_post, retry_on_put)
+
+        # Disable cookie storage to prevent identity leakage
+        self.cookies = DummyCookieJar()
 
         if retry_on_status:
             self._http_adapter = requests.adapters.HTTPAdapter(
@@ -105,6 +129,53 @@ class HTTPSessionWithRetry(requests.Session):
 
             self.mount("http://", self._http_adapter)
             self.mount("https://", self._http_adapter)
+
+    # Attributes set in __init__ that requests.Session.__attrs__ does not cover and
+    # that must survive copy/pickle. Extends the base allowlist rather than replacing
+    # it. _logger is intentionally absent: it is a named child logger, rebuilt in
+    # __setstate__ instead of serialized.
+    _EXTRA_PICKLE_ATTRS = (
+        "max_retries",
+        "retry_backoff_factor",
+        "retry_on_exception",
+        "verbose",
+        "_retry_methods",
+        "_http_adapter",
+    )
+
+    def __getstate__(self) -> dict:
+        """Return picklable state, extending ``requests.Session``'s allowlist.
+
+        ``requests.Session.__getstate__`` only serializes ``__attrs__`` (headers,
+        cookies, adapters, ...), which drops the retry-related attributes this
+        subclass adds in ``__init__``. A copied or pickled session would then raise
+        ``AttributeError`` the moment :meth:`update_retry_methods` reads
+        ``_retry_methods``. We add :attr:`_EXTRA_PICKLE_ATTRS` on top of the base
+        state, copying each only if present - ``_http_adapter`` is set only when
+        ``retry_on_status`` is enabled, and copying by presence (rather than the
+        base ``getattr(..., None)``) keeps it absent otherwise so the
+        ``hasattr`` guard in :meth:`update_retry_methods` stays correct.
+        ``_http_adapter`` is the same object as the mounted ``adapters`` entries;
+        ``requests.adapters.HTTPAdapter`` rebuilds a fresh connection pool on
+        restore, so the copy gets its own pool instead of sharing sockets.
+
+        :return: The instance state to pickle/copy.
+        """
+        state = super().__getstate__()
+        state.update(
+            (attr, self.__dict__[attr])
+            for attr in self._EXTRA_PICKLE_ATTRS
+            if attr in self.__dict__
+        )
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore instance state and rebuild the non-serialized logger.
+
+        :param state: The state produced by :meth:`__getstate__`.
+        """
+        super().__setstate__(state)
+        self._logger = logger.get_child("http-client")
 
     def request(self, method, url, **kwargs):
         retry_count = 0
@@ -198,12 +269,43 @@ class HTTPSessionWithRetry(requests.Session):
             return False
         return True
 
+    def update_retry_methods(self, retry_on_post: bool, retry_on_put: bool) -> None:
+        """Update the retry method set on the session and its mounted adapter.
+
+        This allows reusing a single session across requests with different
+        retry policies (e.g., POST paths that are retriable vs. non-retriable),
+        avoiding the overhead of creating a new session per request.
+
+        :param retry_on_post: Whether POST requests should be retried.
+        :param retry_on_put:  Whether PUT requests should be retried.
+        """
+        new_methods = self._resolve_retry_methods(retry_on_post, retry_on_put)
+
+        # Skip Retry object re-allocation when the allowed methods haven't changed
+        # consecutive calls with the same policy (common case) don't need a new Retry object
+        if new_methods == self._retry_methods:
+            return
+
+        self._retry_methods = new_methods
+        if hasattr(self, "_http_adapter"):
+            self._http_adapter.max_retries = urllib3.util.retry.Retry(
+                total=self.max_retries,
+                backoff_factor=self.retry_backoff_factor,
+                status_forcelist=config.http_retry_defaults.status_codes,
+                allowed_methods=self._retry_methods,
+                raise_on_status=False,
+            )
+
     def _method_retryable(self, method: str):
         return method in self._retry_methods
 
-    def _resolve_retry_methods(self, retry_on_post: bool = False) -> frozenset[str]:
+    def _resolve_retry_methods(
+        self, retry_on_post: bool = False, retry_on_put: bool = True
+    ) -> frozenset[str]:
         methods = urllib3.util.retry.Retry.DEFAULT_ALLOWED_METHODS
         methods = methods.union({"PATCH"})
+        if not retry_on_put:
+            methods = methods.difference({"PUT"})
         if retry_on_post:
             methods = methods.union({"POST"})
         return frozenset(methods)

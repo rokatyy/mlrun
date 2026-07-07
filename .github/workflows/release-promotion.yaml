@@ -1,0 +1,534 @@
+# Copyright 2023 Iguazio
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Promotion Pipeline ( Release )
+run-name: Releasing ${{ inputs.version }} (${{ github.ref_name }})
+
+permissions:
+
+  # Create release and upload artifact to releases
+  contents: write
+
+  # Allow the action to upload images to ghcr
+  packages: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version to promote (must already exist), without prefix v (e.g. 1.1.0-rc10)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'MLRun commit SHA to tag. Leave empty to derive it from the mlrun image revision label.'
+        required: false
+        default: ''
+        type: string
+      ui_commit_sha:
+        description: 'UI repo commit SHA to tag. Leave empty to derive it from the UI image revision label.'
+        required: false
+        default: ''
+        type: string
+      previous_version:
+        description: 'Previous version for release notes (without v prefix). Leave empty to derive the greatest tag below this version.'
+        required: false
+        default: ''
+        type: string
+      source_artifactory_docker_repo:
+        description: 'Source Artifactory Docker repository name'
+        required: false
+        default: 'mlrun-staging/mlrun'
+        type: string
+      target_docker_registries:
+        description: 'Comma separated list of target docker registries to push promoted images to (e.g., ghcr.io/,quay.io/,registry.hub.docker.com/)'
+        required: false
+        default: 'ghcr.io/,quay.io/,registry.hub.docker.com/'
+        type: string
+      target_docker_repo:
+        description: 'Target Artifactory Docker repository name (for promotion, used when target includes Artifactory)'
+        required: false
+        default: 'mlrun'
+        type: string
+      source_artifactory_pypi_repo:
+        description: 'Source Artifactory PyPI repository name'
+        required: false
+        default: 'mlrun-private-pypi-local'
+        type: string
+      skip_images:
+        description: 'Comma separated list of images to skip promoting, example: mlrun,mlrun-gpu,ui,api,jupyter'
+        required: false
+        default: ''
+      skip_publish_pypi:
+        description: 'Whether to skip promoting the python package to target PyPI repo'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      skip_create_tag_release:
+        description: 'Whether to skip creating tag & release in Github'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+
+  approval-gate:
+    name: Approval gate for production release
+    runs-on: ubuntu-latest
+    environment: prod-release
+    steps:
+      - name: Manual approval checkpoint
+        run: echo "✅ Production release approved, proceeding with promotion..."
+
+  prepare-inputs:
+    name: Prepare inputs
+    runs-on: ubuntu-latest
+    needs: approval-gate
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      previous_version: ${{ steps.resolve.outputs.previous_version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      make_latest: ${{ steps.resolve.outputs.make_latest }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install automation requirements
+        run: make install-automation-requirements
+      - name: Resolve inputs
+        id: resolve
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          PREVIOUS_VERSION: ${{ github.event.inputs.previous_version }}
+        run: |
+          python automation/version/version_file.py promotion-inputs \
+            --version "$VERSION" \
+            --previous-version "$PREVIOUS_VERSION" | tee -a "$GITHUB_OUTPUT"
+
+  derive-shas:
+    name: Derive commit SHAs
+    runs-on: mlrun-release
+    if: github.event.inputs.skip_create_tag_release != 'true'
+    needs: [prepare-inputs]
+    outputs:
+      commit_sha: ${{ steps.mlrun-sha.outputs.commit_sha }}
+      ui_commit_sha: ${{ steps.ui-sha.outputs.ui_commit_sha }}
+    steps:
+      - name: Login to Artifactory with skopeo
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/.skopeo
+          skopeo login "${{ secrets.PRIVATE_ARTIFACTORY_DOCKER_URL }}" \
+            -u "${{ secrets.PRIVATE_ARTIFACTORY_USERNAME }}" \
+            -p "${{ secrets.PRIVATE_ARTIFACTORY_PASSWORD }}" \
+            --authfile "$GITHUB_WORKSPACE/.skopeo/auth.json"
+
+      - name: Resolve MLRun commit SHA
+        id: mlrun-sha
+        env:
+          OVERRIDE: ${{ github.event.inputs.commit_sha }}
+          VERSION: ${{ needs.prepare-inputs.outputs.version }}
+        run: |
+          OVERRIDE="$(echo -n "$OVERRIDE" | xargs)"
+          if [ -n "$OVERRIDE" ]; then
+            echo "commit_sha=$OVERRIDE" >> $GITHUB_OUTPUT
+            echo "Using provided MLRun commit SHA: $OVERRIDE"
+            exit 0
+          fi
+
+          IMAGE="docker://${{ secrets.PRIVATE_ARTIFACTORY_DOCKER_URL }}/${{ github.event.inputs.source_artifactory_docker_repo }}/mlrun:$VERSION"
+          echo "Inspecting $IMAGE"
+          SHA="$(skopeo inspect --authfile "$GITHUB_WORKSPACE/.skopeo/auth.json" "$IMAGE" \
+            --format '{{ index .Labels "org.opencontainers.image.revision" }}')"
+          if [ -z "$SHA" ] || [ "$SHA" = "<no value>" ]; then
+            echo "❌ No org.opencontainers.image.revision label on $IMAGE (image predates the label). Provide the commit_sha input." >&2
+            exit 1
+          fi
+          echo "commit_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Derived MLRun commit SHA: $SHA"
+
+      - name: Resolve UI commit SHA
+        id: ui-sha
+        env:
+          OVERRIDE: ${{ github.event.inputs.ui_commit_sha }}
+          VERSION: ${{ needs.prepare-inputs.outputs.version }}
+        run: |
+          OVERRIDE="$(echo -n "$OVERRIDE" | xargs)"
+          if [ -n "$OVERRIDE" ]; then
+            echo "ui_commit_sha=$OVERRIDE" >> $GITHUB_OUTPUT
+            echo "Using provided UI commit SHA: $OVERRIDE"
+            exit 0
+          fi
+
+          IMAGE="docker://${{ secrets.PRIVATE_ARTIFACTORY_DOCKER_URL }}/${{ github.event.inputs.source_artifactory_docker_repo }}/mlrun-ui:$VERSION"
+          echo "Inspecting $IMAGE"
+          SHA="$(skopeo inspect --authfile "$GITHUB_WORKSPACE/.skopeo/auth.json" "$IMAGE" \
+            --format '{{ index .Labels "org.opencontainers.image.revision" }}')"
+          if [ -z "$SHA" ] || [ "$SHA" = "<no value>" ]; then
+            echo "❌ No org.opencontainers.image.revision label on $IMAGE (UI image predates the label). Provide the ui_commit_sha input." >&2
+            exit 1
+          fi
+          echo "ui_commit_sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Derived UI commit SHA: $SHA"
+
+  create-tag:
+    name: Create tag v${{ needs.prepare-inputs.outputs.version }}
+    runs-on: ubuntu-latest
+    if: github.event.inputs.skip_create_tag_release != 'true'
+    needs: [prepare-inputs, derive-shas]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate MLRun commit SHA
+        run: |
+          if ! git cat-file -t "${{ needs.derive-shas.outputs.commit_sha }}" &>/dev/null; then
+            echo "❌ Error: commit SHA '${{ needs.derive-shas.outputs.commit_sha }}' does not exist in this repository"
+            exit 1
+          fi
+          echo "✅ Commit SHA validated: ${{ needs.derive-shas.outputs.commit_sha }}"
+
+      - name: Create git tag for branch at specific SHA
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout ${{ github.ref_name }}
+          git tag -a "v${{ needs.prepare-inputs.outputs.version }}" "${{ needs.derive-shas.outputs.commit_sha }}" -m "Branch tag ${{ github.ref_name }} at ${{ needs.derive-shas.outputs.commit_sha }}"
+          git push origin "v${{ needs.prepare-inputs.outputs.version }}"
+          echo "✅ Created and pushed tag: v${{ needs.prepare-inputs.outputs.version }} on commit ${{ needs.derive-shas.outputs.commit_sha }}"
+
+      - name: Generate GitHub App Token for ui repo
+        id: ui-app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ui
+
+      - name: Create git tag for UI repo
+        env:
+          GH_TOKEN: ${{ steps.ui-app-token.outputs.token }}
+        run: |
+          VERSION="v${{ needs.prepare-inputs.outputs.version }}"
+          UI_SHA="${{ needs.derive-shas.outputs.ui_commit_sha }}"
+          UI_REPO="${{ github.repository_owner }}/ui"
+
+          echo "Creating tag ${VERSION} on UI repo at SHA ${UI_SHA}"
+
+          # Create annotated tag object
+          TAG_SHA=$(gh api "repos/${UI_REPO}/git/tags" \
+            -X POST \
+            -f tag="${VERSION}" \
+            -f message="Release ${VERSION}" \
+            -f object="${UI_SHA}" \
+            -f type="commit" \
+            --jq '.sha')
+
+          # Create tag reference
+          gh api "repos/${UI_REPO}/git/refs" \
+            -X POST \
+            -f ref="refs/tags/${VERSION}" \
+            -f sha="${TAG_SHA}"
+
+          echo "✅ Created and pushed tag: ${VERSION} on UI repo at commit ${UI_SHA}"
+
+  matrix-prep:
+    name: Prepare image matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: set-matrix
+        uses: ./.github/actions/image-matrix-prep
+        with:
+          skip_images: ${{ github.event.inputs.skip_images }}
+
+  promote-docker-images:
+    name: Promote Docker images from source to target
+    runs-on: mlrun-release
+    needs: [prepare-inputs, matrix-prep]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix-prep.outputs.matrix) }}
+    steps:
+
+      - name: Login to registries with skopeo
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/.skopeo
+          AUTHFILE="$GITHUB_WORKSPACE/.skopeo/auth.json"
+          
+          # Login to source registry (Artifactory)
+          skopeo login "${{ secrets.PRIVATE_ARTIFACTORY_DOCKER_URL }}" \
+            -u "${{ secrets.PRIVATE_ARTIFACTORY_USERNAME }}" \
+            -p "${{ secrets.PRIVATE_ARTIFACTORY_PASSWORD }}" \
+            --authfile "$AUTHFILE"
+          
+          # Login to target registries
+          skopeo login ghcr.io \
+            -u "${{ github.repository_owner }}" \
+            -p "${{ secrets.GITHUB_TOKEN }}" \
+            --authfile "$AUTHFILE"
+          
+          skopeo login quay.io \
+            -u "${{ secrets.QUAY_IO_DOCKER_REGISTRY_USERNAME }}" \
+            -p "${{ secrets.QUAY_IO_DOCKER_REGISTRY_PASSWORD }}" \
+            --authfile "$AUTHFILE"
+          
+          skopeo login docker.io \
+            -u "${{ secrets.DOCKER_HUB_DOCKER_REGISTRY_USERNAME }}" \
+            -p "${{ secrets.DOCKER_HUB_DOCKER_REGISTRY_PASSWORD }}" \
+            --authfile "$AUTHFILE"
+          
+          # Also login to registry.hub.docker.com (alias used in target registries)
+          skopeo login registry.hub.docker.com \
+            -u "${{ secrets.DOCKER_HUB_DOCKER_REGISTRY_USERNAME }}" \
+            -p "${{ secrets.DOCKER_HUB_DOCKER_REGISTRY_PASSWORD }}" \
+            --authfile "$AUTHFILE"
+
+      - name: Copy Docker image with skopeo (preserves digest)
+        if: ${{ matrix.image-name != 'test' }}
+        run: |
+          AUTHFILE="$GITHUB_WORKSPACE/.skopeo/auth.json"
+          
+          image_name="${{ matrix.image-name }}"
+          if [ "${{ matrix.image-name }}" = "api" ]; then
+            image_name="mlrun-api"
+          fi
+          
+          # Compute Python version suffix (e.g., -py39) when include-suffix is true
+          python_version_suffix=""
+          if [[ "${{ matrix.include-suffix }}" == "true" ]]; then
+            python_version_suffix="-py$(echo '${{ matrix.python-version }}' | tr -d '.')"
+          fi
+          
+          SOURCE_IMAGE="docker://${{ secrets.PRIVATE_ARTIFACTORY_DOCKER_URL }}/${{ github.event.inputs.source_artifactory_docker_repo }}/${image_name}:${{ needs.prepare-inputs.outputs.version }}${python_version_suffix}"
+          
+          echo "Source image: $SOURCE_IMAGE"
+          
+          # Loop through target registries and copy to each
+          IFS=',' read -ra REGISTRIES <<< "${{ github.event.inputs.target_docker_registries }}"
+          for registry in "${REGISTRIES[@]}"; do
+            registry=$(echo "$registry" | xargs)  # trim whitespace
+            
+            TARGET_IMAGE="docker://${registry}${{ github.event.inputs.target_docker_repo }}/${image_name}:${{ needs.prepare-inputs.outputs.version }}${python_version_suffix}"
+
+            echo "Copying image to: $TARGET_IMAGE"
+            skopeo copy --all --authfile "$AUTHFILE" "$SOURCE_IMAGE" "$TARGET_IMAGE"
+            
+            echo "✅ Successfully promoted ${{ matrix.image-name }}${python_version_suffix} to $registry (digest preserved)"
+          done
+
+  promote-ui-image:
+    name: Promote UI Docker image from source to target
+    runs-on: mlrun-release
+    if: "!contains(github.event.inputs.skip_images, 'ui')"
+    needs: [prepare-inputs]
+    steps:
+
+      - name: Generate GitHub App Token for ui repo
+        id: ui-app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ui
+      - uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # 1.6.5
+        with:
+          owner: ${{ github.repository_owner }}
+          repo: ui
+          github_token: ${{ steps.ui-app-token.outputs.token }}
+          workflow_file_name: ui-promotion.yaml
+          ref: development
+          wait_interval: 60
+          client_payload: "{\"version\": \"${{ needs.prepare-inputs.outputs.version }}\"}"
+
+
+  promote-pypi-package:
+    name: Promote PyPI package from source to target Artifactory
+    runs-on: mlrun-release
+    needs: [ prepare-inputs, promote-docker-images, promote-ui-image ]
+    steps:
+      - name: Setup Python 3.11 venv
+        run: |
+          rm -rf $GITHUB_WORKSPACE/.venv-promotion
+          python3.11 -m venv $GITHUB_WORKSPACE/.venv-promotion
+          echo "$GITHUB_WORKSPACE/.venv-promotion/bin" >> $GITHUB_PATH
+
+      - name: Download package from source PyPI repo
+        if: github.event.inputs.skip_publish_pypi != 'true'
+        run: |
+          mkdir -p dist
+          pip download \
+            --no-deps \
+            --index-url https://${{ secrets.PRIVATE_ARTIFACTORY_USERNAME }}:${{ secrets.PRIVATE_ARTIFACTORY_PASSWORD }}@${{ secrets.PRIVATE_ARTIFACTORY_URL }}/artifactory/api/pypi/${{ github.event.inputs.source_artifactory_pypi_repo }}/simple \
+            --dest dist \
+            mlrun==${{ needs.prepare-inputs.outputs.version }}
+          
+          echo "Downloaded packages:"
+          ls -lh dist/
+
+      - name: Set up uv
+        if: github.event.inputs.skip_publish_pypi != 'true'
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # 8.3.1
+
+      - name: Upload package to target PyPI repo
+        if: github.event.inputs.skip_publish_pypi != 'true'
+        env:
+          UV_PUBLISH_USERNAME: ${{ secrets.PYPI_USERNAME }}
+          UV_PUBLISH_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+        run: |
+          uv publish dist/*
+          echo "✅ Successfully promoted PyPI package"
+
+  create-releases:
+    name: Create release & tag v${{ needs.prepare-inputs.outputs.version }}
+    runs-on: ubuntu-latest
+    needs: [ prepare-inputs, promote-pypi-package, create-tag ]
+    steps:
+      - name: Create GitHub release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # 1.21.0
+        if: github.event.inputs.skip_create_tag_release != 'true'
+        with:
+          tag: v${{ needs.prepare-inputs.outputs.version }}
+          allowUpdates: true
+          makeLatest: ${{ needs.prepare-inputs.outputs.make_latest }}
+          prerelease: ${{ needs.prepare-inputs.outputs.prerelease }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate GitHub App Token for ui repo
+        if: github.event.inputs.skip_create_tag_release != 'true'
+        id: ui-release-app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ui
+      - name: Create UI repo release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # 1.21.0
+        if: github.event.inputs.skip_create_tag_release != 'true'
+        with:
+          repo: ui
+          tag: v${{ needs.prepare-inputs.outputs.version }}
+          allowUpdates: true
+          token: ${{ steps.ui-release-app-token.outputs.token }}
+          # experienced 500 errors when trying to create release notes for ui repo with `prerelease flag`
+          # prerelease: ${{ needs.prepare-inputs.outputs.prerelease }}
+
+  update-tutorials:
+    name: Bundle tutorials
+    needs: [ prepare-inputs, create-releases ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create tutorials tar
+        run: |
+          wget -c https://raw.githubusercontent.com/v3io/tutorials/refs/heads/development/welcome.ipynb -P docs
+          wget -c https://raw.githubusercontent.com/v3io/tutorials/refs/heads/development/README.md -P docs
+          tar -cvf mlrun-tutorials.tar docs/tutorials docs/README.md docs/welcome.ipynb
+          rm -rf docs/welcome.ipynb docs/README.md
+      - name: Add tutorials tar to release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # 1.21.0
+        with:
+          allowUpdates: true
+          tag: v${{ needs.prepare-inputs.outputs.version }}
+          makeLatest: ${{ needs.prepare-inputs.outputs.make_latest }}
+          prerelease: ${{ needs.prepare-inputs.outputs.prerelease }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: mlrun-tutorials.tar
+
+  update-demos:
+    name: Bundle demos
+    needs: [ prepare-inputs, create-releases ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Python venv
+        run: |
+          venv="$HOME/.local/share/venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> $GITHUB_PATH
+      - name: Install prerequisites
+        run: |
+          pip install requests packaging tqdm
+      - name: Download demos using get_demos script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python automation/scripts/get_demos.py ${{ needs.prepare-inputs.outputs.version }} \
+          --dest demos
+      - name: Copy update script to demos folder
+        run: |
+          cp automation/scripts/update_demos.sh demos/update_demos.sh
+      - name: Create mlrun-demos tar
+        run: |
+          tar -cf mlrun-demos.tar demos
+          echo "✅ Archive created successfully!"
+      - name: Add mlrun-demos tar to release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # 1.21.0
+        with:
+          allowUpdates: true
+          tag: v${{ needs.prepare-inputs.outputs.version }}
+          makeLatest: ${{ needs.prepare-inputs.outputs.make_latest }}
+          prerelease: ${{ needs.prepare-inputs.outputs.prerelease }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: mlrun-demos.tar
+
+  update-release-notes:
+    name: Update release notes
+    runs-on: ubuntu-latest
+    if: github.event.inputs.skip_create_tag_release != 'true'
+    # runs lastly to avoid conflicts with other release-related jobs
+    needs: [ prepare-inputs, update-tutorials, update-demos ]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          make install-automation-requirements
+      - name: Generate release notes
+        id: release-notes
+        run: |
+          make release-notes
+        env:
+          MLRUN_SKIP_CLONE: true
+          MLRUN_RELEASE_BRANCH: ${{ github.ref_name }}
+          MLRUN_RELEASE_NOTES_OUTPUT_FILE: release_notes.md
+          MLRUN_RAISE_ON_ERROR: false
+          MLRUN_VERSION: "v${{ needs.prepare-inputs.outputs.version }}"
+          MLRUN_OLD_VERSION: "v${{ needs.prepare-inputs.outputs.previous_version }}"
+
+      - name: resolve release notes
+        id: resolve-release-notes
+        run: |
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          cat release_notes.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # 1.21.0
+        with:
+          tag: v${{ needs.prepare-inputs.outputs.version }}
+          body: ${{ steps.resolve-release-notes.outputs.body }}
+          makeLatest: ${{ needs.prepare-inputs.outputs.make_latest }}
+          prerelease: ${{ needs.prepare-inputs.outputs.prerelease }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true

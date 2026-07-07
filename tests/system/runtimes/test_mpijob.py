@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import pytest
 
@@ -39,12 +38,13 @@ class TestMpiJobRuntime(tests.system.base.TestMLRunSystem):
             handler="handler",
             project=self.project_name,
             filename=code_path,
-            image="mlrun/mlrun",
+            image=mlrun.mlconf.function_defaults.image_by_kind.job,
         )
         mpijob_function.spec.replicas = replicas
 
         mpijob_run = mpijob_function.run(returns=["reduced_result", "rank_0_result"])
         assert mpijob_run.status.state == RunStates.completed
+        assert mpijob_run.status.host is not None
 
         reduced_result = mpijob_run.status.results["reduced_result"]
         rank_0_result = mpijob_run.status.results["rank_0_result"]

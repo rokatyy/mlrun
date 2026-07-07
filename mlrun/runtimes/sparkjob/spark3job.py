@@ -167,8 +167,13 @@ class Spark3JobSpec(KubeResourceSpec):
         driver_cores=None,
         executor_cores=None,
         security_context=None,
-        clone_target_dir=None,
         state_thresholds=None,
+        serving_spec=None,
+        graph=None,
+        parameters=None,
+        track_models=None,
+        env_from=None,
+        mount_otlp_secret: bool = False,
     ):
         super().__init__(
             command=command,
@@ -178,6 +183,7 @@ class Spark3JobSpec(KubeResourceSpec):
             volumes=volumes,
             volume_mounts=volume_mounts,
             env=env,
+            env_from=env_from,
             resources=resources,
             replicas=replicas,
             image_pull_policy=image_pull_policy,
@@ -197,8 +203,12 @@ class Spark3JobSpec(KubeResourceSpec):
             tolerations=tolerations,
             preemption_mode=preemption_mode,
             security_context=security_context,
-            clone_target_dir=clone_target_dir,
             state_thresholds=state_thresholds,
+            serving_spec=serving_spec,
+            graph=graph,
+            parameters=parameters,
+            track_models=track_models,
+            mount_otlp_secret=mount_otlp_secret,
         )
 
         self.driver_resources = driver_resources or {}
@@ -288,12 +298,6 @@ class Spark3JobSpec(KubeResourceSpec):
         self._driver_preemption_mode = (
             mode or mlrun.mlconf.function_defaults.preemption_mode
         )
-        self.enrich_function_preemption_spec(
-            preemption_mode_field_name="driver_preemption_mode",
-            tolerations_field_name="driver_tolerations",
-            affinity_field_name="driver_affinity",
-            node_selector_field_name="driver_node_selector",
-        )
 
     @property
     def executor_preemption_mode(self) -> str:
@@ -303,12 +307,6 @@ class Spark3JobSpec(KubeResourceSpec):
     def executor_preemption_mode(self, mode):
         self._executor_preemption_mode = (
             mode or mlrun.mlconf.function_defaults.preemption_mode
-        )
-        self.enrich_function_preemption_spec(
-            preemption_mode_field_name="executor_preemption_mode",
-            tolerations_field_name="executor_tolerations",
-            affinity_field_name="executor_affinity",
-            node_selector_field_name="executor_node_selector",
         )
 
     @property
@@ -337,9 +335,7 @@ class Spark3JobSpec(KubeResourceSpec):
                     volume_mount, volume_mounts_field_name="_executor_volume_mounts"
                 )
 
-    def _verify_jvm_memory_string(
-        self, resources_field_name: str, memory: typing.Optional[str]
-    ):
+    def _verify_jvm_memory_string(self, resources_field_name: str, memory: str | None):
         if memory:
             verify_field_regex(
                 f"function.spec.{resources_field_name}.requests.memory",
@@ -405,8 +401,8 @@ class Spark3JobSpec(KubeResourceSpec):
     def _verify_and_set_requests(
         self,
         resources_field_name,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
         patch: bool = False,
     ):
         # Spark operator uses JVM notation for memory, so we must verify it separately
@@ -484,10 +480,10 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_node_selection(
         self,
-        node_name: typing.Optional[str] = None,
-        node_selector: typing.Optional[dict[str, str]] = None,
-        affinity: typing.Optional[kubernetes.client.V1Affinity] = None,
-        tolerations: typing.Optional[list[kubernetes.client.V1Toleration]] = None,
+        node_name: str | None = None,
+        node_selector: dict[str, str] | None = None,
+        affinity: kubernetes.client.V1Affinity | None = None,
+        tolerations: list[kubernetes.client.V1Toleration] | None = None,
     ):
         if node_name:
             raise NotImplementedError(
@@ -514,10 +510,10 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_driver_node_selection(
         self,
-        node_name: typing.Optional[str] = None,
-        node_selector: typing.Optional[dict[str, str]] = None,
-        affinity: typing.Optional[kubernetes.client.V1Affinity] = None,
-        tolerations: typing.Optional[list[kubernetes.client.V1Toleration]] = None,
+        node_name: str | None = None,
+        node_selector: dict[str, str] | None = None,
+        affinity: kubernetes.client.V1Affinity | None = None,
+        tolerations: list[kubernetes.client.V1Toleration] | None = None,
     ):
         """
         Enables control of which k8s node the spark executor will run on.
@@ -546,10 +542,10 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_executor_node_selection(
         self,
-        node_name: typing.Optional[str] = None,
-        node_selector: typing.Optional[dict[str, str]] = None,
-        affinity: typing.Optional[kubernetes.client.V1Affinity] = None,
-        tolerations: typing.Optional[list[kubernetes.client.V1Toleration]] = None,
+        node_name: str | None = None,
+        node_selector: dict[str, str] | None = None,
+        affinity: kubernetes.client.V1Affinity | None = None,
+        tolerations: list[kubernetes.client.V1Toleration] | None = None,
     ):
         """
         Enables control of which k8s node the spark executor will run on.
@@ -776,8 +772,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_cores(
         self,
-        executor_cores: typing.Optional[int] = None,
-        driver_cores: typing.Optional[int] = None,
+        executor_cores: int | None = None,
+        driver_cores: int | None = None,
     ):
         """
         Allows to configure spark.executor.cores and spark.driver.cores parameters. The values must be integers
@@ -816,6 +812,12 @@ class Spark3Runtime(KubejobRuntime):
 
     @classmethod
     def deploy_default_image(cls, with_gpu=False):
+        if not mlrun.get_current_project(silent=True):
+            raise mlrun.errors.MLRunMissingProjectError(
+                "An active project is required to run deploy_default_image(). "
+                "This can be set by calling get_or_create_project()."
+            )
+
         sj = mlrun.new_function(kind=cls.kind, name="spark-default-image-deploy-temp")
         sj.spec.build.image = cls._get_default_deployed_mlrun_image_name(with_gpu)
 
@@ -857,7 +859,7 @@ class Spark3Runtime(KubejobRuntime):
         skip_deployed=False,
         is_kfp=False,
         mlrun_version_specifier=None,
-        builder_env: typing.Optional[dict] = None,
+        builder_env: dict | None = None,
         show_on_failure: bool = False,
         force_build: bool = False,
     ):
@@ -949,8 +951,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_executor_requests(
         self,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
         patch: bool = False,
     ):
         """
@@ -961,8 +963,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_executor_limits(
         self,
-        cpu: typing.Optional[str] = None,
-        gpus: typing.Optional[int] = None,
+        cpu: str | None = None,
+        gpus: int | None = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -978,8 +980,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_driver_requests(
         self,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
         patch: bool = False,
     ):
         """
@@ -990,8 +992,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_driver_limits(
         self,
-        cpu: typing.Optional[str] = None,
-        gpus: typing.Optional[int] = None,
+        cpu: str | None = None,
+        gpus: int | None = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):

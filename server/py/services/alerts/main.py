@@ -13,7 +13,7 @@
 # limitations under the License.
 import datetime
 import http
-from typing import Optional, Union
+from typing import Union
 
 import fastapi
 import semver
@@ -43,7 +43,6 @@ import framework.utils.time_window_tracker
 import services.alerts.crud
 import services.alerts.initial_data
 import services.api.crud
-from framework.db.session import close_session, create_session
 from framework.routers import (
     alert_activations,
     alert_template,
@@ -146,9 +145,11 @@ class Service(framework.service.Service):
         self,
         request: fastapi.Request,
         project: str,
+        page_size: int | None,
+        offset: int | None,
         auth_info: mlrun.common.schemas.AuthInfo,
         db_session: sqlalchemy.orm.Session = None,
-    ) -> list[mlrun.common.schemas.AlertConfig]:
+    ) -> dict[str, list[mlrun.common.schemas.AlertConfig]]:
         if project != "*":
             # TODO: When alerts is a different service and not in Hydra mode, we need to send the request to the API and
             #  not access it directly (ML-8565)
@@ -165,11 +166,18 @@ class Service(framework.service.Service):
         )
 
         exclude_updated = self._should_exclude_updated(request)
+
+        # TODO: Remove this when implementing pagination for alert configs
+        #  page_size is used for the limit in the query, but we don't have pagination yet
+        limit = page_size or mlconf.alerts.default_list_alert_configs_limit
+
         alerts = await run_in_threadpool(
             services.alerts.crud.Alerts().list_alerts,
             db_session,
             project=allowed_project_names,
             exclude_updated=exclude_updated,
+            offset=offset,
+            limit=limit,
         )
 
         alerts = await framework.utils.auth.verifier.AuthVerifier().filter_project_resources_by_permissions(
@@ -182,7 +190,9 @@ class Service(framework.service.Service):
             auth_info,
         )
 
-        return alerts
+        return {
+            "alerts": alerts,
+        }
 
     async def delete_alert(
         self,
@@ -219,6 +229,40 @@ class Service(framework.service.Service):
 
         await run_in_threadpool(
             services.alerts.crud.Alerts().delete_alert, db_session, project, name
+        )
+
+    async def delete_alerts(
+        self,
+        request: fastapi.Request,
+        project: str,
+        auth_info: mlrun.common.schemas.AuthInfo,
+        db_session: sqlalchemy.orm.Session = None,
+    ):
+        # TODO: When alerts is a different service and not in Hydra mode, we need to send the request to the API and
+        #  not access it directly (ML-8565)
+        await run_in_threadpool(
+            framework.utils.singletons.project_member.get_project_member().ensure_project,
+            db_session,
+            project,
+            auth_info=auth_info,
+        )
+
+        await framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
+            mlrun.common.schemas.AuthorizationResourceTypes.alert,
+            project,
+            "*",
+            mlrun.common.schemas.AuthorizationAction.delete,
+            auth_info,
+        )
+
+        if not self._is_chief_or_standalone():
+            chief_client = framework.utils.clients.chief.Client()
+            return await chief_client.delete_alerts(project=project, request=request)
+
+        self._logger.debug("Deleting all alerts in project", project=project)
+
+        await run_in_threadpool(
+            services.alerts.crud.Alerts().delete_alerts, db_session, project
         )
 
     async def reset_alert(
@@ -403,13 +447,13 @@ class Service(framework.service.Service):
         self,
         request: fastapi.Request,
         project: str,
-        name: Optional[str],
-        since: Optional[str],
-        until: Optional[str],
-        entity: Optional[str],
-        severity: Optional[list[Union[mlrun.common.schemas.alert.AlertSeverity, str]]],
-        entity_kind: Optional[Union[mlrun.common.schemas.alert.EventEntityKind, str]],
-        event_kind: Optional[Union[mlrun.common.schemas.alert.EventKind, str]],
+        name: str | None,
+        since: str | None,
+        until: str | None,
+        entity: str | None,
+        severity: list[Union[mlrun.common.schemas.alert.AlertSeverity, str]] | None,
+        entity_kind: Union[mlrun.common.schemas.alert.EventEntityKind, str] | None,
+        event_kind: Union[mlrun.common.schemas.alert.EventKind, str] | None,
         page: int,
         page_size: int,
         page_token: str,
@@ -463,7 +507,7 @@ class Service(framework.service.Service):
         self,
         request: fastapi.Request,
         project: str,
-        name: Optional[str],
+        name: str | None,
         activation_id: int,
         auth_info: mlrun.common.schemas.AuthInfo,
         db_session: sqlalchemy.orm.Session = None,
@@ -502,7 +546,10 @@ class Service(framework.service.Service):
             get_project_member().start()
 
         if self._is_chief_or_standalone():
-            services.alerts.initial_data.update_default_configuration_data(self._logger)
+            await fastapi.concurrency.run_in_threadpool(
+                services.alerts.initial_data.update_default_configuration_data,
+                self._logger,
+            )
             await self._start_periodic_functions()
 
     @staticmethod
@@ -552,11 +599,25 @@ class Service(framework.service.Service):
             alerts_v1_router, prefix=self.base_versioned_service_prefix
         )
 
-    async def _custom_setup_service(self):
-        pass
-
     async def _start_periodic_functions(self):
         self._start_periodic_events_generation()
+        self._start_periodic_cooldown_reset()
+
+    def _start_periodic_cooldown_reset(self):
+        interval = int(mlconf.alerts.cooldown_reset_interval)
+        if interval > 0:
+            self._logger.info("Starting periodic cooldown reset", interval=interval)
+            framework.utils.periodic.run_function_periodically(
+                interval,
+                self._reset_cooled_down_alerts.__name__,
+                False,
+                self._reset_cooled_down_alerts,
+            )
+
+    def _reset_cooled_down_alerts(self):
+        framework.db.session.run_function_with_new_db_session(
+            services.alerts.crud.Alerts().reset_cooled_down_alerts
+        )
 
     def _start_periodic_events_generation(self):
         interval = int(mlconf.alerts.events_generation_interval)
@@ -569,17 +630,14 @@ class Service(framework.service.Service):
                 self._generate_events,
             )
 
-    async def _generate_events(self):
-        db_session = await fastapi.concurrency.run_in_threadpool(create_session)
+    def _generate_events(self):
         try:
-            await framework.utils.time_window_tracker.run_with_time_window_tracker(
-                db_session=db_session,
+            framework.utils.time_window_tracker.run_with_time_window_tracker_sync(
                 key=framework.utils.time_window_tracker.TimeWindowTrackerKeys.events_generation,
                 max_window_size_seconds=int(
                     # TODO: This needs to be aligned with chief
                     mlconf.runtime_resources_deletion_grace_period
                 ),
-                ensure_window_update=False,
                 callback=self._generate_event_on_failed_runs,
             )
         except Exception as exc:
@@ -587,8 +645,6 @@ class Service(framework.service.Service):
                 "Failed generating events. Ignoring",
                 exc=mlrun.errors.err_to_str(exc),
             )
-        finally:
-            await fastapi.concurrency.run_in_threadpool(close_session, db_session)
 
     @staticmethod
     def _get_authorization_resource_for_alert_template():

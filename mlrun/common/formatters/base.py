@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import typing
 
@@ -28,7 +27,7 @@ class ObjectFormat:
     full = "full"
 
     @staticmethod
-    def format_method(format_: str) -> typing.Optional[typing.Callable]:
+    def format_method(format_: str) -> typing.Callable | None:
         """
         Get the formatting method for the provided format.
         A `None` value signifies a pass-through formatting method (no formatting).
@@ -44,7 +43,7 @@ class ObjectFormat:
         cls,
         obj: typing.Any,
         format_: str,
-        exclude_formats: typing.Optional[list[str]] = None,
+        exclude_formats: list[str] | None = None,
     ) -> typing.Any:
         """
         Format the provided object based on the provided format.

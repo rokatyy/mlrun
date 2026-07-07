@@ -11,16 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+import math
 import pathlib
 import sys
+import tempfile
 
+import pandas as pd
 import pytest
 
 import mlrun.launcher.local
+from mlrun import MLRunInvalidArgumentError
 
 assets_path = pathlib.Path(__file__).parent / "assets"
 func_path = assets_path / "sample_function.py"
+custom_classes_path = assets_path / "custom_classes.py"
+input_csv_path = assets_path / "input.csv"
 handler = "hello_world"
 
 
@@ -55,6 +60,7 @@ def test_launch_remote_job_locally():
 
 
 def test_create_local_function_for_execution():
+    project_name = "test-project"
     launcher = mlrun.launcher.local.ClientLocalLauncher(local=False)
     runtime = mlrun.code_to_function(
         name="test", kind="job", filename=str(func_path), handler=handler
@@ -63,8 +69,9 @@ def test_create_local_function_for_execution():
     runtime = launcher._create_local_function_for_execution(
         runtime=runtime,
         run=run,
+        project=project_name,
     )
-    assert runtime.metadata.project == "default"
+    assert runtime.metadata.project == project_name
     assert runtime.metadata.name == "test"
     assert run.spec.handler == handler
     assert runtime.kind == "local"
@@ -97,6 +104,45 @@ def test_create_local_function_for_execution_with_enrichment():
     assert runtime.spec.allow_empty_resources
 
 
+@pytest.mark.parametrize(
+    "module_qualified_handler",
+    [
+        # dotted form — already works
+        "module.submodule.fn",
+        # canonical mlrun module:func form — the new case
+        "handler:my_func",
+    ],
+)
+def test_create_local_function_for_execution_picks_local_for_module_qualified_handler(
+    module_qualified_handler,
+):
+    """Both dotted (`pkg.mod.fn`) and canonical (`mod:fn`) handler forms must
+    cause _create_local_function_for_execution to pick LocalRuntime — only
+    LocalRuntime has a _pre_run override that runs extract_source and puts
+    the workdir on sys.path. HandlerRuntime would silently starve.
+
+    The bug surfaces when the runtime has no embedded source code and no
+    inline command (source is fetched at runtime via git://, archive, or
+    store:// CodeArtifact) — in that case ``mlrun.new_function`` falls back
+    to ``HandlerRuntime`` unless the launcher passes ``kind="local"``.
+    """
+    launcher = mlrun.launcher.local.ClientLocalLauncher(local=False)
+    # simulate a job runtime whose source is loaded at runtime
+    # (git/archive/store) — no embedded source, no inline command. This is
+    # what makes the kind selector matter; otherwise the command path makes
+    # ``mlrun.new_function`` produce a LocalRuntime regardless.
+    runtime = mlrun.new_function(name="test", kind="job")
+    runtime.spec.build.source = "git://github.com/example/repo.git"
+    run = mlrun.run.RunObject()
+    fn = launcher._create_local_function_for_execution(
+        runtime=runtime,
+        run=run,
+        project="some-project",
+        handler=module_qualified_handler,
+    )
+    assert fn.kind == "local"
+
+
 def test_validate_inputs():
     launcher = mlrun.launcher.local.ClientLocalLauncher(local=False)
     runtime = mlrun.code_to_function(
@@ -104,11 +150,13 @@ def test_validate_inputs():
     )
     run = mlrun.run.RunObject(spec=mlrun.model.RunSpec(inputs={"input1": 1}))
     with pytest.raises(mlrun.errors.MLRunInvalidArgumentTypeError) as exc:
-        launcher._validate_runtime(runtime, run)
-    assert "'Inputs' should be of type Dict[str, str]" in str(exc.value)
+        launcher._validate_run(runtime, run)
+    assert "'Inputs' should be of type Dict[str, Union[str,list,dict]]." in str(
+        exc.value
+    )
 
 
-def test_validate_runtime_success():
+def test_validate_run_success():
     launcher = mlrun.launcher.local.ClientLocalLauncher(local=False)
     runtime = mlrun.code_to_function(
         name="test", kind="local", filename=str(func_path), handler=handler
@@ -116,7 +164,7 @@ def test_validate_runtime_success():
     run = mlrun.run.RunObject(
         spec=mlrun.model.RunSpec(inputs={"input1": ""}, output_path="./some_path")
     )
-    launcher._validate_runtime(runtime, run)
+    launcher._validate_run(runtime, run)
 
 
 def test_launch_local_reload_module(tmp_path):
@@ -185,3 +233,183 @@ def func_b():
     # rerunning temp_b with temp_a dependence and verifying with the updated temp_a code
     run = project.run_function("func", local=True, reset_on_run=True)
     assert run.output("return") == "dummy value updated"
+
+
+@pytest.mark.parametrize(
+    ["batching", "batch_size"], [(False, None), (True, None), (True, 10), (True, 77)]
+)
+@pytest.mark.parametrize("code_to_function", (False, True))
+def test_run_local_serving_job(batching, batch_size, code_to_function, tmp_path):
+    project = mlrun.new_project("some-project")
+
+    if code_to_function:
+        function = mlrun.code_to_function(
+            name="test", kind="serving", filename=str(custom_classes_path)
+        )
+    else:
+        function = project.set_function(
+            func=str(custom_classes_path),
+            name="test",
+            kind="serving",
+        )
+    graph = function.set_topology("flow", engine="async")
+    graph.to(name="increaser", class_name="SepalLengthIncreaser").respond()
+    job = function.to_job(func_name="test")
+
+    inputs = {"data": str(input_csv_path)}
+    params = {"batching": batching, "batch_size": batch_size}
+
+    run_obj = project.run_function(
+        job, inputs=inputs, params=params, output_path=str(tmp_path), local=True
+    )
+    file_path = (
+        tmp_path / f"{run_obj.metadata.uid}/test-execute-graph/0/prediction.parquet"
+    )
+    responses = pd.read_parquet(file_path)
+
+    num_input_rows = 150  # number of rows in input file
+    if batching:
+        num_expected_responses = (
+            math.ceil(num_input_rows / batch_size) if batch_size else 1
+        )
+    else:
+        num_expected_responses = 150
+    assert len(responses) == num_expected_responses
+
+    first_response = responses.iloc[0].to_dict()
+    if batching:
+        first_response = first_response["0"]
+    assert first_response == {  # based on the first row in input file
+        "sepal_length": 6.1,
+        "sepal_width": 3.5,
+        "petal_length": 1.4,
+        "petal_width": 0.2,
+        "species": "setosa",
+    }
+
+
+def test_run_local_serving_job_with_target():
+    project = mlrun.new_project("some-project")
+    function = mlrun.code_to_function(
+        name="test", kind="serving", filename=str(custom_classes_path)
+    )
+    graph = function.set_topology("flow", engine="async")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        graph.to(name="increaser", class_name="SepalLengthIncreaser")
+        graph.to(name="parquet", class_name="storey.ParquetTarget", path=tmp_dir)
+
+        job = function.to_job(func_name="test")
+
+        inputs = {"data": str(input_csv_path)}
+
+        project.run_function(job, inputs=inputs, local=True)
+
+        assert pathlib.Path(tmp_dir).exists()
+
+
+def test_to_job_on_function_with_children():
+    function = mlrun.code_to_function(
+        name="test", kind="serving", filename=str(custom_classes_path)
+    )
+    graph = function.set_topology("flow", engine="async")
+
+    child = function.add_child_function(
+        "my-child-function", __file__, image="some-image"
+    )
+
+    graph.to(name="increaser", class_name="SepalLengthIncreaser")
+    graph.to(name="queue", class_name=">>", path="some/path")
+    graph.to(
+        name="parquet", class_name="storey.ParquetTarget", path="some/path", func=child
+    )
+
+    with pytest.raises(
+        MLRunInvalidArgumentError,
+        match="Cannot convert function 'test' to a job because it has child functions",
+    ):
+        function.to_job()
+
+
+def test_validate_run_retries_warning(logs_stream):
+    launcher = mlrun.launcher.local.ClientLocalLauncher(local=True)
+    runtime = mlrun.code_to_function(
+        name="test", kind="local", filename=str(func_path), handler=handler
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(retry={"count": 5}, output_path="/tmp")
+    )
+
+    launcher._validate_run(runtime, run)
+
+    assert (
+        "Retry is not supported for local runs, ignoring retry settings"
+        in logs_stream.getvalue()
+    )
+    assert run.spec.retry.count == 0
+
+
+def test_validate_run_retries_invalid_runtime():
+    launcher = mlrun.launcher.local.ClientLocalLauncher(local=False)
+    runtime = mlrun.code_to_function(
+        name="test", kind="dask", filename=str(func_path), handler=handler
+    )
+    run = mlrun.run.RunObject(
+        spec=mlrun.model.RunSpec(retry={"count": 3}, output_path="/tmp")
+    )
+
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentError) as excinfo:
+        launcher._validate_run(runtime, run)
+
+    assert "Retry is not supported for dask runtime" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "handler_value,expected_suffix",
+    [
+        ("handler:my_func", "my-func"),
+        ("MyClass::run_method", "run-method"),
+        ("pkg.mod.entrypoint", "entrypoint"),
+        ("hello_world", "hello-world"),
+    ],
+)
+def test_enrich_run_name_strips_handler_module_prefix(handler_value, expected_suffix):
+    """The auto-generated run.metadata.name must strip the module prefix from
+    every handler form mlrun accepts. Critically, the result must be a valid
+    DNS-1123 name - no `:` allowed - or the run will be rejected by K8s.
+    Order matters: the `::` separator (class-method) must split BEFORE `:`
+    so MyClass::run_method becomes 'run_method', not 'method'."""
+    launcher = mlrun.launcher.local.ClientLocalLauncher(local=False)
+    # Build the runtime with NO default handler so the parametrized
+    # `handler_value` is the only handler input — keeps the data flow
+    # unambiguous when reading the test cold.
+    runtime = mlrun.code_to_function(name="my-fn", kind="job", filename=str(func_path))
+    run = mlrun.run.RunObject()
+    launcher._enrich_run(
+        runtime=runtime,
+        run=run,
+        handler=handler_value,
+        project_name="some-project",
+        name=None,
+    )
+    assert ":" not in run.metadata.name
+    assert run.metadata.name == f"my-fn-{expected_suffix}"
+
+
+def test_validate_run_invokes_runtime_validate(monkeypatch):
+    # _validate_run must call runtime.validate() first, so unsupported runtimes (e.g. Dask on IG4)
+    # fail fast on the client local-run path.
+    launcher = mlrun.launcher.local.ClientLocalLauncher(local=True)
+    runtime = mlrun.code_to_function(
+        name="test", kind="job", filename=str(func_path), handler=handler
+    )
+
+    def _raise():
+        raise mlrun.errors.MLRunBadRequestError("runtime rejected by validate()")
+
+    monkeypatch.setattr(runtime, "validate", _raise)
+
+    with pytest.raises(
+        mlrun.errors.MLRunBadRequestError, match="runtime rejected by validate"
+    ):
+        launcher._validate_run(runtime, mlrun.run.RunObject())

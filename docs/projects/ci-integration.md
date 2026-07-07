@@ -1,8 +1,18 @@
 (ci-integration)=
 # Run pipelines with GitHub Actions, GitLab
 
-You can run your ML Pipelines using CI frameworks like GitHub Actions, GitLab CI/CD, etc. MLRun supports a simple and native integration 
-with the CI systems. 
+You can run your ML Pipelines using CI frameworks like GitHub Actions, GitLab CI/CD, etc. 
+
+
+**In this section**
+* [Overview](#overview)
+* [Using GitHub Actions](#using-github-actions)
+* [Using GitLab CI/CD](#using-gitlab-cicd)
+* [Using Jenkins Pipeline](#using-jenkins-pipeline)
+
+## Overview
+
+MLRun supports a simple and native integration with the CI systems. 
 
 - Build/run complex workflows composed of local/library functions or external cloud services (e.g. AutoML)
 - Support various Pipeline/CI engines (Kubeflow, GitHub, GitLab, Jenkins)
@@ -29,11 +39,6 @@ When the workflow runs inside the Git CI system it reports the pipeline progress
 
 When working with a private Git repository, you need to create **GIT_TOKEN** secrets. For more details about creating secrets in mlrun see [MLRun-managed secrets](../secrets.md#mlrun-managed-secrets).
 
-**Contents**
-* [**Using GitHub Actions**](#using-github-actions)
-* [**Using GitLab CI/CD**](#using-gitlab-cicd)
-* [**Using Jenkins Pipeline**](#using-jenkins-pipeline)
-
 ## Using GitHub Actions
 
 When running using [GitHub Actions](https://docs.github.com/en/actions) you need to set the credentials/secrets 
@@ -52,10 +57,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Set up Python 3.9
+    - name: Set up Python 3.11
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.11'
         architecture: 'x64'
     
     - name: Install mlrun

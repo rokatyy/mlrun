@@ -11,8 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 name: CI (Go)
+
+permissions:
+  contents: read
 
 on:
   pull_request:
@@ -42,15 +45,11 @@ jobs:
     name: Lint code
     runs-on: ubuntu-latest
     steps:
-      - name: Dump runner context
-        run: echo "$RUNNER_CONTEXT"
-        env:
-          RUNNER_CONTEXT: ${{ toJson(runner) }}
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
-          go-version-file: "server/go/services/log-collector/go.mod"
-          cache-dependency-path: "server/go/services/log-collector/go.sum"
+          go-version-file: "server/go/go.mod"
+          cache-dependency-path: "server/go/go.sum"
           cache: true
       - name: Install protobuf compiler
         run: |
@@ -60,13 +59,13 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
       - name: Lint
-        run: make lint-go
+        run: make lint-go security-go
 
   go-unit-tests:
     name: Run Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run GO tests
         run: |
           make test-go-unit-dockerized
@@ -75,15 +74,15 @@ jobs:
     name: Run Integration Tests in Kubernetes Environment
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # since github-actions gives us 14G only, and fills it up with some garbage
       - name: Freeing up disk space
         run: |
           "${GITHUB_WORKSPACE}/automation/scripts/github_workflow_free_space.sh"
-      - uses: manusa/actions-setup-minikube@v2.13.1
+      - uses: manusa/actions-setup-minikube@b65276017fdec6f1e6498129fb740e34e260dc55 # v2.18.0
         with:
-          minikube version: "v1.34.0"
-          kubernetes version: "v1.31.1"
+          minikube version: "v1.37.0"
+          kubernetes version: "v1.33.5"
           driver: docker
           github token: ${{ github.token }}
       - name: Prepare minikube

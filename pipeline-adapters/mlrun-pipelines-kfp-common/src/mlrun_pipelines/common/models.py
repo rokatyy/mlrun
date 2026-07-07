@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import enum
 
 
-class StrEnum(str, enum.Enum):
+class StrEnum(enum.StrEnum):
     def __str__(self):
         return self.value
 
@@ -53,6 +53,7 @@ class RunStatuses(StrEnum):
     error = "Error"  # available only on KFP 1.8 or lower
     running = "Running"
     unknown = "Unknown"
+    terminating = "Terminating"  # available only on KFP 1.8 or lower
 
     # States available only on KFP 2.0
     runtime_state_unspecified = "Runtime_State_Unspecified"
@@ -112,8 +113,28 @@ class RunStatuses(StrEnum):
             if status not in RunStatuses.stable_statuses()
         ]
 
-    def retryable_statuses(self):
-        return self.stable_statuses() + [
+    @classmethod
+    def retryable_statuses(cls):
+        return cls.stable_statuses() + [
             RunStatuses.unknown,
             RunStatuses.runtime_state_unspecified,
+        ]
+
+    @classmethod
+    def terminable_statuses(cls):
+        return [
+            RunStatuses.running,
+            RunStatuses.pending,
+            RunStatuses.paused,
+            RunStatuses.runtime_state_unspecified,
+            RunStatuses.canceling,
+            RunStatuses.terminating,
+        ]
+
+    @classmethod
+    def unsuccessful_statuses(cls):
+        return [
+            status
+            for status in cls.all()
+            if status not in cls.transient_statuses() + [RunStatuses.succeeded]
         ]

@@ -13,9 +13,7 @@
 # limitations under the License.
 import os
 import pathlib
-import warnings
 from io import StringIO
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -27,7 +25,7 @@ import mlrun.datastore
 import mlrun.utils.helpers
 from mlrun.config import config as mlconf
 
-from .base import Artifact, ArtifactSpec, StorePrefix
+from .base import Artifact, ArtifactSpec, StorePrefix, verify_target_path
 
 default_preview_rows_length = 20
 max_preview_columns = mlconf.artifacts.datasets.max_preview_columns
@@ -149,25 +147,18 @@ class DatasetArtifact(Artifact):
 
     def __init__(
         self,
-        key: Optional[str] = None,
+        key: str | None = None,
         df=None,
-        preview: Optional[int] = None,
+        preview: int | None = None,
         format: str = "",  # TODO: should be changed to 'fmt'.
-        stats: Optional[bool] = None,
-        target_path: Optional[str] = None,
-        extra_data: Optional[dict] = None,
-        column_metadata: Optional[dict] = None,
+        stats: bool | None = None,
+        target_path: str | None = None,
+        extra_data: dict | None = None,
+        column_metadata: dict | None = None,
         ignore_preview_limits: bool = False,
-        label_column: Optional[str] = None,
+        label_column: str | None = None,
         **kwargs,
     ):
-        if key or format or target_path:
-            warnings.warn(
-                "Artifact constructor parameters are deprecated and will be removed in 1.9.0. "
-                "Use the metadata and spec parameters instead.",
-                DeprecationWarning,
-            )
-
         format = (format or "").lower()
         super().__init__(key, None, format=format, target_path=target_path)
         if format and format not in self.SUPPORTED_FORMATS:
@@ -207,7 +198,7 @@ class DatasetArtifact(Artifact):
     def spec(self, spec):
         self._spec = self._verify_dict(spec, "spec", DatasetArtifactSpec)
 
-    def upload(self, artifact_path: Optional[str] = None):
+    def upload(self, artifact_path: str | None = None):
         """
         internal, upload to target store
         :param artifact_path: required only for when generating target_path from artifact hash
@@ -320,9 +311,12 @@ class DatasetArtifact(Artifact):
         if stats or (
             stats is None
             and (
-                artifact.spec.length < max_csv and len(df.columns) < max_preview_columns
+                (
+                    artifact.spec.length < max_csv
+                    and len(df.columns) < max_preview_columns
+                )
+                or ignore_preview_limits
             )
-            or ignore_preview_limits
         ):
             artifact.status.stats = get_df_stats(df)
 
@@ -374,9 +368,9 @@ def get_df_stats(df):
     for col, values in df.describe(include="all").items():
         stats_dict = {}
         for stat, val in values.dropna().items():
-            if isinstance(val, (float, np.floating, np.float64)):
+            if isinstance(val, float | np.floating | np.float64):
                 stats_dict[stat] = float(val)
-            elif isinstance(val, (int, np.integer, np.int64)):
+            elif isinstance(val, int | np.integer | np.int64):
                 stats_dict[stat] = int(val)
             else:
                 stats_dict[stat] = str(val)
@@ -396,13 +390,13 @@ def get_df_stats(df):
 def update_dataset_meta(
     artifact,
     from_df=None,
-    schema: Optional[dict] = None,
-    header: Optional[list] = None,
-    preview: Optional[list] = None,
-    stats: Optional[dict] = None,
-    extra_data: Optional[dict] = None,
-    column_metadata: Optional[dict] = None,
-    labels: Optional[dict] = None,
+    schema: dict | None = None,
+    header: list | None = None,
+    preview: list | None = None,
+    stats: dict | None = None,
+    extra_data: dict | None = None,
+    column_metadata: dict | None = None,
+    labels: dict | None = None,
     ignore_preview_limits: bool = False,
 ):
     """Update dataset object attributes/metadata
@@ -432,6 +426,7 @@ def update_dataset_meta(
         artifact_spec = artifact
     elif mlrun.datastore.is_store_uri(artifact):
         artifact_spec, _ = mlrun.datastore.store_manager.get_store_artifact(artifact)
+        verify_target_path(artifact_spec)
     else:
         raise ValueError("model path must be a model store object/URL/DataItem")
 
@@ -475,7 +470,7 @@ def update_dataset_meta(
 
 def upload_dataframe(
     df, target_path, format, src_path=None, **kw
-) -> tuple[Optional[int], Optional[str]]:
+) -> tuple[int | None, str | None]:
     if src_path and os.path.isfile(src_path):
         mlrun.datastore.store_manager.object(url=target_path).upload(src_path)
         return (

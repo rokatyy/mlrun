@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import asyncio
 import datetime
 import functools
 import re
 import time
-from typing import Callable, Optional, Union
+from collections.abc import Callable
+from typing import Literal, Union, overload
 
 import semver
 from humanfriendly import InvalidTimespan, parse_timespan
@@ -73,46 +74,47 @@ def ensure_running_on_chief(function):
     return wrapper
 
 
-def time_string_to_seconds(time_str: str, min_seconds: int = 60) -> Optional[int]:
+def time_string_to_seconds(time_str: str, min_time_str: str = "60s") -> int | None:
     if not time_str:
         return None
 
     if time_str == "-1":
         return -1
 
-    parsed_length = TimeLength(time_str, strict=True)
-    total_seconds = parsed_length.to_seconds()
+    total_seconds = TimeLength(time_str, strict=True).to_seconds()
+    min_seconds = TimeLength(min_time_str, strict=True).to_seconds()
     if total_seconds < min_seconds:
-        raise ValueError(f"Invalid time string {time_str}, must be at least 1 minute")
+        raise ValueError(
+            f"Invalid time string {time_str}, must be at least {min_seconds=}"
+        )
 
     return total_seconds
 
 
 def extract_image_tag(image_reference):
-    # This matches any word character,dots,hyphens after a colon (:) anchored to the end of the string
+    # Extracts the tag from an image reference (e.g. repo/image:tag)
     pattern = r"(?<=:)[\w.-]+$"
     match = re.search(pattern, image_reference)
-
     tag = None
-    is_semver = False
     has_py_package = False
     if match:
         tag = match.group()
-        is_semver = semver.Version.is_valid(tag)
-
-        if is_semver:
+        # Remove -pyXY suffix if present (e.g. 1.2.3-py39 -> 1.2.3)
+        tag = re.sub(r"-py\d+$", "", tag)
+        if semver.Version.is_valid(tag):
             version = semver.Version.parse(tag)
-            # If the version is a prerelease, and it has a hyphen, it means it's a feature branch build
-            has_py_package = (
-                not version.prerelease or version.prerelease.find("-") == -1
-            )
-
+            is_ga = not version.prerelease
+            if is_ga:
+                # GA version always has a python package
+                return tag, True
+            # Allow -rc suffix to indicate python package exists
+            has_py_package = re.search(r"-rc\d+$", tag) is not None
     return tag, has_py_package
 
 
 def is_request_from_leader(
-    projects_role: Optional[mlrun.common.schemas.ProjectsRole],
-    leader_name: Optional[str] = None,
+    projects_role: mlrun.common.schemas.ProjectsRole | None,
+    leader_name: str | None = None,
 ):
     leader_name = leader_name or mlrun.mlconf.httpdb.projects.leader
     if projects_role and projects_role.value == leader_name:
@@ -120,9 +122,17 @@ def is_request_from_leader(
     return False
 
 
+@overload
 def string_to_timedelta(
-    date_str: str, offset: int = 0, raise_on_error: bool = True
-) -> Optional[datetime.timedelta]:
+    date_str: str, offset: int = 0, *, raise_on_error: Literal[True] = True
+) -> datetime.timedelta: ...
+@overload
+def string_to_timedelta(
+    date_str: str, offset: int = 0, *, raise_on_error: Literal[False]
+) -> datetime.timedelta | None: ...
+def string_to_timedelta(
+    date_str: str, offset: int = 0, *, raise_on_error: bool = True
+) -> datetime.timedelta | None:
     date_str = date_str.strip().lower()
     try:
         seconds = parse_timespan(date_str) + offset
@@ -169,7 +179,7 @@ def lru_cache_with_ttl(maxsize=128, typed=False, ttl_seconds=60):
 
 
 def set_scheduled_object_labels(
-    scheduled_object: Union[Optional[dict], Callable], labels: Optional[dict]
+    scheduled_object: Union[dict | None, Callable], labels: dict | None
 ) -> None:
     if not isinstance(scheduled_object, dict):
         return
@@ -179,10 +189,10 @@ def set_scheduled_object_labels(
 
 
 def merge_schedule_and_db_schedule_labels(
-    labels: Optional[dict],
-    scheduled_object: Union[Optional[dict], Callable],
-    db_schedule: Optional[mlrun.common.schemas.ScheduleRecord],
-) -> tuple[Optional[dict], Union[Optional[dict], Callable]]:
+    labels: dict | None,
+    scheduled_object: Union[dict | None, Callable],
+    db_schedule: mlrun.common.schemas.ScheduleRecord | None,
+) -> tuple[dict | None, Union[dict | None, Callable]]:
     """
     Merges the provided schedule labels and scheduled object labels with the labels
     from the database schedule. The method ensures that the scheduled object's labels
@@ -225,9 +235,9 @@ def merge_schedule_and_db_schedule_labels(
 
 
 def merge_schedule_and_schedule_object_labels(
-    labels: Optional[dict],
-    scheduled_object: Union[Optional[dict], Callable],
-) -> Optional[dict]:
+    labels: dict | None,
+    scheduled_object: Union[dict | None, Callable],
+) -> dict | None:
     """
     Merges the labels of the scheduled object, giving precedence to the scheduled object labels
     :param labels: The labels of a schedule

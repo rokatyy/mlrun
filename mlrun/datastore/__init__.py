@@ -14,6 +14,7 @@
 
 __all__ = [
     "DataItem",
+    "ModelProvider",
     "get_store_resource",
     "ParquetTarget",
     "CSVTarget",
@@ -32,11 +33,21 @@ __all__ = [
     "get_stream_pusher",
     "ConfigProfile",
     "VectorStoreCollection",
+    "store_manager",
 ]
 
+from urllib.parse import urlparse
+
 import fsspec
+import storey
 
 import mlrun.datastore.wasbfs
+from mlrun.datastore.datastore_profile import (
+    DatastoreProfileKafkaStream,
+    DatastoreProfileRabbitMQ,
+    DatastoreProfileV3io,
+)
+from mlrun.datastore.model_provider.model_provider import ModelProvider
 from mlrun.platforms.iguazio import (
     HTTPOutputStream,
     KafkaOutputStream,
@@ -48,7 +59,6 @@ from ..utils import logger
 from .base import DataItem
 from .datastore import StoreManager, in_memory_store, uri_to_ipython
 from .dbfs_store import DatabricksFileBugFixed, DatabricksFileSystemDisableCache
-from .s3 import parse_s3_bucket_and_key
 from .sources import (
     BigQuerySource,
     CSVSource,
@@ -64,7 +74,7 @@ from .store_resources import (
     parse_store_uri,
 )
 from .targets import CSVTarget, NoSqlTarget, ParquetTarget, StreamTarget
-from .utils import get_kafka_brokers_from_dict, parse_kafka_url
+from .utils import get_kafka_brokers_from_dict, parse_kafka_url, parse_s3_bucket_and_key
 
 store_manager = StoreManager()
 
@@ -106,34 +116,74 @@ def get_stream_pusher(stream_path: str, **kwargs):
 
     :param stream_path:        path/url of stream
     """
+    if stream_path.startswith("ds://"):
+        datastore_profile = mlrun.datastore.datastore_profile.datastore_profile_read(
+            stream_path
+        )
+        if isinstance(
+            datastore_profile,
+            DatastoreProfileKafkaStream,
+        ):
+            attributes = datastore_profile.attributes()
+            brokers = attributes.pop("brokers", None)
+            # Override the topic with the one in the url (if any)
+            parsed_url = urlparse(stream_path)
+            topic = (
+                parsed_url.path.strip("/")
+                if parsed_url.path
+                else datastore_profile.get_topic()
+            )
+            producer_options = mlrun.datastore.utils.KafkaParameters(
+                attributes
+            ).producer()
+            return KafkaOutputStream(topic, brokers, producer_options=producer_options)
 
-    kafka_brokers = get_kafka_brokers_from_dict(kwargs)
-    if stream_path.startswith("kafka://") or kafka_brokers:
-        topic, brokers = parse_kafka_url(stream_path, kafka_brokers)
-        return KafkaOutputStream(topic, brokers, kwargs.get("kafka_producer_options"))
-    elif stream_path.startswith("http://") or stream_path.startswith("https://"):
-        return HTTPOutputStream(stream_path=stream_path)
-    elif "://" not in stream_path:
-        return OutputStream(stream_path, **kwargs)
-    elif stream_path.startswith("v3io"):
-        endpoint, stream_path = parse_path(stream_path)
-        endpoint = kwargs.pop("endpoint", None) or endpoint
-        return OutputStream(stream_path, endpoint=endpoint, **kwargs)
-    elif stream_path.startswith("dummy://"):
-        return _DummyStream(**kwargs)
+        elif isinstance(datastore_profile, DatastoreProfileV3io):
+            parsed_url = urlparse(stream_path)
+            stream_path = datastore_profile.url(parsed_url.path)
+            endpoint, stream_path = parse_path(stream_path)
+            return OutputStream(stream_path, endpoint=endpoint, **kwargs)
+        else:
+            raise ValueError(
+                f"Unsupported datastore profile type: {type(datastore_profile)}"
+            )
     else:
-        raise ValueError(f"unsupported stream path {stream_path}")
+        kafka_brokers = get_kafka_brokers_from_dict(kwargs)
+        if stream_path.startswith("kafka://") or kafka_brokers:
+            topic, brokers = parse_kafka_url(stream_path, kafka_brokers)
+            return KafkaOutputStream(
+                topic, brokers, kwargs.get("kafka_producer_options")
+            )
+        elif stream_path.startswith("http://") or stream_path.startswith("https://"):
+            return HTTPOutputStream(stream_path=stream_path)
+        elif "://" not in stream_path:
+            return OutputStream(stream_path, **kwargs)
+        elif stream_path.startswith("v3io"):
+            endpoint, stream_path = parse_path(stream_path)
+            endpoint = kwargs.pop("endpoint", None) or endpoint
+            return OutputStream(stream_path, endpoint=endpoint, **kwargs)
+        elif stream_path.startswith("dummy://"):
+            return _DummyStream(**kwargs)
+        else:
+            raise ValueError(f"unsupported stream path {stream_path}")
 
 
-class _DummyStream:
+class _DummyStream(storey.MapClass):
     """stream emulator for tests and debug"""
 
     def __init__(self, event_list=None, **kwargs):
         self.event_list = event_list or []
+        super().__init__(**kwargs)
 
     def push(self, data, **kwargs):
         if not isinstance(data, list):
             data = [data]
         for item in data:
             logger.info(f"dummy stream got event: {item}, kwargs={kwargs}")
+            self.event_list.append(item)
+
+    def do(self, event):
+        if not isinstance(event, list):
+            event = [event]
+        for item in event:
             self.event_list.append(item)

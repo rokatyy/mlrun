@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from abc import ABC
-from typing import Optional
 
 import mlrun
 
@@ -162,8 +161,8 @@ class SKLearnMLRunInterface(MLRunInterface, ABC):
     def configure_logging(
         self,
         context: mlrun.MLClientCtx = None,
-        plans: Optional[list[MLPlan]] = None,
-        metrics: Optional[list[Metric]] = None,
+        plans: list[MLPlan] | None = None,
+        metrics: list[Metric] | None = None,
         x_test: SKLearnTypes.DatasetType = None,
         y_test: SKLearnTypes.DatasetType = None,
         model_handler: MLModelHandler = None,

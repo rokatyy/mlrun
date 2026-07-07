@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 from urllib.parse import urlparse
 
 import redis
@@ -31,9 +30,7 @@ class RedisStore(DataStore):
     - key and value sizes are limited to 512MB
     """
 
-    def __init__(
-        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
-    ):
+    def __init__(self, parent, schema, name, endpoint="", secrets: dict | None = None):
         redis_default_port = "6379"
         super().__init__(parent, name, schema, endpoint, secrets=secrets)
         self.headers = None
@@ -48,9 +45,8 @@ class RedisStore(DataStore):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "Provide Redis username and password only via secrets"
             )
-        credentials_prefix = self._get_secret_or_env("CREDENTIALS_PREFIX")
-        user = self._get_secret_or_env("REDIS_USER", "", credentials_prefix)
-        password = self._get_secret_or_env("REDIS_PASSWORD", "", credentials_prefix)
+        user = self._get_secret_or_env("REDIS_USER", "")
+        password = self._get_secret_or_env("REDIS_PASSWORD", "")
         host = parsed_endpoint.hostname
         port = parsed_endpoint.port if parsed_endpoint.port else redis_default_port
         schema = parsed_endpoint.scheme

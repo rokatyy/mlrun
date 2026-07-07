@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import os
 from abc import abstractmethod
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable, Generic, Optional, Union
+from typing import Any, Generic, Union
 
 import yaml
 
@@ -64,8 +65,8 @@ class TensorboardLogger(Logger, Generic[DLTypes.WeightType]):
             Callable[[DLTypes.WeightType], Union[float, DLTypes.WeightType]]
         ],
         context: mlrun.MLClientCtx = None,
-        tensorboard_directory: Optional[str] = None,
-        run_name: Optional[str] = None,
+        tensorboard_directory: str | None = None,
+        run_name: str | None = None,
         update_frequency: Union[int, str] = "epoch",
     ):
         """

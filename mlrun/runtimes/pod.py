@@ -17,29 +17,27 @@ import os
 import re
 import time
 import typing
+import warnings
 from collections.abc import Iterable
-from enum import Enum
+from enum import StrEnum
 
 import dotenv
 import kubernetes.client as k8s_client
 from kubernetes.client import V1Volume, V1VolumeMount
 
 import mlrun.common.constants
+import mlrun.common.secrets
 import mlrun.errors
 import mlrun.runtimes.mounts
 import mlrun.utils.regex
 from mlrun.common.schemas import (
-    NodeSelectorOperator,
     PreemptionModes,
     SecurityContextEnrichmentModes,
 )
 
 from ..config import config as mlconf
 from ..k8s_utils import (
-    generate_preemptible_node_selector_requirements,
     generate_preemptible_nodes_affinity_terms,
-    generate_preemptible_nodes_anti_affinity_terms,
-    generate_preemptible_tolerations,
     validate_node_selectors,
 )
 from ..utils import logger, update_in
@@ -95,6 +93,7 @@ class KubeResourceSpec(FunctionSpec):
         "volumes",
         "volume_mounts",
         "env",
+        "env_from",
         "resources",
         "replicas",
         "image_pull_policy",
@@ -108,6 +107,16 @@ class KubeResourceSpec(FunctionSpec):
         "preemption_mode",
         "security_context",
         "state_thresholds",
+        "serving_spec",
+        "track_models",
+        "parameters",
+        "graph",
+        "filename",
+        "mount_otlp_secret",
+        # Internal book-keeping for auto-mount modifiers (see has_user_set_plain_env).
+        # Serialized so it survives SDK->API; deliberately excluded from
+        # _k8s_fields_to_serialize so it never reaches the pod manifest.
+        "auto_mount_injected_env_names",
     ]
     _default_fields_to_strip = FunctionSpec._default_fields_to_strip + [
         "volumes",
@@ -130,6 +139,7 @@ class KubeResourceSpec(FunctionSpec):
         "volume_mounts",
         "resources",
         "env",
+        "env_from",
         "image_pull_policy",
         "service_account",
         "image_pull_secret",
@@ -182,8 +192,13 @@ class KubeResourceSpec(FunctionSpec):
         tolerations=None,
         preemption_mode=None,
         security_context=None,
-        clone_target_dir=None,
         state_thresholds=None,
+        serving_spec=None,
+        track_models=None,
+        parameters=None,
+        graph=None,
+        env_from=None,
+        mount_otlp_secret: bool = False,
     ):
         super().__init__(
             command=command,
@@ -197,7 +212,6 @@ class KubeResourceSpec(FunctionSpec):
             default_handler=default_handler,
             pythonpath=pythonpath,
             disable_auto_mount=disable_auto_mount,
-            clone_target_dir=clone_target_dir,
         )
         self._volumes = {}
         self._volume_mounts = {}
@@ -205,6 +219,7 @@ class KubeResourceSpec(FunctionSpec):
         self.volume_mounts = volume_mounts or []
         # TODO: add env attribute to the sanitized types
         self.env = env or []
+        self.env_from = env_from or []
         self._resources = self.enrich_resources_with_default_pod_resources(
             "resources", resources
         )
@@ -230,6 +245,21 @@ class KubeResourceSpec(FunctionSpec):
             state_thresholds
             or mlrun.mlconf.function.spec.state_thresholds.default.to_dict()
         )
+        self.serving_spec = serving_spec
+        self.track_models = track_models
+        self.parameters = parameters
+        self._graph = None
+        self.graph = graph
+        # When True, the API server mounts the OTLP telemetry headers secret onto
+        # the function pod so the runtime can authenticate against the OTLP endpoint
+        # via mlrun.utils.telemetry.resolve_otlp_headers().
+        self.mount_otlp_secret = mount_otlp_secret
+        # Names of env vars an auto-mount modifier wrote as plain values. Project-secret
+        # injection (server-side) consults this via has_user_set_plain_env to know it
+        # may override these — they were not set by the user. Internal book-keeping:
+        # in _dict_fields so it round-trips SDK↔API via from_dict's setattr, but
+        # deliberately not a constructor kwarg (no external caller sets it).
+        self.auto_mount_injected_env_names = []
         # Termination grace period is internal for runtimes that have a pod termination hook hence it is not in the
         # _dict_fields and doesn't have a setter.
         self._termination_grace_period_seconds = None
@@ -292,7 +322,6 @@ class KubeResourceSpec(FunctionSpec):
     @preemption_mode.setter
     def preemption_mode(self, mode):
         self._preemption_mode = mode or mlconf.function_defaults.preemption_mode
-        self.enrich_function_preemption_spec()
 
     @property
     def security_context(self) -> k8s_client.V1SecurityContext:
@@ -305,11 +334,22 @@ class KubeResourceSpec(FunctionSpec):
         )
 
     @property
-    def termination_grace_period_seconds(self) -> typing.Optional[int]:
+    def termination_grace_period_seconds(self) -> int | None:
         return self._termination_grace_period_seconds
 
+    @property
+    def graph(self):
+        """states graph, holding the serving workflow/DAG topology"""
+        return self._graph
+
+    @graph.setter
+    def graph(self, graph):
+        from ..serving.states import graph_root_setter
+
+        graph_root_setter(self, graph)
+
     def _serialize_field(
-        self, struct: dict, field_name: typing.Optional[str] = None, strip: bool = False
+        self, struct: dict, field_name: str | None = None, strip: bool = False
     ) -> typing.Any:
         """
         Serialize a field to a dict, list, or primitive type.
@@ -321,7 +361,7 @@ class KubeResourceSpec(FunctionSpec):
         return super()._serialize_field(struct, field_name, strip)
 
     def _enrich_field(
-        self, struct: dict, field_name: typing.Optional[str] = None, strip: bool = False
+        self, struct: dict, field_name: str | None = None, strip: bool = False
     ) -> typing.Any:
         k8s_api = k8s_client.ApiClient()
         if strip:
@@ -356,7 +396,9 @@ class KubeResourceSpec(FunctionSpec):
             for volume_mount in volume_mounts:
                 self._set_volume_mount(volume_mount, volume_mounts_field_name)
 
-    def validate_service_account(self, allowed_service_accounts):
+    def validate_service_account(
+        self, allowed_service_accounts, forbidden_service_accounts
+    ):
         if (
             allowed_service_accounts
             and self.service_account not in allowed_service_accounts
@@ -364,6 +406,14 @@ class KubeResourceSpec(FunctionSpec):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"Function service account {self.service_account} is not in allowed "
                 + f"service accounts {allowed_service_accounts}"
+            )
+        if (
+            forbidden_service_accounts
+            and self.service_account in forbidden_service_accounts
+        ):
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"Function service account {self.service_account} is in forbidden "
+                + f"service accounts {forbidden_service_accounts}"
             )
 
     def with_volumes(
@@ -409,9 +459,9 @@ class KubeResourceSpec(FunctionSpec):
     def _verify_and_set_limits(
         self,
         resources_field_name,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
-        gpus: typing.Optional[int] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
+        gpus: int | None = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -459,8 +509,8 @@ class KubeResourceSpec(FunctionSpec):
     def _verify_and_set_requests(
         self,
         resources_field_name,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
         patch: bool = False,
     ):
         resources = verify_requests(resources_field_name, mem=mem, cpu=cpu)
@@ -485,9 +535,9 @@ class KubeResourceSpec(FunctionSpec):
 
     def with_limits(
         self,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
-        gpus: typing.Optional[int] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
+        gpus: int | None = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -505,8 +555,8 @@ class KubeResourceSpec(FunctionSpec):
 
     def with_requests(
         self,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
         patch: bool = False,
     ):
         """
@@ -560,300 +610,6 @@ class KubeResourceSpec(FunctionSpec):
             return {}
         return resources
 
-    def _merge_node_selector(self, node_selector: dict[str, str]):
-        if not node_selector:
-            return
-
-        # merge node selectors - precedence to existing node selector
-        self.node_selector = mlrun.utils.helpers.merge_dicts_with_precedence(
-            node_selector, self.node_selector
-        )
-
-    def _merge_tolerations(
-        self,
-        tolerations: list[k8s_client.V1Toleration],
-        tolerations_field_name: str,
-    ):
-        if not tolerations:
-            return
-        # In case function has no toleration, take all from input
-        self_tolerations = getattr(self, tolerations_field_name)
-        if not self_tolerations:
-            setattr(self, tolerations_field_name, tolerations)
-            return
-        tolerations_to_add = []
-
-        # Only add non-matching tolerations to avoid duplications
-        for toleration in tolerations:
-            to_add = True
-            for function_toleration in self_tolerations:
-                if function_toleration == toleration:
-                    to_add = False
-                    break
-            if to_add:
-                tolerations_to_add.append(toleration)
-
-        if len(tolerations_to_add) > 0:
-            self_tolerations.extend(tolerations_to_add)
-
-    def _override_required_during_scheduling_ignored_during_execution(
-        self,
-        node_selector: k8s_client.V1NodeSelector,
-        affinity_field_name: str,
-    ):
-        self._initialize_affinity(affinity_field_name)
-        self._initialize_node_affinity(affinity_field_name)
-
-        self_affinity = getattr(self, affinity_field_name)
-        self_affinity.node_affinity.required_during_scheduling_ignored_during_execution = node_selector
-
-    def enrich_function_preemption_spec(
-        self,
-        preemption_mode_field_name: str = "preemption_mode",
-        tolerations_field_name: str = "tolerations",
-        affinity_field_name: str = "affinity",
-        node_selector_field_name: str = "node_selector",
-    ):
-        """
-        Enriches function pod with the below described spec.
-        If no preemptible node configuration is provided, do nothing.
-            `allow` 	- Adds Tolerations if configured.
-                          otherwise, assume pods can be scheduled on preemptible nodes.
-                        > Purges any `affinity` / `anti-affinity` preemption related configuration
-                        > Purges preemptible node selector
-            `constrain` - Uses node-affinity to make sure pods are assigned using OR on the configured
-                          node label selectors.
-                        > Merges tolerations with preemptible tolerations.
-                        > Purges any `anti-affinity` preemption related configuration
-            `prevent`	- Prevention is done either using taints (if Tolerations were configured) or anti-affinity.
-                        > Purges any `tolerations` preemption related configuration
-                        > Purges any `affinity` preemption related configuration
-                        > Purges preemptible node selector
-                        > Sets anti-affinity and overrides any affinity if no tolerations were configured
-            `none`      - Doesn't apply any preemptible node selection configuration.
-        """
-        # nothing to do here, configuration is not populated
-        if not mlconf.is_preemption_nodes_configured():
-            return
-
-        if not getattr(self, preemption_mode_field_name):
-            # We're not supposed to get here, but if we do, we'll set the private attribute to
-            # avoid triggering circular enrichment.
-            setattr(
-                self,
-                f"_{preemption_mode_field_name}",
-                mlconf.function_defaults.preemption_mode,
-            )
-            logger.debug(
-                "No preemption mode was given, using the default preemption mode",
-                default_preemption_mode=getattr(self, preemption_mode_field_name),
-            )
-        self_preemption_mode = getattr(self, preemption_mode_field_name)
-        # don't enrich with preemption configuration.
-        if self_preemption_mode == PreemptionModes.none.value:
-            return
-        # remove preemptible tolerations and remove preemption related configuration
-        # and enrich with anti-affinity if preemptible tolerations configuration haven't been provided
-        if self_preemption_mode == PreemptionModes.prevent.value:
-            # ensure no preemptible node tolerations
-            self._prune_tolerations(
-                generate_preemptible_tolerations(),
-                tolerations_field_name=tolerations_field_name,
-            )
-
-            # purge affinity preemption related configuration
-            self._prune_affinity_node_selector_requirement(
-                generate_preemptible_node_selector_requirements(
-                    NodeSelectorOperator.node_selector_op_in.value
-                ),
-                affinity_field_name=affinity_field_name,
-            )
-            # remove preemptible nodes constrain
-            self._prune_node_selector(
-                mlconf.get_preemptible_node_selector(),
-                node_selector_field_name=node_selector_field_name,
-            )
-
-            # if tolerations are configured, simply pruning tolerations is sufficient because functions
-            # cannot be scheduled without tolerations on tainted nodes.
-            # however, if preemptible tolerations are not configured, we must use anti-affinity on preemptible nodes
-            # to ensure that the function is not scheduled on the nodes.
-            if not generate_preemptible_tolerations():
-                # using a single term with potentially multiple expressions to ensure anti-affinity
-                self._override_required_during_scheduling_ignored_during_execution(
-                    k8s_client.V1NodeSelector(
-                        node_selector_terms=generate_preemptible_nodes_anti_affinity_terms()
-                    ),
-                    affinity_field_name=affinity_field_name,
-                )
-        # enrich tolerations and override all node selector terms with preemptible node selector terms
-        elif self_preemption_mode == PreemptionModes.constrain.value:
-            # enrich with tolerations
-            self._merge_tolerations(
-                generate_preemptible_tolerations(),
-                tolerations_field_name=tolerations_field_name,
-            )
-
-            # setting required_during_scheduling_ignored_during_execution
-            # overriding other terms that have been set, and only setting terms for preemptible nodes
-            # when having multiple terms, pod scheduling is succeeded if at least one term is satisfied
-            self._override_required_during_scheduling_ignored_during_execution(
-                k8s_client.V1NodeSelector(
-                    node_selector_terms=generate_preemptible_nodes_affinity_terms()
-                ),
-                affinity_field_name=affinity_field_name,
-            )
-        # purge any affinity / anti-affinity preemption related configuration and enrich with preemptible tolerations
-        elif self_preemption_mode == PreemptionModes.allow.value:
-            # remove preemptible anti-affinity
-            self._prune_affinity_node_selector_requirement(
-                generate_preemptible_node_selector_requirements(
-                    NodeSelectorOperator.node_selector_op_not_in.value
-                ),
-                affinity_field_name=affinity_field_name,
-            )
-            # remove preemptible affinity
-            self._prune_affinity_node_selector_requirement(
-                generate_preemptible_node_selector_requirements(
-                    NodeSelectorOperator.node_selector_op_in.value
-                ),
-                affinity_field_name=affinity_field_name,
-            )
-
-            # remove preemptible nodes constrain
-            self._prune_node_selector(
-                mlconf.get_preemptible_node_selector(),
-                node_selector_field_name=node_selector_field_name,
-            )
-
-            # enrich with tolerations
-            self._merge_tolerations(
-                generate_preemptible_tolerations(),
-                tolerations_field_name=tolerations_field_name,
-            )
-
-        self._clear_affinity_if_initialized_but_empty(
-            affinity_field_name=affinity_field_name
-        )
-        self._clear_tolerations_if_initialized_but_empty(
-            tolerations_field_name=tolerations_field_name
-        )
-
-    def _clear_affinity_if_initialized_but_empty(self, affinity_field_name: str):
-        self_affinity = getattr(self, affinity_field_name)
-        if not getattr(self, affinity_field_name):
-            setattr(self, affinity_field_name, None)
-        elif (
-            not self_affinity.node_affinity
-            and not self_affinity.pod_affinity
-            and not self_affinity.pod_anti_affinity
-        ):
-            setattr(self, affinity_field_name, None)
-
-    def _clear_tolerations_if_initialized_but_empty(self, tolerations_field_name: str):
-        if not getattr(self, tolerations_field_name):
-            setattr(self, tolerations_field_name, None)
-
-    def _merge_node_selector_term_to_node_affinity(
-        self,
-        node_selector_terms: list[k8s_client.V1NodeSelectorTerm],
-        affinity_field_name: str,
-    ):
-        if not node_selector_terms:
-            return
-
-        self._initialize_affinity(affinity_field_name)
-        self._initialize_node_affinity(affinity_field_name)
-
-        self_affinity = getattr(self, affinity_field_name)
-        if not self_affinity.node_affinity.required_during_scheduling_ignored_during_execution:
-            self_affinity.node_affinity.required_during_scheduling_ignored_during_execution = k8s_client.V1NodeSelector(
-                node_selector_terms=node_selector_terms
-            )
-            return
-
-        node_selector = self_affinity.node_affinity.required_during_scheduling_ignored_during_execution
-        new_node_selector_terms = []
-
-        for node_selector_term_to_add in node_selector_terms:
-            to_add = True
-            for node_selector_term in node_selector.node_selector_terms:
-                if node_selector_term == node_selector_term_to_add:
-                    to_add = False
-                    break
-            if to_add:
-                new_node_selector_terms.append(node_selector_term_to_add)
-
-        if new_node_selector_terms:
-            node_selector.node_selector_terms += new_node_selector_terms
-
-    def _initialize_affinity(self, affinity_field_name: str):
-        if not getattr(self, affinity_field_name):
-            setattr(self, affinity_field_name, k8s_client.V1Affinity())
-
-    def _initialize_node_affinity(self, affinity_field_name: str):
-        if not getattr(getattr(self, affinity_field_name), "node_affinity"):
-            # self.affinity.node_affinity:
-            getattr(
-                self, affinity_field_name
-            ).node_affinity = k8s_client.V1NodeAffinity()
-            # self.affinity.node_affinity = k8s_client.V1NodeAffinity()
-
-    def _prune_affinity_node_selector_requirement(
-        self,
-        node_selector_requirements: list[k8s_client.V1NodeSelectorRequirement],
-        affinity_field_name: str = "affinity",
-    ):
-        """
-        Prunes given node selector requirements from affinity.
-        We are only editing required_during_scheduling_ignored_during_execution because the scheduler can't schedule
-        the pod unless the rule is met.
-        :param node_selector_requirements:
-        :return:
-        """
-        # both needs to exist to prune required affinity from spec affinity
-        self_affinity = getattr(self, affinity_field_name)
-        if not self_affinity or not node_selector_requirements:
-            return
-        if self_affinity.node_affinity:
-            node_affinity: k8s_client.V1NodeAffinity = self_affinity.node_affinity
-
-            new_required_during_scheduling_ignored_during_execution = None
-            if node_affinity.required_during_scheduling_ignored_during_execution:
-                node_selector: k8s_client.V1NodeSelector = (
-                    node_affinity.required_during_scheduling_ignored_during_execution
-                )
-                new_node_selector_terms = (
-                    self._prune_node_selector_requirements_from_node_selector_terms(
-                        node_selector_terms=node_selector.node_selector_terms,
-                        node_selector_requirements_to_prune=node_selector_requirements,
-                    )
-                )
-                # check whether there are node selector terms to add to the new list of required terms
-                if len(new_node_selector_terms) > 0:
-                    new_required_during_scheduling_ignored_during_execution = (
-                        k8s_client.V1NodeSelector(
-                            node_selector_terms=new_node_selector_terms
-                        )
-                    )
-            # if both preferred and new required are empty, clean node_affinity
-            if (
-                not node_affinity.preferred_during_scheduling_ignored_during_execution
-                and not new_required_during_scheduling_ignored_during_execution
-            ):
-                setattr(self_affinity, "node_affinity", None)
-                # self.affinity.node_affinity = None
-                return
-
-            self._initialize_affinity(affinity_field_name)
-            self._initialize_node_affinity(affinity_field_name)
-
-            # fmt: off
-            self_affinity.node_affinity.required_during_scheduling_ignored_during_execution = (
-                new_required_during_scheduling_ignored_during_execution
-            )
-            # fmt: on
-
     @staticmethod
     def _prune_node_selector_requirements_from_node_selector_terms(
         node_selector_terms: list[k8s_client.V1NodeSelectorTerm],
@@ -894,57 +650,8 @@ class KubeResourceSpec(FunctionSpec):
                 )
         return new_node_selector_terms
 
-    def _prune_tolerations(
-        self,
-        tolerations: list[k8s_client.V1Toleration],
-        tolerations_field_name: str = "tolerations",
-    ):
-        """
-        Prunes given tolerations from function spec
-        :param tolerations: tolerations to prune
-        """
-        self_tolerations = getattr(self, tolerations_field_name)
-        # both needs to exist to prune required tolerations from spec tolerations
-        if not tolerations or not self_tolerations:
-            return
 
-        # generate a list of tolerations without tolerations to prune
-        new_tolerations = []
-        for toleration in self_tolerations:
-            to_prune = False
-            for toleration_to_delete in tolerations:
-                if toleration == toleration_to_delete:
-                    to_prune = True
-                    # no need to keep going over the list provided for the current toleration
-                    break
-            if not to_prune:
-                new_tolerations.append(toleration)
-
-        # Set tolerations without tolerations to prune
-        setattr(self, tolerations_field_name, new_tolerations)
-
-    def _prune_node_selector(
-        self,
-        node_selector: dict[str, str],
-        node_selector_field_name: str,
-    ):
-        """
-        Prunes given node_selector key from function spec if their key and value are matching
-        :param node_selector: node selectors to prune
-        """
-        self_node_selector = getattr(self, node_selector_field_name)
-        # both needs to exists to prune required node_selector from the spec node selector
-        if not node_selector or not self_node_selector:
-            return
-
-        for key, value in node_selector.items():
-            if value:
-                spec_value = self_node_selector.get(key)
-                if spec_value and spec_value == value:
-                    self_node_selector.pop(key)
-
-
-class AutoMountType(str, Enum):
+class AutoMountType(StrEnum):
     none = "none"
     auto = "auto"
     v3io_credentials = "v3io_credentials"
@@ -952,6 +659,7 @@ class AutoMountType(str, Enum):
     pvc = "pvc"
     s3 = "s3"
     env = "env"
+    secret_env = "secret_env"
 
     @classmethod
     def _missing_(cls, value):
@@ -976,7 +684,19 @@ class AutoMountType(str, Enum):
             mlrun.runtimes.mounts.auto_mount.__name__,
             mlrun.runtimes.mounts.mount_s3.__name__,
             mlrun.runtimes.mounts.set_env_variables.__name__,
+            mlrun.runtimes.mounts.set_env_vars_from_secret.__name__,
         ]
+
+    # Modifiers that contribute only env vars / envFrom (no volumes) - safe to harvest
+    # by reading spec.env after applying them.
+    @classmethod
+    def env_style_modifiers(cls) -> set:
+        return {
+            mlrun.runtimes.mounts.set_env_variables,
+            mlrun.runtimes.mounts.set_env_vars_from_secret,
+            mlrun.runtimes.mounts.v3io_cred,
+            mlrun.runtimes.mounts.mount_s3,
+        }
 
     @classmethod
     def is_auto_modifier(cls, modifier):
@@ -1009,6 +729,7 @@ class AutoMountType(str, Enum):
             AutoMountType.auto: self._get_auto_modifier(),
             AutoMountType.s3: mlrun.runtimes.mounts.mount_s3,
             AutoMountType.env: mlrun.runtimes.mounts.set_env_variables,
+            AutoMountType.secret_env: mlrun.runtimes.mounts.set_env_vars_from_secret,
         }[self]
 
 
@@ -1032,19 +753,57 @@ class KubeResource(BaseRuntime):
     def spec(self, spec):
         self._spec = self._verify_dict(spec, "spec", KubeResourceSpec)
 
-    def set_env_from_secret(self, name, secret=None, secret_key=None):
-        """set pod environment var from secret"""
-        secret_key = secret_key or name
+    def set_env_from_secret(
+        self,
+        name: str,
+        secret: str | None = None,
+        secret_key: str | None = None,
+    ):
+        """
+        Set an environment variable from a Kubernetes Secret.
+        Client-side guard forbids MLRun internal auth/project secrets; no-op on API.
+        """
+        mlrun.common.secrets.validate_not_forbidden_secret(secret)
+        key = secret_key or name
         value_from = k8s_client.V1EnvVarSource(
-            secret_key_ref=k8s_client.V1SecretKeySelector(name=secret, key=secret_key)
+            secret_key_ref=k8s_client.V1SecretKeySelector(name=secret, key=key)
         )
-        return self._set_env(name, value_from=value_from)
+        return self._set_env(name=name, value_from=value_from)
 
-    def set_env(self, name, value=None, value_from=None):
-        """set pod environment var from value"""
-        if value is not None:
-            return self._set_env(name, value=str(value))
-        return self._set_env(name, value_from=value_from)
+    def set_env_from_secret_ref(self, secret_name: str):
+        """
+        Mount all keys from a Kubernetes Secret as environment variables.
+        Uses envFrom.secretRef so every key in the secret becomes an env var.
+        """
+        mlrun.common.secrets.validate_not_forbidden_secret(secret_name)
+        env_from_source = k8s_client.V1EnvFromSource(
+            secret_ref=k8s_client.V1SecretEnvSource(name=secret_name)
+        )
+        self.spec.env_from.append(env_from_source)
+        return self
+
+    def set_env(
+        self,
+        name: str,
+        value: str | None = None,
+        value_from: typing.Any | None = None,
+    ):
+        """
+        Set an environment variable.
+        If value comes from a Secret, validate on client-side only.
+        """
+        if value_from is not None:
+            secret_name = self._extract_secret_name_from_value_from(
+                value_from=value_from
+            )
+            if secret_name:
+                mlrun.common.secrets.validate_not_forbidden_secret(secret_name)
+            return self._set_env(name=name, value_from=value_from)
+
+        # Plain literal value path
+        return self._set_env(
+            name=name, value=(str(value) if value is not None else None)
+        )
 
     def with_annotations(self, annotations: dict):
         """set a key/value annotations in the metadata of the pod"""
@@ -1074,8 +833,47 @@ class KubeResource(BaseRuntime):
                 return True
         return False
 
+    def has_user_set_plain_env(self, name: str) -> bool:
+        """Check whether `name` is present in the runtime spec as a plain-value env var.
+
+        Returns True only for env vars with a plain ``.value`` *and* not flagged as
+        auto-mount-injected (see ``mark_env_auto_mount_injected``). Returns False
+        for secret-injected vars (``.value_from``) and for plain values that an
+        auto-mount modifier wrote — the latter must yield to project-secret
+        injection. Auto-mount modifiers and secret-store injection consult this
+        to defer to user-set values instead of overriding them.
+        """
+        if name in self.spec.auto_mount_injected_env_names:
+            return False
+        for env_var in self.spec.env:
+            if get_item_name(env_var) == name:
+                return get_item_name(env_var, "value") is not None
+        return False
+
+    def mark_env_auto_mount_injected(self, name: str) -> None:
+        """Flag ``name`` as written by an auto-mount modifier (plain-value path).
+
+        Called by ``mount_s3`` (and any future modifier that injects plain
+        values) right after writing the env var, so that project-secret
+        injection can override the value via ``has_user_set_plain_env``.
+        Idempotent.
+
+        Ordering contract: must be called *after* ``set_env``/``_set_env``,
+        never before. Any write to ``name`` via ``_set_env`` clears the marker
+        (see the comment there), so flagging first and writing second would
+        silently wipe the flag.
+        """
+        if name not in self.spec.auto_mount_injected_env_names:
+            self.spec.auto_mount_injected_env_names.append(name)
+
     def _set_env(self, name, value=None, value_from=None):
         new_var = k8s_client.V1EnvVar(name=name, value=value, value_from=value_from)
+
+        # Any write to `name` invalidates a stale auto-mount-injected marker;
+        # the auto-mount caller re-asserts it via mark_env_auto_mount_injected
+        # immediately after writing if it owns the new value.
+        if name in self.spec.auto_mount_injected_env_names:
+            self.spec.auto_mount_injected_env_names.remove(name)
 
         # ensure we don't have duplicate env vars with the same name
         for env_index, value_item in enumerate(self.spec.env):
@@ -1087,8 +885,8 @@ class KubeResource(BaseRuntime):
 
     def set_envs(
         self,
-        env_vars: typing.Optional[dict] = None,
-        file_path: typing.Optional[str] = None,
+        env_vars: dict | None = None,
+        file_path: str | None = None,
     ):
         """set pod environment var from key/value dict or .env file
 
@@ -1117,8 +915,8 @@ class KubeResource(BaseRuntime):
 
     def set_image_pull_configuration(
         self,
-        image_pull_policy: typing.Optional[str] = None,
-        image_pull_secret_name: typing.Optional[str] = None,
+        image_pull_policy: str | None = None,
+        image_pull_secret_name: str | None = None,
     ):
         """
         Configure the image pull parameters for the runtime.
@@ -1167,9 +965,9 @@ class KubeResource(BaseRuntime):
 
     def with_limits(
         self,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
-        gpus: typing.Optional[int] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
+        gpus: int | None = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -1187,8 +985,8 @@ class KubeResource(BaseRuntime):
 
     def with_requests(
         self,
-        mem: typing.Optional[str] = None,
-        cpu: typing.Optional[str] = None,
+        mem: str | None = None,
+        cpu: str | None = None,
         patch: bool = False,
     ):
         """
@@ -1201,26 +999,163 @@ class KubeResource(BaseRuntime):
         """
         self.spec.with_requests(mem, cpu, patch=patch)
 
+    @staticmethod
+    def detect_preemptible_node_selector(node_selector: dict[str, str]) -> list[str]:
+        """
+        Check whether any provided node selector matches preemptible selectors.
+
+        :param node_selector: User-provided node selector mapping.
+        :return: List of `"key='value'"` strings that match a preemptible selector.
+        """
+        preemptible_node_selector = mlconf.get_preemptible_node_selector()
+
+        return [
+            f"'{key}': '{val}'"
+            for key, val in node_selector.items()
+            if preemptible_node_selector.get(key) == val
+        ]
+
+    def detect_preemptible_tolerations(
+        self, tolerations: list[k8s_client.V1Toleration]
+    ) -> list[str]:
+        """
+        Check whether any provided toleration matches preemptible tolerations.
+
+        :param tolerations: User-provided tolerations.
+        :return: List of formatted toleration strings that are considered preemptible.
+        """
+        preemptible_tolerations = [
+            k8s_client.V1Toleration(
+                key=toleration.get("key"),
+                value=toleration.get("value"),
+                effect=toleration.get("effect"),
+            )
+            for toleration in mlconf.get_preemptible_tolerations()
+        ]
+
+        def _format_toleration(toleration):
+            return f"'{toleration.key}'='{toleration.value}' (effect: '{toleration.effect}')"
+
+        return [
+            _format_toleration(toleration)
+            for toleration in tolerations
+            if toleration in preemptible_tolerations
+        ]
+
+    def detect_preemptible_affinity(self, affinity: k8s_client.V1Affinity) -> list[str]:
+        """
+        Check whether any provided affinity rules match preemptible affinity configs.
+
+        :param affinity: User-provided affinity object.
+        :return: List of formatted expressions that overlap with preemptible terms.
+        """
+        preemptible_affinity_terms = generate_preemptible_nodes_affinity_terms()
+        conflicting_affinities = []
+
+        if (
+            affinity
+            and affinity.node_affinity
+            and affinity.node_affinity.required_during_scheduling_ignored_during_execution
+        ):
+            user_terms = affinity.node_affinity.required_during_scheduling_ignored_during_execution.node_selector_terms
+            for user_term in user_terms:
+                user_expressions = {
+                    (expr.key, expr.operator, tuple(expr.values or []))
+                    for expr in user_term.match_expressions or []
+                }
+
+                for preemptible_term in preemptible_affinity_terms:
+                    preemptible_expressions = {
+                        (expr.key, expr.operator, tuple(expr.values or []))
+                        for expr in preemptible_term.match_expressions or []
+                    }
+
+                    # Ensure operators match and preemptible expressions are present
+                    common_exprs = user_expressions & preemptible_expressions
+                    if common_exprs:
+                        formatted = ", ".join(
+                            f"'{key}  {operator}  {list(values)}'"
+                            for key, operator, values in common_exprs
+                        )
+                        conflicting_affinities.append(formatted)
+        return conflicting_affinities
+
+    def raise_preemptible_warning(
+        self,
+        node_selector: dict[str, str] | None,
+        tolerations: list[k8s_client.V1Toleration] | None,
+        affinity: k8s_client.V1Affinity | None,
+    ) -> None:
+        """
+        Detect conflicts and emit a single consolidated warning if needed.
+
+        :param node_selector: User-provided node selector.
+        :param tolerations: User-provided tolerations.
+        :param affinity: User-provided affinity.
+        :warns: PreemptionWarning - Emitted when any of the provided selectors,
+                tolerations, or affinity terms match the configured preemptible
+                settings. The message lists the conflicting items.
+        """
+        conflict_messages = []
+
+        if node_selector:
+            ns_conflicts = ", ".join(
+                self.detect_preemptible_node_selector(node_selector)
+            )
+            if ns_conflicts:
+                conflict_messages.append(f"Node selectors: {ns_conflicts}")
+
+        if tolerations:
+            tol_conflicts = ", ".join(self.detect_preemptible_tolerations(tolerations))
+            if tol_conflicts:
+                conflict_messages.append(f"Tolerations: {tol_conflicts}")
+
+        if affinity:
+            affinity_conflicts = ", ".join(self.detect_preemptible_affinity(affinity))
+            if affinity_conflicts:
+                conflict_messages.append(f"Affinity: {affinity_conflicts}")
+
+        if conflict_messages:
+            warning_componentes = "; \n".join(conflict_messages)
+            warnings.warn(
+                f"Warning: based on MLRun's preemptible node configuration, the following components \n"
+                f"may be removed or adjusted at runtime:\n"
+                f"{warning_componentes}.\n"
+                "This adjustment depends on the function's preemption mode. \n"
+                "The list of potential adjusted preemptible selectors can be viewed here: "
+                "mlrun.mlconf.get_preemptible_node_selector() and mlrun.mlconf.get_preemptible_tolerations()."
+            )
+
     def with_node_selection(
         self,
-        node_name: typing.Optional[str] = None,
-        node_selector: typing.Optional[dict[str, str]] = None,
-        affinity: typing.Optional[k8s_client.V1Affinity] = None,
-        tolerations: typing.Optional[list[k8s_client.V1Toleration]] = None,
+        node_name: str | None = None,
+        node_selector: dict[str, str] | None = None,
+        affinity: k8s_client.V1Affinity | None = None,
+        tolerations: list[k8s_client.V1Toleration] | None = None,
     ):
         """
-        Enables to control on which k8s node the job will run
+        Configure Kubernetes node scheduling for this function.
 
-        :param node_name:       The name of the k8s node
-        :param node_selector:   Label selector, only nodes with matching labels will be eligible to be picked
-        :param affinity:        Expands the types of constraints you can express - see
-                                https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity
-                                for details
-        :param tolerations:     Tolerations are applied to pods, and allow (but do not require) the pods to schedule
-                                onto nodes with matching taints - see
-                                https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration
-                                for details
+        Updates one or more scheduling hints: exact node pinning, label-based selection,
+        affinity/anti-affinity rules, and taint tolerations. Passing ``None`` leaves the
+        current value unchanged; pass an empty dict/list (e.g., ``{}``, ``[]``) to clear.
 
+        :param node_name: Exact Kubernetes node name to pin the pod to.
+        :param node_selector: Mapping of label selectors. Use ``{}`` to clear.
+        :param affinity: :class:`kubernetes.client.V1Affinity` constraints.
+        :param tolerations: List of :class:`kubernetes.client.V1Toleration`. Use ``[]`` to clear.
+        :warns: PreemptionWarning - Emitted if provided selectors/tolerations/affinity
+                conflict with the function's preemption mode.
+
+        Example usage:
+            Prefer a GPU pool and allow scheduling on spot nodes::
+
+                job.with_node_selection(
+                    node_selector={"nodepool": "gpu"},
+                    tolerations=[
+                        k8s_client.V1Toleration(key="spot", operator="Exists")
+                    ],
+                )
         """
         if node_name:
             self.spec.node_name = node_name
@@ -1231,8 +1166,13 @@ class KubeResource(BaseRuntime):
             self.spec.affinity = affinity
         if tolerations is not None:
             self.spec.tolerations = tolerations
+        self.raise_preemptible_warning(
+            node_selector=self.spec.node_selector,
+            tolerations=self.spec.tolerations,
+            affinity=self.spec.affinity,
+        )
 
-    def with_priority_class(self, name: typing.Optional[str] = None):
+    def with_priority_class(self, name: str | None = None):
         """
         Enables to control the priority of the pod
         If not passed - will default to mlrun.mlconf.default_function_priority_class_name
@@ -1363,7 +1303,10 @@ class KubeResource(BaseRuntime):
         self.apply(modifier(**mount_params_dict))
 
     def validate_and_enrich_service_account(
-        self, allowed_service_accounts, default_service_account
+        self,
+        allowed_service_accounts,
+        forbidden_service_accounts,
+        default_service_account,
     ):
         if not self.spec.service_account:
             if default_service_account:
@@ -1372,7 +1315,9 @@ class KubeResource(BaseRuntime):
                     f"Setting default service account to function: {default_service_account}"
                 )
 
-        self.spec.validate_service_account(allowed_service_accounts)
+        self.spec.validate_service_account(
+            allowed_service_accounts, forbidden_service_accounts
+        )
 
     def _configure_mlrun_build_with_source(
         self, source, workdir=None, handler=None, pull_at_runtime=True, target_dir=None
@@ -1401,7 +1346,7 @@ class KubeResource(BaseRuntime):
             self.spec.build.base_image = self.spec.build.base_image or self.spec.image
             self.spec.image = ""
 
-    def _resolve_build_with_mlrun(self, with_mlrun: typing.Optional[bool] = None):
+    def _resolve_build_with_mlrun(self, with_mlrun: bool | None = None):
         build = self.spec.build
         if with_mlrun is None:
             if build.with_mlrun is not None:
@@ -1428,12 +1373,12 @@ class KubeResource(BaseRuntime):
         self,
         builder_env: dict,
         force_build: bool,
-        mlrun_version_specifier: typing.Optional[bool],
+        mlrun_version_specifier: bool | None,
         show_on_failure: bool,
         skip_deployed: bool,
         watch: bool,
         is_kfp: bool,
-        with_mlrun: typing.Optional[bool],
+        with_mlrun: bool | None,
     ):
         # When we're in pipelines context we must watch otherwise the pipelines pod will exit before the operation
         # is actually done. (when a pipelines pod exits, the pipeline step marked as done)
@@ -1465,22 +1410,20 @@ class KubeResource(BaseRuntime):
         # Get the source target dir in case it was enriched due to loading source
         self.spec.build.source_code_target_dir = mlrun.utils.get_in(
             data, "data.spec.build.source_code_target_dir"
-        ) or mlrun.utils.get_in(data, "data.spec.clone_target_dir")
+        )
         ready = data.get("ready", False)
         if not ready:
             logger.info(
                 f"Started building image: {data.get('data', {}).get('spec', {}).get('build', {}).get('image')}"
             )
         if watch and not ready:
-            state = self._build_watch(
+            self.status.state = self._build_watch(
                 watch=watch,
                 show_on_failure=show_on_failure,
             )
-            ready = state == "ready"
-            self.status.state = state
-
-        if watch and not ready:
-            raise mlrun.errors.MLRunRuntimeError("Deploy failed")
+            ready = self.status.state == "ready"
+            if not ready:
+                raise mlrun.errors.MLRunRuntimeError("Deploy failed")
         return ready
 
     def _build_watch(
@@ -1551,6 +1494,27 @@ class KubeResource(BaseRuntime):
                     offset += len(text)
 
         return self.status.state
+
+    @staticmethod
+    def _extract_secret_name_from_value_from(
+        value_from: typing.Any,
+    ) -> str | None:
+        """Extract secret name from a V1EnvVarSource or dict representation."""
+        if isinstance(value_from, k8s_client.V1EnvVarSource):
+            if value_from.secret_key_ref:
+                return value_from.secret_key_ref.name
+        elif isinstance(value_from, dict):
+            value_from = (
+                value_from.get("valueFrom")
+                or value_from.get("value_from")
+                or value_from
+            )
+            secret_key_ref = (value_from or {}).get("secretKeyRef") or (
+                value_from or {}
+            ).get("secret_key_ref")
+            if isinstance(secret_key_ref, dict):
+                return secret_key_ref.get("name")
+        return None
 
 
 def _resolve_if_type_sanitized(attribute_name, attribute):
@@ -1648,6 +1612,10 @@ def get_sanitized_attribute(spec, attribute_name: str):
         if _resolve_if_type_sanitized(attribute_name, attribute[0]):
             return attribute
 
+    return sanitize_attribute(attribute)
+
+
+def sanitize_attribute(attribute):
     api = k8s_client.ApiClient()
     return api.sanitize_for_serialization(attribute)
 

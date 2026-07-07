@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import typing
 
 import sqlalchemy.orm
@@ -51,8 +51,8 @@ class FeatureStore(
         project: str,
         name: str,
         feature_set: mlrun.common.schemas.FeatureSet,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
         versioned: bool = True,
     ) -> str:
         if not feature_set.spec.engine:
@@ -79,8 +79,8 @@ class FeatureStore(
         project: str,
         name: str,
         feature_set_patch: dict,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
         patch_mode: mlrun.common.schemas.PatchMode = mlrun.common.schemas.PatchMode.replace,
     ) -> str:
         return self._patch_object(
@@ -99,8 +99,8 @@ class FeatureStore(
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ) -> mlrun.common.schemas.FeatureSet:
         return self._get_object(
             db_session, mlrun.common.schemas.FeatureSet, project, name, tag, uid
@@ -123,18 +123,17 @@ class FeatureStore(
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        state: typing.Optional[str] = None,
-        entities: typing.Optional[list[str]] = None,
-        features: typing.Optional[list[str]] = None,
-        labels: typing.Optional[list[str]] = None,
+        tag: str | None = None,
+        state: str | None = None,
+        entities: list[str] | None = None,
+        features: list[str] | None = None,
+        labels: list[str] | None = None,
         partition_by: mlrun.common.schemas.FeatureStorePartitionByField = None,
         rows_per_partition: int = 1,
         partition_sort_by: mlrun.common.schemas.SortField = None,
         partition_order: mlrun.common.schemas.OrderType = mlrun.common.schemas.OrderType.desc,
         format_: mlrun.common.formatters.FeatureSetFormat = mlrun.common.formatters.FeatureSetFormat.full,
     ) -> mlrun.common.schemas.FeatureSetsOutput:
-        project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().list_feature_sets(
             db_session,
             project,
@@ -156,8 +155,8 @@ class FeatureStore(
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ):
         self._delete_object(
             db_session,
@@ -168,36 +167,15 @@ class FeatureStore(
             uid,
         )
 
-    # TODO: remove in 1.9.0
-    def list_features(
-        self,
-        db_session: sqlalchemy.orm.Session,
-        project: str,
-        name: str,
-        tag: typing.Optional[str] = None,
-        entities: typing.Optional[list[str]] = None,
-        labels: typing.Optional[list[str]] = None,
-    ) -> mlrun.common.schemas.FeaturesOutput:
-        project = project or mlrun.mlconf.default_project
-        return framework.utils.singletons.db.get_db().list_features(
-            db_session,
-            project,
-            name,
-            tag,
-            entities,
-            labels,
-        )
-
     def list_features_v2(
         self,
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        entities: typing.Optional[list[str]] = None,
-        labels: typing.Optional[list[str]] = None,
+        tag: str | None = None,
+        entities: list[str] | None = None,
+        labels: list[str] | None = None,
     ) -> mlrun.common.schemas.FeaturesOutputV2:
-        project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().list_features_v2(
             db_session,
             project,
@@ -207,33 +185,14 @@ class FeatureStore(
             labels,
         )
 
-    # TODO: remove in 1.9.0
-    def list_entities(
-        self,
-        db_session: sqlalchemy.orm.Session,
-        project: str,
-        name: str,
-        tag: typing.Optional[str] = None,
-        labels: typing.Optional[list[str]] = None,
-    ) -> mlrun.common.schemas.EntitiesOutput:
-        project = project or mlrun.mlconf.default_project
-        return framework.utils.singletons.db.get_db().list_entities(
-            db_session,
-            project,
-            name,
-            tag,
-            labels,
-        )
-
     def list_entities_v2(
         self,
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        labels: typing.Optional[list[str]] = None,
+        tag: str | None = None,
+        labels: list[str] | None = None,
     ) -> mlrun.common.schemas.EntitiesOutputV2:
-        project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().list_entities_v2(
             db_session,
             project,
@@ -257,8 +216,8 @@ class FeatureStore(
         project: str,
         name: str,
         feature_vector: mlrun.common.schemas.FeatureVector,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
         versioned: bool = True,
     ) -> str:
         return self._store_object(
@@ -277,8 +236,8 @@ class FeatureStore(
         project: str,
         name: str,
         feature_vector_patch: dict,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
         patch_mode: mlrun.common.schemas.PatchMode = mlrun.common.schemas.PatchMode.replace,
     ) -> str:
         return self._patch_object(
@@ -297,8 +256,8 @@ class FeatureStore(
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ) -> mlrun.common.schemas.FeatureVector:
         return self._get_object(
             db_session,
@@ -326,15 +285,14 @@ class FeatureStore(
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        state: typing.Optional[str] = None,
-        labels: typing.Optional[list[str]] = None,
+        tag: str | None = None,
+        state: str | None = None,
+        labels: list[str] | None = None,
         partition_by: mlrun.common.schemas.FeatureStorePartitionByField = None,
         rows_per_partition: int = 1,
         partition_sort_by: mlrun.common.schemas.SortField = None,
         partition_order: mlrun.common.schemas.OrderType = mlrun.common.schemas.OrderType.desc,
     ) -> mlrun.common.schemas.FeatureVectorsOutput:
-        project = project or mlrun.mlconf.default_project
         return framework.utils.singletons.db.get_db().list_feature_vectors(
             db_session,
             project,
@@ -353,8 +311,8 @@ class FeatureStore(
         db_session: sqlalchemy.orm.Session,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ):
         self._delete_object(
             db_session,
@@ -374,7 +332,6 @@ class FeatureStore(
         ],
         versioned: bool = True,
     ) -> str:
-        project = project or mlrun.mlconf.default_project
         self._validate_and_enrich_identity_for_object_creation(project, object_)
         if isinstance(object_, mlrun.common.schemas.FeatureSet):
             return framework.utils.singletons.db.get_db().create_feature_set(
@@ -397,11 +354,10 @@ class FeatureStore(
         object_: typing.Union[
             mlrun.common.schemas.FeatureSet, mlrun.common.schemas.FeatureVector
         ],
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
         versioned: bool = True,
     ) -> str:
-        project = project or mlrun.mlconf.default_project
         self._validate_and_enrich_identity_for_object_store(
             object_, project, name, tag, uid
         )
@@ -437,11 +393,10 @@ class FeatureStore(
         project: str,
         name: str,
         object_patch: dict,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
         patch_mode: mlrun.common.schemas.PatchMode = mlrun.common.schemas.PatchMode.replace,
     ) -> str:
-        project = project or mlrun.mlconf.default_project
         self._validate_identity_for_object_patch(
             object_schema.__class__.__name__,
             object_patch,
@@ -481,12 +436,11 @@ class FeatureStore(
         object_schema: typing.ClassVar,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ) -> typing.Union[
         mlrun.common.schemas.FeatureSet, mlrun.common.schemas.FeatureVector
     ]:
-        project = project or mlrun.mlconf.default_project
         if object_schema.__name__ == mlrun.common.schemas.FeatureSet.__name__:
             return framework.utils.singletons.db.get_db().get_feature_set(
                 db_session, project, name, tag, uid
@@ -506,7 +460,6 @@ class FeatureStore(
         object_schema: typing.ClassVar,
         project: str,
     ) -> list[tuple[str, str, str]]:
-        project = project or mlrun.mlconf.default_project
         if object_schema.__name__ == mlrun.common.schemas.FeatureSet.__name__:
             return framework.utils.singletons.db.get_db().list_feature_sets_tags(
                 db_session, project
@@ -526,10 +479,9 @@ class FeatureStore(
         object_schema: typing.ClassVar,
         project: str,
         name: str,
-        tag: typing.Optional[str] = None,
-        uid: typing.Optional[str] = None,
+        tag: str | None = None,
+        uid: str | None = None,
     ):
-        project = project or mlrun.mlconf.default_project
         if object_schema.__name__ == mlrun.common.schemas.FeatureSet.__name__:
             framework.utils.singletons.db.get_db().delete_feature_set(
                 db_session, project, name, tag, uid

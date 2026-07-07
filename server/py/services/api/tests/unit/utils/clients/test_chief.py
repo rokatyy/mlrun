@@ -53,8 +53,8 @@ async def chief_client(
     try:
         yield client
     finally:
-        if client._messaging_client._session:
-            await client._messaging_client._session.close()
+        await client._messaging_client._async_sessions.async_close()
+        await client._messaging_client._sync_sessions.async_close()
 
 
 @pytest.mark.asyncio
@@ -123,9 +123,9 @@ async def test_retry_on_exception(
     chief_client: framework.utils.clients.chief.Client,
     aioresponses_mock: aioresponses_mock,
 ):
-    # ensure the session to make sure the retry options are set
-    await chief_client._messaging_client._ensure_session()
-    retry_attempts = chief_client._messaging_client._session.retry_options.attempts
+    retry_attempts = (
+        chief_client._messaging_client._async_sessions.get().retry_options.attempts
+    )
 
     task_name = "test-for-chief"
     for i in range(retry_attempts):
@@ -294,16 +294,20 @@ def _generate_background_task(
 )
 @pytest.mark.asyncio
 async def test_do_not_escape_cookie(
-    chief_client, session_cookie, expected_cookie_header
+    chief_client, session_cookie, expected_cookie_header, monkeypatch
 ):
     async def handler(request):
         assert (
-            request.headers["cookie"] == f"session={expected_cookie_header}"
+            request.headers[mlrun.common.schemas.HeaderNames.cookie]
+            == f"session={expected_cookie_header}"
         ), "Cookie header escaping is malfunctioning"
+        assert request.cookies["session"] == expected_cookie_header, (
+            "Cookie session escaping is malfunctioning"
+        )
         assert (
-            request.cookies["session"] == expected_cookie_header
-        ), "Cookie session escaping is malfunctioning"
-        assert request.headers["x-request-id"] == "test-request-id"
+            request.headers[mlrun.common.schemas.HeaderNames.x_request_id]
+            == "test-request-id"
+        )
         return aiohttp.web.Response(status=200)
 
     fastapi_app = unittest.mock.Mock()
@@ -319,8 +323,12 @@ async def test_do_not_escape_cookie(
     app.router.add_post("/api/v1/operations/migrations", handler)
     async with TestClient(TestServer(app)) as client:
         chief_client._api_url = ""
-        await chief_client._messaging_client._ensure_session()
-        chief_client._messaging_client._session._client = client
+        # Use monkeypatch to temporarily replace factory (will be auto-restored)
+        monkeypatch.setattr(
+            chief_client._messaging_client._async_sessions,
+            "_factory",
+            lambda: client,
+        )
 
         # set that to make sure session escaping is on
         # coupled with chief_client._resolve_request_kwargs_from_request logic.

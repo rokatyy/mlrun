@@ -11,17 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import base64
+import json
 import os
 import pathlib
+import re
+import shlex
 import sys
 import typing
+import urllib.parse
 from tempfile import NamedTemporaryFile
 
+import git
 import igz_mgmt
 import kubernetes.client as k8s_client
 import kubernetes.config
+import paramiko
 import pytest
 import yaml
 from deepdiff import DeepDiff
@@ -53,9 +59,9 @@ class TestMLRunSystem:
         "MLRUN_SYSTEM_TESTS_DEFAULT_SPARK_SERVICE",
     ]
 
-    model_monitoring_mandatory_env_vars = [
-        "MLRUN_MODEL_ENDPOINT_MONITORING__TSDB_CONNECTION",
-        "MLRUN_MODEL_ENDPOINT_MONITORING__STREAM_CONNECTION",
+    model_monitoring_mandatory_keys = [
+        "mlrun_model_monitoring_tsdb_profile",
+        "mlrun_model_monitoring_stream_profile",
     ]
 
     enterprise_configured = os.getenv("V3IO_API")
@@ -64,6 +70,11 @@ class TestMLRunSystem:
 
     _test_env = {}
     _old_env = {}
+    _ssh_client: paramiko.SSHClient | None = None
+
+    DATA_CLUSTER_IP_ENV = "LATEST_SYSTEM_TEST_DATA_CLUSTER_IP"
+    DATA_CLUSTER_SSH_USERNAME_ENV = "LATEST_SYSTEM_TEST_DATA_CLUSTER_SSH_USERNAME"
+    DATA_CLUSTER_SSH_PASSWORD_ENV = "LATEST_SYSTEM_TEST_DATA_CLUSTER_SSH_PASSWORD"
 
     @classmethod
     def setup_class(cls):
@@ -73,10 +84,18 @@ class TestMLRunSystem:
         cls._run_db = get_run_db()
         cls.custom_setup_class()
         cls._logger = logger.get_child(cls.__name__.lower())
-        cls.project: typing.Optional[mlrun.projects.MlrunProject] = None
+        cls.project: mlrun.projects.MlrunProject | None = None
+
+        cls.mm_tsdb_profile_data = cls._get_mm_data(
+            env, "mlrun_model_monitoring_tsdb_profile"
+        )
+        cls.mm_stream_profile_data = cls._get_mm_data(
+            env, "mlrun_model_monitoring_stream_profile"
+        )
+
         cls.uploaded_code = False
 
-        if "MLRUN_IGUAZIO_API_URL" in env:
+        if "MLRUN_IGUAZIO_API_URL" in env and "V3IO_ACCESS_KEY" in env:
             cls._igz_mgmt_client = igz_mgmt.Client(
                 endpoint=env["MLRUN_IGUAZIO_API_URL"],
                 access_key=env["V3IO_ACCESS_KEY"],
@@ -86,6 +105,15 @@ class TestMLRunSystem:
         # so even though we set the env var, we still need to directly configure
         # it in mlconf.
         mlconf.dbpath = cls._test_env["MLRUN_DBPATH"]
+
+    @staticmethod
+    def _get_mm_data(
+        env: dict[str, typing.Any], key: str
+    ) -> dict[str, typing.Any] | None:
+        data = env.get(key)
+        if isinstance(data, str):
+            data = json.loads(data)
+        return data
 
     @classmethod
     def custom_setup_class(cls):
@@ -148,6 +176,7 @@ class TestMLRunSystem:
     @classmethod
     def teardown_class(cls):
         cls.custom_teardown_class()
+        cls._disconnect_ssh()
         cls._teardown_env()
 
     def custom_setup(self):
@@ -172,7 +201,11 @@ class TestMLRunSystem:
             else cls.mandatory_env_vars
         )
         if cls._has_marker(test, cls.model_monitoring_marker_name):
-            mandatory_env_vars += cls.model_monitoring_mandatory_env_vars
+            # Use + (not +=) to avoid mutating the class variable in-place,
+            # which would permanently append to it across test runs in the same process.
+            mandatory_env_vars = (
+                mandatory_env_vars + cls.model_monitoring_mandatory_keys
+            )
 
         missing_env_vars = []
         try:
@@ -186,7 +219,7 @@ class TestMLRunSystem:
 
         return pytest.mark.skipif(
             len(missing_env_vars) > 0,
-            reason=f"This is a system test, add the needed environment variables {*mandatory_env_vars,} "
+            reason=f"This is a system test, add the needed environment variables {(*mandatory_env_vars,)} "
             f"in tests/system/env.yml. You are missing: {missing_env_vars}",
         )(test)
 
@@ -217,23 +250,20 @@ class TestMLRunSystem:
     @classmethod
     def _get_env_from_file(cls) -> dict:
         with cls.env_file_path.open() as f:
-            return yaml.safe_load(f)
+            env = yaml.safe_load(f)
+        return env if isinstance(env, dict) else {}
 
     @classmethod
     def _setup_env(cls, env: dict):
         cls._logger.debug("Setting up test environment")
         cls._test_env.update(env)
 
-        ordered_keys = mlconf.get_ordered_keys()
-
-        # Process ordered keys
-        for key in ordered_keys & env.keys():
-            cls._process_env_var(key, env[key])
-
-        # Process remaining keys
+        # Process keys
         for key, value in env.items():
-            if key not in ordered_keys:
-                cls._process_env_var(key, value)
+            if key in cls.model_monitoring_mandatory_keys:
+                # model monitoring profiles data is saved separately
+                continue
+            cls._process_env_var(key, value)
 
         # Reload the config so changes to the env vars will take effect
         mlrun.mlconf.reload()
@@ -247,11 +277,15 @@ class TestMLRunSystem:
         # Set the environment variable
         if isinstance(value, bool):
             os.environ[key] = "true" if value else "false"
-        elif value is not None:
+        elif value is not None and not isinstance(value, list | dict):
             os.environ[key] = value
 
     @classmethod
     def _setup_k8s_client(cls):
+        if cls._is_remote_kubectl_configured():
+            cls.kube_client = None
+            return
+
         def missing_kubeclient(*args, **kwargs):
             raise AttributeError("Kubeclient was not setup and is unavailable")
 
@@ -309,14 +343,14 @@ class TestMLRunSystem:
     def _verify_run_spec(
         self,
         run_spec,
-        parameters: typing.Optional[dict] = None,
-        inputs: typing.Optional[dict] = None,
-        outputs: typing.Optional[list] = None,
-        output_path: typing.Optional[str] = None,
-        function: typing.Optional[str] = None,
-        secret_sources: typing.Optional[list] = None,
-        data_stores: typing.Optional[list] = None,
-        scrape_metrics: typing.Optional[bool] = None,
+        parameters: dict | None = None,
+        inputs: dict | None = None,
+        outputs: list | None = None,
+        output_path: str | None = None,
+        function: str | None = None,
+        secret_sources: list | None = None,
+        data_stores: list | None = None,
+        scrape_metrics: bool | None = None,
     ):
         self._logger.debug("Verifying run spec", spec=run_spec)
         if parameters:
@@ -339,11 +373,11 @@ class TestMLRunSystem:
     def _verify_run_metadata(
         self,
         run_metadata,
-        uid: typing.Optional[str] = None,
-        name: typing.Optional[str] = None,
-        project: typing.Optional[str] = None,
-        labels: typing.Optional[dict] = None,
-        iteration: typing.Optional[int] = None,
+        uid: str | None = None,
+        name: str | None = None,
+        project: str | None = None,
+        labels: dict | None = None,
+        iteration: int | None = None,
     ):
         self._logger.debug("Verifying run metadata", spec=run_metadata)
         if uid:
@@ -366,23 +400,26 @@ class TestMLRunSystem:
         name: str,
         project: str,
         output_path: pathlib.Path,
-        accuracy: typing.Optional[int] = None,
-        loss: typing.Optional[int] = None,
-        best_iteration: typing.Optional[int] = None,
+        accuracy: int | None = None,
+        loss: int | None = None,
+        best_iteration: int | None = None,
         iteration_results: bool = False,
+        iteration: int | None = None,
     ):
+        fragment = "" if iteration is None else f"#{iteration}"
+
         self._logger.debug("Verifying run outputs", spec=run_outputs)
         assert run_outputs["plotly"].startswith(str(output_path))
         assert (
-            f"store://datasets/{project}/{name}_mydf#1:latest@{uid}"
+            f"store://datasets/{project}/{name}_mydf{fragment}:latest@{uid}"
             in run_outputs["mydf"]
         )
         assert (
-            f"store://artifacts/{project}/{name}_model#1:latest@{uid}"
+            f"store://artifacts/{project}/{name}_model{fragment}:latest@{uid}"
             in run_outputs["model"]
         )
         assert (
-            f"store://artifacts/{project}/{name}_html_result#1:latest@{uid}"
+            f"store://artifacts/{project}/{name}_html_result{fragment}:latest@{uid}"
             in run_outputs["html_result"]
         )
         if accuracy:
@@ -418,3 +455,351 @@ class TestMLRunSystem:
                     source_path
                 )
         self.uploaded_code = True
+
+    @staticmethod
+    def _resolve_current_git_branch_and_fork():
+        """
+        Resolve the current git branch and fork name.
+        Falls back to any available remote if 'origin' is not found.
+        """
+        repo = git.Repo(search_parent_directories=True)
+
+        # Try to get the 'origin' remote, or fall back to the first available remote
+        remote = (
+            repo.remotes.origin
+            if "origin" in repo.remotes
+            else next(iter(repo.remotes), None)
+        )
+        if remote is None:
+            raise RuntimeError("No remotes found in the Git repository.")
+
+        git_url = remote.url
+        fork = TestMLRunSystem._extract_fork(git_url)
+        branch = repo.active_branch.name
+
+        return branch, fork
+
+    @staticmethod
+    def _extract_fork(git_url: str) -> str:
+        """
+        Return the user / organisation part (“fork”) from common Git remote URLs.
+        Supports:
+          • git@github.com:<fork>/<repo>.git      (classic SSH / scp-like)
+          • https://github.com/<fork>/<repo>.git  (HTTPS)
+          • ssh://git@github.com/<fork>/<repo>.git
+          • git://github.com/<fork>/<repo>.git
+        """
+        # 1) scp-like SSH form: git@github.com:fork/repo(.git)
+        match = re.match(r"git@[^:]+:([^/]+)/", git_url)
+        if match:
+            return match.group(1)
+
+        # 2) Anything with “://” – let urlparse do the heavy lifting
+        if "://" in git_url:
+            parsed = urllib.parse.urlparse(git_url)
+            # parsed.path -> "/fork/repo.git"; we only need the first component
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 2:
+                return parts[0]
+
+        raise ValueError(f"Could not extract fork from git URL: {git_url}")
+
+    # =========================================================================
+    # Pod Log Collection for Test Failure Debugging
+    # =========================================================================
+
+    # System pod prefixes - these are shared pods, not project-specific
+    SYSTEM_POD_PREFIXES = ("mlrun-api-chief", "mlrun-api-worker")
+
+    # Default namespace for MLRun pods
+    DEFAULT_NAMESPACE = "default-tenant"
+
+    @classmethod
+    def _is_remote_kubectl_configured(cls) -> bool:
+        """Return whether data-cluster SSH credentials are available for remote kubectl."""
+        required_env_vars = (
+            cls.DATA_CLUSTER_IP_ENV,
+            cls.DATA_CLUSTER_SSH_USERNAME_ENV,
+            cls.DATA_CLUSTER_SSH_PASSWORD_ENV,
+        )
+        return all(os.environ.get(env_var) for env_var in required_env_vars)
+
+    @classmethod
+    def _ensure_ssh_connected(cls) -> None:
+        """Open an SSH session to the data cluster if not already connected."""
+        if cls._ssh_client is not None:
+            try:
+                cls._ssh_client.exec_command("true")
+                return
+            except Exception:
+                cls._disconnect_ssh()
+
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.WarningPolicy)
+        ssh_client.connect(
+            os.environ[cls.DATA_CLUSTER_IP_ENV],
+            username=os.environ[cls.DATA_CLUSTER_SSH_USERNAME_ENV],
+            password=os.environ[cls.DATA_CLUSTER_SSH_PASSWORD_ENV],
+        )
+        cls._ssh_client = ssh_client
+
+    @classmethod
+    def _disconnect_ssh(cls) -> None:
+        """Close the data-cluster SSH session if open."""
+        if cls._ssh_client is not None:
+            cls._ssh_client.close()
+            cls._ssh_client = None
+
+    @classmethod
+    def _run_remote_kubectl(cls, args: list[str]) -> tuple[str, str, int]:
+        """Run kubectl on the data cluster over SSH.
+
+        :param args: kubectl arguments (without the ``kubectl`` binary name)
+        :return: stdout, stderr, and remote exit status
+        """
+        cls._ensure_ssh_connected()
+        command = "kubectl " + " ".join(shlex.quote(arg) for arg in args)
+        assert cls._ssh_client is not None
+        _, stdout_stream, stderr_stream = cls._ssh_client.exec_command(command)
+        stdout = stdout_stream.read().decode()
+        stderr = stderr_stream.read().decode()
+        exit_status = stdout_stream.channel.recv_exit_status()
+        return stdout, stderr, exit_status
+
+    @classmethod
+    def _list_pod_names_via_ssh(cls, namespace: str) -> list[str]:
+        """List pod names in a namespace using remote kubectl."""
+        stdout, stderr, exit_status = cls._run_remote_kubectl(
+            ["get", "pods", "-n", namespace, "-o", "json"]
+        )
+        if exit_status != 0:
+            raise RuntimeError(
+                f"Failed to list pods in {namespace}: {stderr or stdout}"
+            )
+        pod_list = json.loads(stdout)
+        return [
+            item["metadata"]["name"]
+            for item in pod_list.get("items", [])
+            if item.get("metadata", {}).get("name")
+        ]
+
+    def _is_kube_client_available(self) -> bool:
+        """Check if kube_client is configured and available."""
+        try:
+            if not hasattr(self, "kube_client") or self.kube_client is None:
+                return False
+            # Test if it's a property that raises
+            _ = self.kube_client.api_client
+            return True
+        except AttributeError:
+            return False
+
+    def _is_project_pod(self, pod_name: str, project_name: str) -> bool:
+        """Check if pod belongs to the test project (name contains project name)."""
+        return project_name in pod_name
+
+    def _is_system_pod(self, pod_name: str) -> bool:
+        """Check if pod is a system pod (mlrun-api-*)."""
+        return pod_name.startswith(self.SYSTEM_POD_PREFIXES)
+
+    def _collect_single_pod_logs_via_ssh(
+        self,
+        pod_name: str,
+        namespace: str,
+        tail_lines: int,
+        since_seconds: int | None = None,
+    ) -> str | None:
+        """Collect logs from a single pod using remote kubectl."""
+        args = ["logs", "-n", namespace, pod_name, f"--tail={tail_lines}"]
+        if since_seconds is not None:
+            args.append(f"--since={since_seconds}s")
+        try:
+            stdout, stderr, exit_status = self._run_remote_kubectl(args)
+            if exit_status != 0:
+                return f"[Failed to get logs: {stderr or stdout}]"
+            self._logger.debug(
+                "Collected logs from pod via remote kubectl",
+                pod_name=pod_name,
+                lines=len(stdout.splitlines()) if stdout else 0,
+            )
+            return stdout
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to collect logs from pod via remote kubectl",
+                pod_name=pod_name,
+                exc=mlrun.errors.err_to_str(exc),
+            )
+            return f"[Failed to get logs: {exc}]"
+
+    def _collect_single_pod_logs(
+        self,
+        pod_name: str,
+        namespace: str,
+        tail_lines: int,
+        since_seconds: int | None = None,
+    ) -> str | None:
+        """Collect logs from a single pod.
+
+        :param pod_name: Name of the pod
+        :param namespace: Kubernetes namespace
+        :param tail_lines: Maximum number of lines to retrieve
+        :param since_seconds: Only return logs newer than this many seconds
+        :returns: Pod logs or error message
+        """
+        try:
+            # `_preload_content=False` + manual decode avoids kubernetes-client 36.0.1
+            # handing back `str(bytes)` (the repr `"b'\x1b...'"`) instead of the decoded
+            # log - same root cause as ML-12667.
+            resp = self.kube_client.read_namespaced_pod_log(
+                name=pod_name,
+                namespace=namespace,
+                tail_lines=tail_lines,
+                since_seconds=since_seconds,
+                _preload_content=False,
+            )
+            logs = resp.data.decode("utf-8")
+            self._logger.debug(
+                f"Collected logs from {pod_name}",
+                lines=len(logs.splitlines()) if logs else 0,
+            )
+            return logs
+        except Exception as e:
+            self._logger.warning(f"Failed to collect logs from {pod_name}: {e}")
+            return f"[Failed to get logs: {e}]"
+
+    def collect_pod_logs_on_failure(
+        self,
+        test_duration_seconds: int,
+        tail_lines: int = 1000,
+        time_buffer_seconds: int = 60,
+        namespace: str = DEFAULT_NAMESPACE,
+    ) -> dict[str, str]:
+        """Collect logs from relevant pods for debugging test failures.
+
+        Collects logs from:
+        - Project pods (name contains project_name): full logs (tail_lines)
+        - System pods (mlrun-api-*): time-bounded logs (since_seconds)
+
+        :param test_duration_seconds: How long the test ran (for since_seconds calc)
+        :param tail_lines: Maximum lines per pod (default 1000)
+        :param time_buffer_seconds: Extra seconds to add to since_seconds (default 60)
+        :param namespace: Kubernetes namespace (default: default-tenant)
+        :returns: Dictionary mapping pod names to their logs
+        """
+        if self._is_remote_kubectl_configured():
+            return self._collect_pod_logs_on_failure_via_ssh(
+                test_duration_seconds=test_duration_seconds,
+                tail_lines=tail_lines,
+                time_buffer_seconds=time_buffer_seconds,
+                namespace=namespace,
+            )
+
+        if not self._is_kube_client_available():
+            self._logger.info(
+                "kube_client not available, skipping pod log collection. "
+                "Set LATEST_SYSTEM_TEST_DATA_CLUSTER_* env vars, "
+                "MLRUN_SYSTEM_TEST_KUBECONFIG_PATH, or MLRUN_SYSTEM_TEST_KUBECONFIG."
+            )
+            return {}
+
+        project_name = self.project_name
+        since_seconds = test_duration_seconds + time_buffer_seconds
+        collected_logs = {}
+
+        try:
+            pods = self.kube_client.list_namespaced_pod(namespace)
+        except Exception as e:
+            # EKS exec tokens (aws eks get-token / aws-iam-authenticator) are short lived (~15 minutes).
+            # The kube client can hold a token loaded earlier in the test run, and long running tests can fail
+            # after it expires, causing 401 Unauthorized on log collection. If we detect 401, refresh kubeconfig
+            # (re-run exec) and retry once.
+            status = getattr(e, "status", None)
+            if status == 401 or "Unauthorized" in str(e) or "(401)" in str(e):
+                self._logger.info(
+                    f"Unauthorized listing pods in {namespace}, refreshing kube client and retrying once"
+                )
+                try:
+                    type(self)._setup_k8s_client()
+                    pods = self.kube_client.list_namespaced_pod(namespace)
+                except Exception as e2:
+                    self._logger.warning(f"Failed to list pods in {namespace}: {e2}")
+                    return {}
+            else:
+                self._logger.warning(f"Failed to list pods in {namespace}: {e}")
+                return {}
+
+        for pod in pods.items:
+            pod_name = pod.metadata.name
+
+            if self._is_project_pod(pod_name, project_name):
+                if logs := self._collect_single_pod_logs(
+                    pod_name, namespace, tail_lines, since_seconds=None
+                ):
+                    collected_logs[pod_name] = logs
+
+            elif self._is_system_pod(pod_name):
+                if logs := self._collect_single_pod_logs(
+                    pod_name, namespace, tail_lines, since_seconds=since_seconds
+                ):
+                    collected_logs[f"{pod_name} (last {since_seconds}s)"] = logs
+
+        return collected_logs
+
+    def _collect_pod_logs_on_failure_via_ssh(
+        self,
+        test_duration_seconds: int,
+        tail_lines: int = 1000,
+        time_buffer_seconds: int = 60,
+        namespace: str = DEFAULT_NAMESPACE,
+    ) -> dict[str, str]:
+        """Collect pod logs by running kubectl on the data cluster over SSH."""
+        project_name = self.project_name
+        since_seconds = test_duration_seconds + time_buffer_seconds
+        collected_logs: dict[str, str] = {}
+
+        try:
+            pod_names = self._list_pod_names_via_ssh(namespace)
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to list pods via remote kubectl",
+                namespace=namespace,
+                exc=mlrun.errors.err_to_str(exc),
+            )
+            return {}
+
+        for pod_name in pod_names:
+            if self._is_project_pod(pod_name, project_name):
+                if logs := self._collect_single_pod_logs_via_ssh(
+                    pod_name, namespace, tail_lines, since_seconds=None
+                ):
+                    collected_logs[pod_name] = logs
+
+            elif self._is_system_pod(pod_name):
+                if logs := self._collect_single_pod_logs_via_ssh(
+                    pod_name, namespace, tail_lines, since_seconds=since_seconds
+                ):
+                    collected_logs[f"{pod_name} (last {since_seconds}s)"] = logs
+
+        return collected_logs
+
+    def print_pod_logs(self, logs: dict[str, str]) -> None:
+        """Print collected pod logs for CI visibility.
+
+        :param logs: Dictionary mapping pod names to their logs
+        """
+        if not logs:
+            self._logger.info("No pod logs collected")
+            return
+
+        self._logger.info("=" * 60)
+        self._logger.info("POD LOGS FOR DEBUGGING TEST FAILURE")
+        self._logger.info("=" * 60)
+
+        for pod_name, pod_logs in logs.items():
+            self._logger.info(f"\n--- {pod_name} ---")
+            # Print directly to ensure it appears in CI output
+            print(pod_logs)
+
+        self._logger.info("=" * 60)
+        self._logger.info("END OF POD LOGS")
+        self._logger.info("=" * 60)

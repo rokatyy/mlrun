@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 # test_httpdb.py actually holds integration tests (that should be migrated to tests/integration/sdk_api/httpdb)
 # currently we are running it in the integration tests CI step so adding this file for unit tests for the httpdb
 import enum
@@ -26,9 +26,10 @@ import urllib3.exceptions
 import mlrun.artifacts.base
 import mlrun.config
 import mlrun.db.httpdb
+from mlrun.common.types import AuthenticationMode
 
 
-class SomeEnumClass(str, enum.Enum):
+class SomeEnumClass(enum.StrEnum):
     value1 = "value1"
     value2 = "value2"
 
@@ -210,34 +211,39 @@ def test_resolve_artifacts_to_tag_objects():
 
 
 @pytest.mark.parametrize(
-    "path, call_amount",
+    "method, path, call_amount",
     [
         (
+            "POST",
             "projects/default/artifacts/uid/tag",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
         (
+            "POST",
             "projects/default/artifacts/8bbaaa9f-919e-4438-8e6c-edbf6d37f3bf/v1",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
         (
+            "POST",
             "/projects/default/artifacts/uid/tag",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
-        ("run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
+        ("POST", "run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
         (
+            "POST",
             "run/default/8bbaaa9f-919e-4438-8e6c-edbf6d37f3bf",
             1 + mlrun.mlconf.http_retry_defaults.max_retries,
         ),
-        ("/run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
-        ("/not/retriable", 1),
+        ("POST", "/run/default/uid", 1 + mlrun.mlconf.http_retry_defaults.max_retries),
+        # non-retriable
+        ("POST", "/not/retriable", 1),
+        ("PUT", "user-secrets/tokens", 1),
+        ("PUT", "/user-secrets/tokens", 1),
     ],
 )
-def test_retriable_post_requests(path, call_amount):
+def test_retriable_requests(method, path, call_amount):
     mlrun.mlconf.httpdb.retry_api_call_on_exception = "enabled"
     db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
-    # init the session to make sure it will be reinitialized when needed
-    db.session = db._init_session(False)
     original_request = requests.Session.request
     requests.Session.request = unittest.mock.Mock()
     requests.Session.request.side_effect = ConnectionRefusedError(
@@ -249,7 +255,7 @@ def test_retriable_post_requests(path, call_amount):
         # Catching also MLRunRuntimeError as if the exception inherits from requests.RequestException, it will be
         # wrapped with MLRunRuntimeError
         with pytest.raises(ConnectionRefusedError):
-            db.api_call("POST", path)
+            db.api_call(method, path)
 
     assert requests.Session.request.call_count == call_amount
     requests.Session.request = original_request
@@ -310,6 +316,216 @@ def test_watch_logs_continue():
         # the first log line is printed with a newline
         assert newprint.getvalue() == "Firstrow\nSecondrowThirdrowSmiley😆�LastRow"
 
+    assert adapter.call_count == len(log_lines) + 1, (
+        "should have called the adapter once per log line, and one more time at the end of log"
+    )
+
+
+@pytest.mark.parametrize(
+    "params,expected_page_params",
+    [
+        # defaults
+        (
+            {},
+            {"page": 1, "page-size": mlrun.mlconf.httpdb.pagination.default_page_size},
+        ),
+        # override `page-size`
+        ({"page-size": 1}, {"page": 1, "page-size": 1}),
+        # override `page`
+        (
+            {"page": 2},
+            {"page": 2, "page-size": mlrun.mlconf.httpdb.pagination.default_page_size},
+        ),
+    ],
+)
+def test_resolve_page_params(params, expected_page_params):
+    db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
+    resolved_page_params = db._resolve_page_params(params)
+    assert expected_page_params == resolved_page_params
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "store_secret_token",
+        "store_secret_tokens",
+        "list_secret_tokens",
+        "delete_secret_token",
+    ],
+)
+def test_restricted_methods_in_wrong_mode(monkeypatch, method_name):
+    mlrun.mlconf.httpdb.authentication.mode = AuthenticationMode.BASIC
+    db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
+    method = getattr(db, method_name)
+    with pytest.raises(mlrun.errors.MLRunRuntimeError) as exc_info:
+        method(None)
+    assert "This method is only supported in an Iguazio V4 system" in str(
+        exc_info.value
+    )
+
+
+DEFAULTS = {
+    "job": "mlrun/mlrun",
+    "serving": "mlrun/mlrun",
+    "nuclio": "mlrun/mlrun",
+}
+
+
+@pytest.mark.parametrize(
+    "client_image_by_kind,server_image_by_kind,expected_image_by_kind",
+    [
+        # Server provides custom images for a subset of kinds
+        (
+            DEFAULTS,
+            {
+                "job": "custom/job-image",
+                "serving": "custom/serving-image",
+            },
+            {
+                "job": "custom/job-image",
+                "serving": "custom/serving-image",
+                "nuclio": "mlrun/mlrun",
+            },
+        ),
+        # Server provides custom images for all kinds
+        (
+            DEFAULTS,
+            {
+                "job": "custom/job-image",
+                "serving": "custom/serving-image",
+                "nuclio": "custom/nuclio-image",
+            },
+            {
+                "job": "custom/job-image",
+                "serving": "custom/serving-image",
+                "nuclio": "custom/nuclio-image",
+            },
+        ),
+        # User has an override and server provides another override
+        (
+            {
+                "job": "custom/job-image",
+                "serving": "mlrun/mlrun",
+                "nuclio": "mlrun/mlrun",
+            },
+            {
+                "serving": "custom/serving-image",
+            },
+            {
+                "job": "custom/job-image",
+                "serving": "custom/serving-image",
+                "nuclio": "mlrun/mlrun",
+            },
+        ),
+        # Server does not override (returns None)
+        (DEFAULTS, None, DEFAULTS),
+        # Server provides a kind not in the whitelist (dropped)
+        (DEFAULTS, {"foo": "foo"}, DEFAULTS),
+    ],
+)
+def test_client_spec_default_runtime_image_by_kind_enrichment(
+    requests_mock,
+    client_image_by_kind,
+    server_image_by_kind,
+    expected_image_by_kind,
+):
+    mlrun.mlconf.function_defaults.image_by_kind = client_image_by_kind.copy()
+
+    requests_mock.get(
+        "https://fake-url/api/v1/client-spec",
+        json={
+            "version": "v1.1.0",
+            "default_runtime_image_by_kind": server_image_by_kind,
+        },
+    )
+
+    db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
+    db.connect()
+
     assert (
-        adapter.call_count == len(log_lines) + 1
-    ), "should have called the adapter once per log line, and one more time at the end of log"
+        mlrun.mlconf.function_defaults.image_by_kind.to_dict() == expected_image_by_kind
+    )
+
+
+def test_client_spec_telemetry_sync_overrides_local(requests_mock):
+    """Operator-set telemetry values in /client-spec overwrite local mlconf.
+    Critical: bool False and the False / 0 edge cases must not be skipped
+    as if they were falsy (regression guard on the `is not None` check).
+    """
+    # Set local mlconf to something distinguishable, then verify it gets
+    # overwritten by the server's values.
+    mlrun.mlconf.telemetry.enabled = False
+    mlrun.mlconf.telemetry.otlp_endpoint = ""
+    mlrun.mlconf.telemetry.insecure = True
+    mlrun.mlconf.telemetry.model_monitoring.interval = 60
+
+    requests_mock.get(
+        "https://fake-url/api/v1/client-spec",
+        json={
+            "version": "v1.1.0",
+            "telemetry_enabled": True,
+            "telemetry_otlp_endpoint": (
+                "otel-collector.iguazio.svc.cluster.local:4317"
+            ),
+            # False (not the default True) must propagate, not be skipped
+            # as falsy.
+            "telemetry_insecure": False,
+            # Non-default integer.
+            "telemetry_model_monitoring_interval": 30,
+        },
+    )
+
+    db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
+    db.connect()
+
+    assert mlrun.mlconf.telemetry.enabled is True
+    assert (
+        mlrun.mlconf.telemetry.otlp_endpoint
+        == "otel-collector.iguazio.svc.cluster.local:4317"
+    )
+    assert mlrun.mlconf.telemetry.insecure is False
+    assert mlrun.mlconf.telemetry.model_monitoring.interval == 30
+
+    # Restore defaults so we don't leak into other tests.
+    mlrun.mlconf.telemetry.enabled = False
+    mlrun.mlconf.telemetry.otlp_endpoint = ""
+    mlrun.mlconf.telemetry.insecure = True
+    mlrun.mlconf.telemetry.model_monitoring.interval = 60
+
+
+def test_client_spec_telemetry_sync_keeps_local_when_server_omits(requests_mock):
+    """When the operator hasn't overridden telemetry config the server emits
+    None for every telemetry field — local mlconf must be preserved (e.g. an
+    env-var-set MLRUN_TELEMETRY__ENABLED=true on the dev's machine).
+    """
+    mlrun.mlconf.telemetry.enabled = True
+    mlrun.mlconf.telemetry.otlp_endpoint = "https://local-collector:4317"
+    mlrun.mlconf.telemetry.insecure = False
+    mlrun.mlconf.telemetry.model_monitoring.interval = 15
+
+    requests_mock.get(
+        "https://fake-url/api/v1/client-spec",
+        json={
+            "version": "v1.1.0",
+            # Server emits None / omits the telemetry_* fields entirely.
+            "telemetry_enabled": None,
+            "telemetry_otlp_endpoint": None,
+            "telemetry_insecure": None,
+            "telemetry_model_monitoring_interval": None,
+        },
+    )
+
+    db = mlrun.db.httpdb.HTTPRunDB("https://fake-url")
+    db.connect()
+
+    # Local values preserved.
+    assert mlrun.mlconf.telemetry.enabled is True
+    assert mlrun.mlconf.telemetry.otlp_endpoint == "https://local-collector:4317"
+    assert mlrun.mlconf.telemetry.insecure is False
+    assert mlrun.mlconf.telemetry.model_monitoring.interval == 15
+
+    # Restore defaults.
+    mlrun.mlconf.telemetry.enabled = False
+    mlrun.mlconf.telemetry.otlp_endpoint = ""
+    mlrun.mlconf.telemetry.insecure = True
+    mlrun.mlconf.telemetry.model_monitoring.interval = 60

@@ -11,19 +11,19 @@ We recommend using [pyenv](https://github.com/pyenv/pyenv#installation) to manag
 Once you have pyenv installed, you can create a new environment by running:
 
 ```bash
-pyenv install 3.9
+pyenv install 3.11
 ```
 
 To activate the environment, run:
 
 ```bash
-pyenv shell 3.9
+pyenv shell 3.11
 ```
 
 Or, set as default by running:
 
 ```bash
-pyenv global 3.9
+pyenv global 3.11
 ```
 
 
@@ -33,7 +33,7 @@ git clone git@github.com:<your username>/mlrun.git
 cd mlrun
 ```
 
-Set up a virtualenv (we recommend using [venv](https://docs.python.org/3.9/library/venv.html))
+Set up a virtualenv (we recommend using [venv](https://docs.python.org/3.11/library/venv.html))
 ```shell script
 python -m venv venv
 source venv/bin/activate
@@ -66,13 +66,13 @@ cd mlrun
 
 Create a [Conda](https://docs.anaconda.com/free/anaconda/install/index.html) environment and activate it
 ```shell script
-conda create -n mlrun python=3.9
+conda create -n mlrun python=3.11
 conda activate mlrun
 ```
 
 Then, install the dependencies
 ```shell script
-make install-conda-requirements
+make install-requirements
 ```
 
 *Or*, alternatively, you may use native Python atop the ARM64 machine, but you will need to compile some dependencies.
@@ -156,11 +156,13 @@ instance and tests that requires and can only run on a full Iguazio system.
 Any system test which isn't marked with the `@pytest.mark.enterprise` marker can run on MLRun Community Edition which
 incidentally can also be installed locally on a developer machine.
 
+
+
 In the `tests/system/` directory exist test suites to run against a running system, in order to test full MLRun flows.
 
 ### Setting Up an MLRun Community Edition Instance for System Tests
 
-You can follow the [Install MLRun on Kubernetes](https://docs.mlrun.org/en/latest/install/kubernetes.html) guide to 
+You can follow the [Install MLRun on Kubernetes](https://docs.mlrun.org/en/latest/install-mlrun-ce/kubernetes-install.html) guide to 
 install an instance of MLRun Community Edition on your local machine. Notice the mentioned prerequisites and make sure 
 you have some kubernetes cluster running locally. 
 You can use [minikube](https://minikube.sigs.k8s.io/docs/start/) for this purpose (however this will require an extra step, see below).
@@ -194,6 +196,26 @@ minikube -n mlrun service mlrun-api
 ```
 Which will tunnel the MLRun api service to your local machine. You can then use the url that is outputted by this command
 to set the `MLRUN_DBPATH` environment variable.
+
+### Optional: PostgreSQL support for testing
+
+If you want **PostgreSQL support when running tests**, you need to install system dependencies required by `psycopg2`.
+
+**macOS:**
+```shell
+brew install postgresql
+export PATH="$(brew --prefix postgresql)/bin:$PATH"
+```
+**Debian based distributions:**
+```shell
+sudo apt-get update
+sudo apt-get install -y libpq-dev build-essential python3-dev postgresql-client
+```
+
+And then install the relevant Python package:
+```shell
+pip install pytest-mock-resources[postgres]
+```
 
 ### Adding System Tests
 
@@ -273,22 +295,15 @@ Currently, this can only be done by one of the maintainers, the process is:
 3. Go to the [system test action](https://github.com/mlrun/mlrun/actions?query=workflow%3A%22System+Tests%22) and trigger 
 it for the branch, change "Take tested code from action REF" to `true`   
 
-## Migrating to Python 3.9
+## Migrating to Python 3.11
+Starting with MLRun v1.11.0, MLRun supports Python 3.11 only.
+Python versions earlier than 3.11 are no longer supported.
+If your environment is currently running on Python 3.9, you must upgrade to a Python 3.11 interpreter. 
 
-MLRun moved to Python 3.9 from 1.3.0.  
-If you are working on MLRun 1.2.x or earlier, you will need to switch between python 3.9 and python 3.7 interpreters.
-To work with multiple python interpreters, we recommend using _pyenv_ (see [Creating a development environment](#creating-a-development-environment)).
-Once you have pyenv installed, create multiple `venv` for each Python version, so when you switch between them, you will
-have the correct dependencies installed. You can manage and switch venvs through PyCharm project settings.
-
-e.g.:
-
-```bash
-pyenv shell 3.9
-pyenv virtualenv mlrun
-
-pyenv shell 3.7
-pyenv virtualenv mlrun37
+Example:
+```
+pyenv shell 3.11
+pyenv virtualenv mlrun311
 ```
 
 ### Python Code Conventions:
@@ -327,6 +342,32 @@ def function_name(parameter1, parameter2):
 	# Function implementation
 ```
 
+Bulleted lists in docstrings do not throw an error if they are incorrectly formatted. Build the doc locally to 
+check the formatting. The basic rules are:
+- Add a blank line before and after bulleted lines
+- Nested bulleted lists also need a blank line before and after
+- If the text of the bullet exceeds one line, indent the second line by 2 spaces.
+Example:
+```
+        :param creation_strategy: Strategy for creating or updating the model endpoint:
+
+                           - **overwrite**:
+                           
+                           1. If model endpoints with the same name exist, delete the `latest` one.
+                           2. Create a new model endpoint entry and set it as `latest`.
+
+                           - **inplace** (default):
+                           
+                           1. If model endpoints with the same name exist, update the `latest` entry.
+                           2. Otherwise, create a new entry.
+
+        :param labels: Filter artifacts by label key-value pairs or key existence. This can be provided as:
+
+                       - A dictionary in the format `{"label": "value"}` to match specific label key-value pairs,
+                         or `{"label": None}` to check for key existence.
+                         
+        :param since: Not in use in :py:class:`HTTPRunDB`.					
+```
 15. When calling functions with multiple parameters, prefer using keyword arguments to improve readability and clarity.
 16. Logging: use structured variable instead of f-strings, for example: `logger.debug("Message", var1=var1, ...)`, and
 try to avoid logging large objects which are hard to decipher.
@@ -336,50 +377,9 @@ try to avoid logging large objects which are hard to decipher.
 
 1. When converting an error object to a string representation, instead of using: `str(error)` use: `mlrun.errors.err_to_str(error)`
 2. Use `mlrun.mlconf` Instead of `mlrun.config.config`.
-3. When deprecating a parameter/method/class we keep backwards compatibility for 2 minor versions.
-For example if we deprecated a parameter in 1.6.0, it will be removed in 1.8.0.
-Always specify what should be used instead. If there is nothing to be used instead, specify why.
-
-* Deprecating a parameter:
-Check if the parameter is given and output a FutureWarning and add a TODO with when this should be removed to
-help developers keep track.
-for example:
-
-```
-if uid:
-	warnings.warn(
-		"'uid' is deprecated in 1.6.0 and will be removed in 1.8.0, use 'tree' instead.",
-		# TODO: Remove this in 1.8.0
-		FutureWarning,
-	)
-```
-
-* Deprecating a method:
-Use 'deprecated'
-
-```
-# TODO: remove in 1.6.0
-@deprecated(
-	version="1.4.0",
-	reason="'verify_base_image' will be removed in 1.6.0, use 'prepare_image_for_deploy' instead",
-	category=FutureWarning,
-)
-def verify_base_image(self):
-```
-
-* Deprecating a class:
-
-```
-# TODO: Remove in 1.7.0
-@deprecated(
-	version="1.5.0",
-	reason="v1alpha1 mpi will be removed in 1.7.0, use v1 instead",
-	category=FutureWarning,
-)
-class MpiRuntimeV1Alpha1(AbstractMPIJobRuntime):
-```
+3. See the dedicated [Deprecation Guidelines](./DEPRECATION.md) document for the full process, examples, and checklist.
 4. Minimize imports and avoid unnecessary dependencies in client code.
-5. Scale performance: be caution when executing large queries in order to prevent overloading the database.
+5. Scale performance: be cautious when executing large queries in order to prevent overloading the database.
 
 ## MySQL changes
 

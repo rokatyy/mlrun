@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import abc
 import datetime
-import typing
 
 import mlrun.common.schemas
 
@@ -25,6 +24,7 @@ class Member(abc.ABC):
         self,
         session: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
         wait_for_completion: bool = True,
     ) -> bool:
         pass
@@ -35,6 +35,7 @@ class Member(abc.ABC):
         session: str,
         name: str,
         project: mlrun.common.schemas.Project,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ):
         pass
 
@@ -43,6 +44,7 @@ class Member(abc.ABC):
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
         deletion_strategy: mlrun.common.schemas.DeletionStrategy = mlrun.common.schemas.DeletionStrategy.default(),
         wait_for_completion: bool = True,
     ) -> bool:
@@ -52,8 +54,9 @@ class Member(abc.ABC):
     def list_projects(
         self,
         session: str,
-        updated_after: typing.Optional[datetime.datetime] = None,
-    ) -> tuple[list[mlrun.common.schemas.Project], typing.Optional[datetime.datetime]]:
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
+        updated_after: datetime.datetime | None = None,
+    ) -> tuple[list[mlrun.common.schemas.Project], datetime.datetime | None]:
         pass
 
     @abc.abstractmethod
@@ -61,6 +64,7 @@ class Member(abc.ABC):
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.Project:
         pass
 
@@ -75,5 +79,6 @@ class Member(abc.ABC):
         self,
         session: str,
         name: str,
+        auth_info: mlrun.common.schemas.AuthInfo = mlrun.common.schemas.AuthInfo(),
     ) -> mlrun.common.schemas.ProjectOwner:
         pass

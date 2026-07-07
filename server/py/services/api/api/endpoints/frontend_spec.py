@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-import typing
+
 
 import fastapi
 import semver
 
 import mlrun.common.schemas
+import mlrun.common.types
 import mlrun.runtimes
 import mlrun.runtimes.utils
 import mlrun.utils.helpers
@@ -25,7 +25,7 @@ from mlrun.config import config
 from mlrun.platforms import is_iguazio_session_cookie
 
 import framework.api.deps
-import framework.utils.clients.iguazio
+import framework.utils.clients.iguazio.v3
 import framework.utils.runtimes.nuclio
 import services.api.utils.builder
 from framework.api.utils import get_allowed_path_prefixes_list
@@ -99,11 +99,11 @@ def try_get_grafana_service_url(session):
     if mlrun.mlconf.grafana_url:
         return mlrun.mlconf.grafana_url
     else:
-        iguazio_client = framework.utils.clients.iguazio.Client()
+        iguazio_client = framework.utils.clients.iguazio.v3.Client()
         return iguazio_client.try_get_grafana_service_url(session)
 
 
-def _resolve_jobs_dashboard_url(session: str) -> typing.Optional[str]:
+def _resolve_jobs_dashboard_url(session: str) -> str | None:
     grafana_service_url = try_get_grafana_service_url(session)
     if grafana_service_url:
         # FIXME: this creates a heavy coupling between mlrun and the grafana dashboard (name and filters) + org id
@@ -115,7 +115,7 @@ def _resolve_jobs_dashboard_url(session: str) -> typing.Optional[str]:
     return None
 
 
-def _resolve_model_monitoring_dashboard_url(session: str) -> typing.Optional[str]:
+def _resolve_model_monitoring_dashboard_url(session: str) -> str | None:
     grafana_service_url = try_get_grafana_service_url(session)
     if grafana_service_url:
         return grafana_service_url + (
@@ -129,7 +129,7 @@ def _resolve_feature_flags() -> mlrun.common.schemas.FeatureFlags:
     project_membership = mlrun.common.schemas.ProjectMembershipFeatureFlag.disabled
     if mlrun.mlconf.httpdb.authorization.mode == "opa":
         project_membership = mlrun.common.schemas.ProjectMembershipFeatureFlag.enabled
-    authentication = mlrun.common.schemas.AuthenticationFeatureFlag(
+    authentication = mlrun.common.types.AuthenticationMode(
         mlrun.mlconf.httpdb.authentication.mode
     )
     nuclio_streams = mlrun.common.schemas.NuclioStreamsFeatureFlag.disabled

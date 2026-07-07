@@ -11,11 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import datetime
+import os
+import os.path
 import tempfile
 import urllib.parse
 from base64 import b64encode
-from os import path, remove
-from typing import Optional, Union
+from copy import copy
+from types import ModuleType
+from typing import Union
 from urllib.parse import urlparse
 
 import fsspec
@@ -24,10 +28,11 @@ import pandas as pd
 import pyarrow
 import pytz
 import requests
-from deprecated import deprecated
 
+import mlrun.common.schemas
 import mlrun.config
 import mlrun.errors
+from mlrun.datastore.remote_client import BaseRemoteClient
 from mlrun.errors import err_to_str
 from mlrun.utils import StorePrefix, is_jupyter, logger
 
@@ -45,20 +50,19 @@ class FileStats:
         return f"FileStats(size={self.size}, modified={self.modified}, type={self.content_type})"
 
 
-class DataStore:
+class DataStore(BaseRemoteClient):
     using_bucket = False
 
-    def __init__(self, parent, name, kind, endpoint="", secrets: Optional[dict] = None):
-        self._parent = parent
-        self.kind = kind
-        self.name = name
-        self.endpoint = endpoint
+    def __init__(
+        self, parent, name, kind, endpoint="", secrets: dict | None = None, **kwargs
+    ):
+        super().__init__(
+            parent=parent, kind=kind, name=name, endpoint=endpoint, secrets=secrets
+        )
         self.subpath = ""
-        self.secret_pfx = ""
         self.options = {}
         self.from_spec = False
         self._filesystem = None
-        self._secrets = secrets or {}
 
     @property
     def is_structured(self):
@@ -67,13 +71,6 @@ class DataStore:
     @property
     def is_unstructured(self):
         return True
-
-    @staticmethod
-    def _sanitize_storage_options(options):
-        if not options:
-            return {}
-        options = {k: v for k, v in options.items() if v is not None and v != ""}
-        return options
 
     @staticmethod
     def _sanitize_url(url):
@@ -95,18 +92,8 @@ class DataStore:
     def uri_to_ipython(endpoint, subpath):
         return ""
 
-    # TODO: remove in 1.8.0
-    @deprecated(
-        version="1.8.0",
-        reason="'get_filesystem()' will be removed in 1.8.0, use "
-        "'filesystem' property instead",
-        category=FutureWarning,
-    )
-    def get_filesystem(self):
-        return self.filesystem
-
     @property
-    def filesystem(self) -> Optional[fsspec.AbstractFileSystem]:
+    def filesystem(self) -> fsspec.AbstractFileSystem | None:
         """return fsspec file system object, if supported"""
         return None
 
@@ -114,15 +101,9 @@ class DataStore:
         """Whether the data store supports isdir"""
         return True
 
-    def _get_secret_or_env(self, key, default=None, prefix=None):
-        # Project-secrets are mounted as env variables whose name can be retrieved from SecretsStore
-        return mlrun.get_secret_or_env(
-            key, secret_provider=self._get_secret, default=default, prefix=prefix
-        )
-
     def get_storage_options(self):
         """get fsspec storage options"""
-        return self._sanitize_storage_options(None)
+        return self._sanitize_options(None)
 
     def open(self, filepath, mode):
         file_system = self.filesystem
@@ -132,16 +113,6 @@ class DataStore:
         if self.subpath:
             return f"{self.subpath}/{key}"
         return key
-
-    def _get_parent_secret(self, key):
-        return self._parent.secret(self.secret_pfx + key)
-
-    def _get_secret(self, key: str, default=None):
-        return self._secrets.get(key, default) or self._get_parent_secret(key)
-
-    @property
-    def url(self):
-        return f"{self.kind}://{self.endpoint}"
 
     @property
     def spark_url(self):
@@ -186,8 +157,197 @@ class DataStore:
     def upload(self, key, src_path):
         pass
 
-    def get_spark_options(self):
+    def get_spark_options(self, path=None):
         return {}
+
+    @staticmethod
+    def _is_directory_in_range(
+        start_time: datetime.datetime | None,
+        end_time: datetime.datetime | None,
+        year: int,
+        month: int | None = None,
+        day: int | None = None,
+        hour: int | None = None,
+        **kwargs,
+    ):
+        """Check if a partition directory (year=.., month=.., etc.) is in the time range."""
+        from dateutil.relativedelta import relativedelta
+
+        partition_start = datetime.datetime(
+            year=year,
+            month=month or 1,
+            day=day or 1,
+            hour=hour or 0,
+            tzinfo=start_time.tzinfo if start_time else end_time.tzinfo,
+        )
+        partition_end = (
+            partition_start
+            + relativedelta(
+                years=1 if month is None else 0,
+                months=1 if day is None and month is not None else 0,
+                days=1 if hour is None and day is not None else 0,
+                hours=1 if hour is not None else 0,
+            )
+            - datetime.timedelta(microseconds=1)
+        )
+
+        if (end_time and end_time < partition_start) or (
+            start_time and start_time > partition_end
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _list_partition_paths_helper(
+        paths: list[str],
+        start_time: datetime.datetime | None,
+        end_time: datetime.datetime | None,
+        current_path: str,
+        partition_level: str,
+        filesystem,
+    ):
+        directory_split = current_path.rsplit("/", 1)
+        time_unit = None
+        directory_start, directory_end = "", ""
+        if len(directory_split) == 2:
+            directory_start, directory_end = directory_split
+            time_unit = directory_end.split("=")[0] if "=" in directory_end else None
+
+        if not time_unit and directory_end.endswith((".parquet", ".pq")):
+            paths.append(directory_start.rstrip("/"))
+            return
+        elif time_unit and time_unit == partition_level:
+            paths.append(current_path.rstrip("/"))
+            return
+
+        directories = filesystem.ls(current_path, detail=True)
+        if len(directories) == 0:
+            return
+        for directory in directories:
+            current_path = directory["name"]
+            parts = [p for p in current_path.split("/") if "=" in p]
+            kwargs = {}
+            for part in parts:
+                key, value = part.split("=", 1)
+                if value.isdigit():
+                    value = int(value)
+                kwargs[key] = value
+            if DataStore._is_directory_in_range(start_time, end_time, **kwargs):
+                DataStore._list_partition_paths_helper(
+                    paths,
+                    start_time,
+                    end_time,
+                    current_path,
+                    partition_level,
+                    filesystem,
+                )
+
+    @staticmethod
+    def _list_partitioned_paths(
+        base_url: str,
+        start_time: datetime.datetime | None,
+        end_time: datetime.datetime | None,
+        partition_level: str,
+        filesystem,
+    ):
+        paths = []
+        parsed_base_url = urlparse(base_url)
+        base_path = parsed_base_url.path
+
+        if parsed_base_url.scheme not in ["v3io", "v3ios"]:
+            base_path = parsed_base_url.netloc + base_path
+
+        DataStore._list_partition_paths_helper(
+            paths, start_time, end_time, base_path, partition_level, filesystem
+        )
+        paths = [
+            DataStore._reconstruct_path_from_base_url(parsed_base_url, path)
+            for path in paths
+        ]
+        return paths
+
+    @staticmethod
+    def _reconstruct_path_from_base_url(
+        parsed_base_url: urllib.parse.ParseResult, returned_path: str
+    ) -> str:
+        scheme = parsed_base_url.scheme
+        authority = parsed_base_url.netloc
+        returned_path = returned_path.lstrip("/")
+        if scheme == "v3io":
+            return f"{scheme}://{authority}/{returned_path}"
+        else:
+            return f"{scheme}://{returned_path}"
+
+    @staticmethod
+    def _clean_filters_for_partitions(
+        filters: list[list[tuple]],
+        partition_keys: list[str],
+    ):
+        """
+        Remove partition keys from filters.
+
+        :param filters: pandas-style filters
+                Example: [[('year','=',2025),('month','=',11),('timestamp','>',ts1)]]
+        :param partition_keys: partition columns handled via directory
+
+        :return list of list of tuples: cleaned filters without partition keys
+        """
+        cleaned_filters = []
+        for group in filters:
+            new_group = [f for f in group if f[0] not in partition_keys]
+            if new_group:
+                cleaned_filters.append(new_group)
+        return cleaned_filters
+
+    @staticmethod
+    def _read_partitioned_parquet(
+        base_url: str,
+        start_time: datetime.datetime | None,
+        end_time: datetime.datetime | None,
+        partition_keys: list[str],
+        df_module: ModuleType,
+        filesystem: fsspec.AbstractFileSystem,
+        **kwargs,
+    ):
+        """
+        Reads only the relevant partitions and concatenates the results.
+        Note that partition_keys cannot be empty.
+        """
+        logger.debug(f"Starting partition discovery process for {base_url}")
+
+        paths = DataStore._list_partitioned_paths(
+            base_url,
+            start_time,
+            end_time,
+            partition_keys[-1],
+            filesystem,
+        )
+
+        dfs = []
+        for current_path in paths:
+            try:
+                kwargs["filters"] = DataStore._clean_filters_for_partitions(
+                    kwargs["filters"], partition_keys
+                )
+                df = df_module.read_parquet(current_path, **kwargs)
+                logger.debug(
+                    "Finished reading DataFrame from subpath",
+                    url=current_path,
+                )
+                dfs.append(df)
+            except FileNotFoundError as e:
+                # Skip partitions that don't exist or have no data
+                logger.warning(
+                    "Failed to read DataFrame", url=current_path, exception=e
+                )
+
+        final_df = pd.concat(dfs) if dfs else pd.DataFrame()
+        logger.debug(
+            "Finished reading partitioned parquet files",
+            url=base_url,
+            columns=final_df.columns,
+        )
+        return final_df
 
     @staticmethod
     def _parquet_reader(
@@ -198,6 +358,7 @@ class DataStore:
         start_time,
         end_time,
         additional_filters,
+        optimize_discovery,
     ):
         from storey.utils import find_filters, find_partitions
 
@@ -236,7 +397,10 @@ class DataStore:
                 )
 
             if start_time or end_time or additional_filters:
-                partitions_time_attributes = find_partitions(url, file_system)
+                partitions_time_attributes, partitions = find_partitions(
+                    url, file_system
+                )
+                logger.debug("Partitioned parquet read", partitions=partitions)
                 set_filters(
                     partitions_time_attributes,
                     start_time,
@@ -244,8 +408,28 @@ class DataStore:
                     additional_filters,
                     kwargs,
                 )
+
                 try:
-                    return df_module.read_parquet(*args, **kwargs)
+                    if (
+                        optimize_discovery
+                        and partitions_time_attributes
+                        and DataStore._verify_path_partition_level(
+                            urlparse(url).path, partitions
+                        )
+                        and (start_time or end_time)
+                    ):
+                        return DataStore._read_partitioned_parquet(
+                            url,
+                            start_time,
+                            end_time,
+                            partitions_time_attributes,
+                            df_module,
+                            file_system,
+                            **kwargs,
+                        )
+
+                    else:
+                        return df_module.read_parquet(*args, **kwargs)
                 except pyarrow.lib.ArrowInvalid as ex:
                     if not str(ex).startswith(
                         "Cannot compare timestamp with timezone to timestamp without timezone"
@@ -271,7 +455,24 @@ class DataStore:
                         additional_filters,
                         kwargs,
                     )
-                    return df_module.read_parquet(*args, **kwargs)
+                    if (
+                        optimize_discovery
+                        and partitions_time_attributes
+                        and DataStore._verify_path_partition_level(
+                            urlparse(url).path, partitions
+                        )
+                    ):
+                        return DataStore._read_partitioned_parquet(
+                            url,
+                            start_time_inner,
+                            end_time_inner,
+                            partitions_time_attributes,
+                            df_module,
+                            file_system,
+                            **kwargs,
+                        )
+                    else:
+                        return df_module.read_parquet(*args, **kwargs)
             else:
                 return df_module.read_parquet(*args, **kwargs)
 
@@ -294,6 +495,10 @@ class DataStore:
         file_url = self._sanitize_url(url)
         is_csv, is_json, drop_time_column = False, False, False
         file_system = self.filesystem
+
+        # Feature flag optimize partition discovery by providing specific partition levels urls to the parquet reader
+        optimize_discovery = kwargs.pop("optimize_discovery", True)
+
         if file_url.endswith(".csv") or format == "csv":
             is_csv = True
             drop_time_column = False
@@ -355,6 +560,7 @@ class DataStore:
                 start_time,
                 end_time,
                 additional_filters,
+                optimize_discovery,
             )
 
         elif file_url.endswith(".json") or format == "json":
@@ -380,7 +586,7 @@ class DataStore:
             temp_file = tempfile.NamedTemporaryFile(delete=False)
             self.download(self._join(subpath), temp_file.name)
             df = reader(temp_file.name, **kwargs)
-            remove(temp_file.name)
+            os.remove(temp_file.name)
 
         if is_json or is_csv:
             # for parquet file the time filtering is executed in `reader`
@@ -419,6 +625,26 @@ class DataStore:
             return df_module == dd
         except ImportError:
             return False
+
+    @staticmethod
+    def _verify_path_partition_level(base_path: str, partitions: list[str]) -> bool:
+        if not partitions:
+            return False
+
+        path_parts = base_path.strip("/").split("/")
+        path_parts = [part.split("=")[0] for part in path_parts if "=" in part]
+        if "hour" in partitions:
+            hour_index = partitions.index("hour")
+        else:
+            return False
+        for i, part in enumerate(partitions):
+            if not (
+                part in path_parts
+                or part in ["year", "month", "day", "hour"]
+                or i > hour_index
+            ):
+                return False
+        return True
 
 
 class DataItem:
@@ -472,7 +698,7 @@ class DataItem:
     @property
     def suffix(self):
         """DataItem suffix (file extension) e.g. '.png'"""
-        _, file_ext = path.splitext(self._path)
+        _, file_ext = os.path.splitext(self._path)
         return file_ext
 
     @property
@@ -502,9 +728,9 @@ class DataItem:
 
     def get(
         self,
-        size: Optional[int] = None,
+        size: int | None = None,
         offset: int = 0,
-        encoding: Optional[str] = None,
+        encoding: str | None = None,
     ) -> Union[bytes, str]:
         """read all or a byte range and return the content
 
@@ -581,7 +807,7 @@ class DataItem:
             return
 
         if self._local_path:
-            remove(self._local_path)
+            os.remove(self._local_path)
             self._local_path = ""
 
     def as_df(
@@ -625,7 +851,7 @@ class DataItem:
         )
         return df
 
-    def show(self, format: Optional[str] = None) -> None:
+    def show(self, format: str | None = None) -> None:
         """show the data object content in Jupyter
 
         :param format: format to use (when there is no/wrong suffix), e.g. 'png'
@@ -681,14 +907,14 @@ def basic_auth_header(user, password):
     username = user.encode("latin1")
     password = password.encode("latin1")
     base = b64encode(b":".join((username, password))).strip()
-    authstr = "Basic " + base.decode("ascii")
-    return {"Authorization": authstr}
+    authstr = mlrun.common.schemas.AuthorizationHeaderPrefixes.basic + base.decode(
+        "ascii"
+    )
+    return {mlrun.common.schemas.HeaderNames.authorization: authstr}
 
 
 class HttpStore(DataStore):
-    def __init__(
-        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
-    ):
+    def __init__(self, parent, schema, name, endpoint="", secrets: dict | None = None):
         super().__init__(parent, name, schema, endpoint, secrets)
         self._https_auth_token = None
         self._schema = schema
@@ -714,7 +940,11 @@ class HttpStore(DataStore):
         raise ValueError("unimplemented")
 
     def get(self, key, size=None, offset=0):
-        data = self._http_get(self.url + self._join(key), self._headers, self.auth)
+        headers = self._headers
+        if urlparse(self.url).hostname == "api.github.com":
+            headers = copy(self._headers)
+            headers["Accept"] = headers.get("Accept", "application/vnd.github.raw")
+        data = self._http_get(self.url + self._join(key), headers, self.auth)
         if offset:
             data = data[offset:]
         if size:
@@ -725,7 +955,10 @@ class HttpStore(DataStore):
         token = self._get_secret_or_env("HTTPS_AUTH_TOKEN")
         if token:
             self._https_auth_token = token
-            self._headers.setdefault("Authorization", f"token {token}")
+            self._headers.setdefault(
+                mlrun.common.schemas.HeaderNames.authorization,
+                f"{mlrun.common.schemas.AuthorizationHeaderPrefixes.bearer}{token}",
+            )
 
     def _validate_https_token(self):
         if self._https_auth_token and self._schema in ["http"]:

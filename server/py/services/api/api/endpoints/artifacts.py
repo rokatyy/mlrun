@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from http import HTTPStatus
-from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -21,7 +20,6 @@ from sqlalchemy.orm import Session
 
 import mlrun.common.formatters
 import mlrun.common.schemas
-from mlrun.config import config
 from mlrun.utils import logger
 
 import framework.utils.auth.verifier
@@ -201,10 +199,10 @@ async def delete_artifact(
 
 @router.get("/projects/{project}/artifacts")
 async def list_artifacts(
-    project: Optional[str] = None,
-    name: Optional[str] = None,
-    tag: Optional[str] = None,
-    kind: Optional[str] = None,
+    project: str | None = None,
+    name: str | None = None,
+    tag: str | None = None,
+    kind: str | None = None,
     category: mlrun.common.schemas.ArtifactCategories = None,
     labels: list[str] = Query([], alias="label"),
     iter: int = Query(None, ge=0),
@@ -214,8 +212,8 @@ async def list_artifacts(
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
 ):
-    if project is None:
-        project = config.default_project
+    if not project:
+        raise mlrun.errors.MLRunMissingProjectError()
     await framework.utils.auth.verifier.AuthVerifier().query_project_permissions(
         project,
         mlrun.common.schemas.AuthorizationAction.read,
@@ -268,15 +266,17 @@ async def list_artifacts(
 
 @router.delete("/projects/{project}/artifacts")
 async def delete_artifacts(
-    project: Optional[str] = None,
+    project: str | None = None,
     name: str = "",
     tag: str = "",
     labels: list[str] = Query([], alias="label"),
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
 ):
+    if not project:
+        raise mlrun.errors.MLRunMissingProjectError()
     return await _delete_artifacts(
-        project=project or mlrun.mlconf.default_project,
+        project=project,
         name=name,
         tag=tag,
         labels=labels,
@@ -286,10 +286,10 @@ async def delete_artifacts(
 
 
 async def _delete_artifacts(
-    project: Optional[str] = None,
-    name: Optional[str] = None,
-    tag: Optional[str] = None,
-    labels: Optional[list[str]] = None,
+    project: str | None = None,
+    name: str | None = None,
+    tag: str | None = None,
+    labels: list[str] | None = None,
     auth_info: mlrun.common.schemas.AuthInfo = None,
     db_session: Session = None,
 ):

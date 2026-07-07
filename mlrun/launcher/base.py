@@ -14,10 +14,16 @@
 import abc
 import ast
 import copy
+import difflib
+import inspect
 import os
 import uuid
-from typing import Any, Callable, Optional, Union
+import warnings
+from collections.abc import Callable
+from typing import Any, Union
 
+import mlrun.common.constants
+import mlrun.common.runtimes.constants
 import mlrun.common.schemas
 import mlrun.config
 import mlrun.errors
@@ -40,37 +46,55 @@ class BaseLauncher(abc.ABC):
     """
 
     def __init__(self, **kwargs):
-        pass
+        if not kwargs:
+            return
+
+        valid_launch_params = self._get_valid_launcher_params()
+        for key in sorted(kwargs):
+            if key in valid_launch_params:
+                continue
+
+            suggestion = ""
+            close_match = difflib.get_close_matches(
+                key, valid_launch_params, n=1, cutoff=0.8
+            )
+            if close_match:
+                suggestion = f" Did you mean '{close_match[0]}'?"
+
+            warnings.warn(
+                f"Unexpected run keyword argument '{key}' was ignored.{suggestion}",
+                UserWarning,
+                stacklevel=3,
+            )
 
     @abc.abstractmethod
     def launch(
         self,
         runtime: "mlrun.runtimes.BaseRuntime",
-        task: Optional[
-            Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict]
-        ] = None,
-        handler: Optional[Union[str, Callable]] = None,
-        name: Optional[str] = "",
-        project: Optional[str] = "",
-        params: Optional[dict] = None,
-        inputs: Optional[dict[str, str]] = None,
-        out_path: Optional[str] = "",
-        workdir: Optional[str] = "",
-        artifact_path: Optional[str] = "",
-        watch: Optional[bool] = True,
-        schedule: Optional[
-            Union[str, mlrun.common.schemas.schedule.ScheduleCronTrigger]
-        ] = None,
-        hyperparams: Optional[dict[str, list]] = None,
-        hyper_param_options: Optional[mlrun.model.HyperParamOptions] = None,
-        verbose: Optional[bool] = None,
-        scrape_metrics: Optional[bool] = None,
-        local_code_path: Optional[str] = None,
-        auto_build: Optional[bool] = None,
-        param_file_secrets: Optional[dict[str, str]] = None,
-        notifications: Optional[list[mlrun.model.Notification]] = None,
-        returns: Optional[list[Union[str, dict[str, str]]]] = None,
-        state_thresholds: Optional[dict[str, int]] = None,
+        task: Union["mlrun.run.RunTemplate", "mlrun.run.RunObject", dict] | None = None,
+        handler: Union[str, Callable] | None = None,
+        name: str | None = "",
+        project: str | None = "",
+        params: dict | None = None,
+        inputs: dict[str, str | list | dict] | None = None,
+        out_path: str | None = "",
+        workdir: str | None = "",
+        artifact_path: str | None = "",
+        output_path: str | None = "",
+        watch: bool | None = True,
+        schedule: Union[str, mlrun.common.schemas.schedule.ScheduleCronTrigger]
+        | None = None,
+        hyperparams: dict[str, list] | None = None,
+        hyper_param_options: mlrun.model.HyperParamOptions | None = None,
+        verbose: bool | None = None,
+        scrape_metrics: bool | None = None,
+        local_code_path: str | None = None,
+        auto_build: bool | None = None,
+        param_file_secrets: dict[str, str] | None = None,
+        notifications: list[mlrun.model.Notification] | None = None,
+        returns: list[Union[str, dict[str, str]]] | None = None,
+        state_thresholds: dict[str, int] | None = None,
+        retry: Union[mlrun.model.Retry, dict] | None = None,
     ) -> "mlrun.run.RunObject":
         """run the function from the server/client[local/remote]"""
         pass
@@ -79,8 +103,9 @@ class BaseLauncher(abc.ABC):
     def enrich_runtime(
         self,
         runtime: "mlrun.runtimes.base.BaseRuntime",
-        project_name: Optional[str] = "",
+        project_name: str | None = "",
         full: bool = True,
+        client_version: str = "",
     ):
         pass
 
@@ -131,20 +156,33 @@ class BaseLauncher(abc.ABC):
         """Check if the runtime requires to build the image and updates the spec accordingly"""
         pass
 
-    def _validate_runtime(
+    def _validate_run(
         self,
         runtime: "mlrun.runtimes.BaseRuntime",
         run: "mlrun.run.RunObject",
     ):
         mlrun.utils.helpers.verify_dict_items_type(
-            "Inputs", run.spec.inputs, [str], [str]
+            "Inputs", run.spec.inputs, [str], [str, list, dict]
         )
 
         if runtime.spec.mode and runtime.spec.mode not in run_modes:
-            raise ValueError(f'run mode can only be {",".join(run_modes)}')
+            raise ValueError(f"run mode can only be {','.join(run_modes)}")
 
         self._validate_run_params(run.spec.parameters)
         self._validate_output_path(runtime, run)
+
+        # Raise an error if retry is configured for a runtime that doesn't support retries.
+        # For local runs, we intentionally skip this validation and allow the run to proceed, since they are typically
+        # used for debugging purposes, and in such cases we avoid blocking their execution.
+        if (
+            not mlrun.runtimes.RuntimeKinds.is_local_runtime(runtime.kind)
+            and run.spec.retry.count
+            and runtime.kind not in mlrun.runtimes.RuntimeKinds.retriable_runtimes()
+        ):
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"Retry is not supported for {runtime.kind} runtime, supported runtimes are: "
+                f"{mlrun.runtimes.RuntimeKinds.retriable_runtimes()}"
+            )
 
     @staticmethod
     def _validate_output_path(
@@ -186,7 +224,7 @@ class BaseLauncher(abc.ABC):
             )
 
     @classmethod
-    def _validate_run_single_param(cls, param_name, param_value):
+    def _validate_run_single_param(cls, param_name: str, param_value: int):
         # verify that integer parameters don't exceed a int64
         if isinstance(param_value, int) and abs(param_value) >= 2**63:
             raise mlrun.errors.MLRunInvalidArgumentError(
@@ -195,8 +233,6 @@ class BaseLauncher(abc.ABC):
 
     @staticmethod
     def _create_run_object(task):
-        valid_task_types = (dict, mlrun.run.RunTemplate, mlrun.run.RunObject)
-
         if not task:
             # if task passed generate default RunObject
             return mlrun.run.RunObject.from_dict(task)
@@ -207,18 +243,18 @@ class BaseLauncher(abc.ABC):
         if isinstance(task, str):
             task = ast.literal_eval(task)
 
-        if not isinstance(task, valid_task_types):
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                f"Task is not a valid object, type={type(task)}, expected types={valid_task_types}"
-            )
-
+        valid_task_types = (dict, mlrun.run.RunTemplate, mlrun.run.RunObject)
+        if isinstance(task, mlrun.run.RunObject):
+            # if task is already a RunObject, we can return it as is
+            return task
         if isinstance(task, mlrun.run.RunTemplate):
             return mlrun.run.RunObject.from_template(task)
         elif isinstance(task, dict):
             return mlrun.run.RunObject.from_dict(task)
 
-        # task is already a RunObject
-        return task
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            f"Task is not a valid object, type={type(task)}, expected types={valid_task_types}"
+        )
 
     @staticmethod
     def _enrich_run(
@@ -234,11 +270,11 @@ class BaseLauncher(abc.ABC):
         hyper_param_options=None,
         verbose=None,
         scrape_metrics=None,
-        out_path=None,
-        artifact_path=None,
+        output_path=None,
         workdir=None,
-        notifications: Optional[list[mlrun.model.Notification]] = None,
-        state_thresholds: Optional[dict[str, int]] = None,
+        notifications: list[mlrun.model.Notification] | None = None,
+        state_thresholds: dict[str, int] | None = None,
+        retry: Union[mlrun.model.Retry, dict] | None = None,
     ):
         run.spec.handler = (
             handler or run.spec.handler or runtime.spec.default_handler or ""
@@ -251,7 +287,12 @@ class BaseLauncher(abc.ABC):
         def_name = runtime.metadata.name
         if run.spec.handler_name:
             short_name = run.spec.handler_name
-            for separator in ["#", "::", "."]:
+            # Strip every recognized handler separator from the short name —
+            # `:` is required for the canonical mlrun "module:function" form
+            # (auto-name must be DNS-1123 valid; K8s rejects `:`). Ordered
+            # longest-match-first as a defensive convention; `split(...)[-1]`
+            # makes the end result invariant to this ordering today.
+            for separator in ["#", "::", ":", "."]:
                 # drop paths, module or class name from short name
                 if separator in short_name:
                     short_name = short_name.split(separator)[-1]
@@ -259,12 +300,6 @@ class BaseLauncher(abc.ABC):
 
         run.metadata.name = mlrun.utils.normalize_name(
             name=name or run.metadata.name or def_name,
-            # if name or runspec.metadata.name are set then it means that is user defined name and we want to warn the
-            # user that the passed name needs to be set without underscore, if its not user defined but rather enriched
-            # from the handler(function) name then we replace the underscore without warning the user.
-            # most of the time handlers will have `_` in the handler name (python convention is to separate function
-            # words with `_`), therefore we don't want to be noisy when normalizing the run name
-            verbose=bool(name or run.metadata.name),
         )
         mlrun.utils.verify_field_regex(
             "run.metadata.name", run.metadata.name, mlrun.utils.regex.run_name
@@ -273,7 +308,7 @@ class BaseLauncher(abc.ABC):
             project_name
             or run.metadata.project
             or runtime.metadata.project
-            or mlrun.mlconf.default_project
+            or mlrun.mlconf.active_project
         )
         run.spec.parameters = params or run.spec.parameters
         run.spec.inputs = inputs or run.spec.inputs
@@ -301,7 +336,7 @@ class BaseLauncher(abc.ABC):
         meta = run.metadata
         meta.uid = meta.uid or uuid.uuid4().hex
 
-        run.spec.output_path = out_path or artifact_path or run.spec.output_path
+        run.spec.output_path = output_path or run.spec.output_path
 
         if not run.spec.output_path:
             if run.metadata.project:
@@ -357,6 +392,7 @@ class BaseLauncher(abc.ABC):
             | state_thresholds
         )
         run.spec.state_thresholds = state_thresholds or run.spec.state_thresholds
+        run.spec.retry = retry or run.spec.retry
         return run
 
     @staticmethod
@@ -382,8 +418,8 @@ class BaseLauncher(abc.ABC):
         runtime: "mlrun.runtimes.BaseRuntime",
         result: dict,
         run: "mlrun.run.RunObject",
-        schedule: Optional[mlrun.common.schemas.ScheduleCronTrigger] = None,
-        err: Optional[Exception] = None,
+        schedule: mlrun.common.schemas.ScheduleCronTrigger | None = None,
+        err: Exception | None = None,
     ):
         # if the purpose was to schedule (and not to run) nothing to wrap
         if schedule:
@@ -401,10 +437,9 @@ class BaseLauncher(abc.ABC):
                 status=run.status.state,
                 name=run.metadata.name,
             )
-            self._update_end_time_if_terminal_state(runtime, run)
             if (
                 run.status.state
-                in mlrun.common.runtimes.constants.RunStates.error_and_abortion_states()
+                in mlrun.common.runtimes.constants.RunStates.error_states()
             ):
                 if runtime._is_remote and not runtime.is_child:
                     logger.error(
@@ -412,25 +447,17 @@ class BaseLauncher(abc.ABC):
                         state=run.status.state,
                         status=run.status.to_dict(),
                     )
-                raise mlrun.runtimes.utils.RunError(run.error)
+
+                error = run.error
+                if (
+                    run.status.state
+                    == mlrun.common.runtimes.constants.RunStates.pending_retry
+                ):
+                    error = f"Run is pending retry, error: {run.error}"
+                raise mlrun.runtimes.utils.RunError(error)
             return run
 
         return None
-
-    @staticmethod
-    def _update_end_time_if_terminal_state(
-        runtime: "mlrun.runtimes.BaseRuntime", run: "mlrun.run.RunObject"
-    ):
-        if (
-            run.status.state
-            in mlrun.common.runtimes.constants.RunStates.terminal_states()
-            and not run.status.end_time
-        ):
-            end_time = mlrun.utils.now_date().isoformat()
-            updates = {"status.end_time": end_time}
-            runtime._get_db().update_run(
-                updates, run.metadata.uid, run.metadata.project
-            )
 
     @staticmethod
     def _refresh_function_metadata(runtime: "mlrun.runtimes.BaseRuntime"):
@@ -441,3 +468,23 @@ class BaseLauncher(abc.ABC):
         runtime: "mlrun.runtimes.BaseRuntime", result: dict, run: "mlrun.run.RunObject"
     ):
         pass
+
+    def _get_valid_launcher_params(self) -> frozenset[str]:
+        """
+        Union of params valid for launcher __init__ (should not warn on these).
+        Derived from:
+            (1) launch() signature,
+            (2) explicit __init__ params of launcher subclasses (local, auth_info, etc.).
+        """
+        valid = set(inspect.signature(self.launch).parameters) - {"self"}
+
+        # Collect explicit __init__ params from this class and subclasses
+        for cls in type(self).__mro__:
+            if cls is object or not issubclass(cls, BaseLauncher):
+                continue
+            if "__init__" in cls.__dict__:
+                for name, param in inspect.signature(cls.__init__).parameters.items():
+                    if name != "self" and param.kind != inspect.Parameter.VAR_KEYWORD:
+                        valid.add(name)
+
+        return frozenset(valid)

@@ -11,13 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import tempfile
 import unittest.mock
 import uuid
 from datetime import datetime, timedelta
 from http import HTTPStatus
-from typing import Optional
 
 import deepdiff
 import pytest
@@ -42,10 +41,12 @@ STORE_API_ARTIFACTS_PATH = API_ARTIFACTS_PATH + "/{uid}/{key}?tag={tag}"
 GET_API_ARTIFACT_PATH = API_ARTIFACTS_PATH + "/{key}?tag={tag}"
 LIST_API_ARTIFACTS_PATH_WITH_TAG = API_ARTIFACTS_PATH + "?tag={tag}"
 DELETE_API_ARTIFACTS_PATH = API_ARTIFACTS_PATH + "/{key}"
+DELETE_API_MULTI_ARTIFACTS_PATH = API_ARTIFACTS_PATH
 
 # V2 endpoints
 V2_PREFIX = "v2/"
 DELETE_API_ARTIFACTS_V2_PATH = V2_PREFIX + DELETE_API_ARTIFACTS_PATH
+DELETE_API_MULTI_ARTIFACTS_V2_PATH = V2_PREFIX + DELETE_API_MULTI_ARTIFACTS_PATH
 STORE_API_ARTIFACTS_V2_PATH = V2_PREFIX + API_ARTIFACTS_PATH
 LIST_API_ARTIFACTS_V2_PATH = V2_PREFIX + API_ARTIFACTS_PATH
 GET_API_ARTIFACT_V2_PATH = V2_PREFIX + API_ARTIFACTS_PATH + "/{key}"
@@ -252,30 +253,45 @@ def test_delete_artifacts_after_storing_empty_dict(db: Session, client: TestClie
 
 
 @pytest.mark.parametrize(
-    "deletion_strategy, expected_status_code",
+    "deletion_strategy, expected_status_code, expected_status_code_for_getting_artifact",
     [
         (
             mlrun.common.schemas.artifact.ArtifactsDeletionStrategies.data_optional,
             HTTPStatus.NO_CONTENT.value,
+            # Artifact does not exist in DB after deleting data fails
+            HTTPStatus.NOT_FOUND.value,
         ),
         (
             mlrun.common.schemas.artifact.ArtifactsDeletionStrategies.data_force,
             HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            # Artifact exists in DB after deleting data fails
+            HTTPStatus.OK.value,
         ),
     ],
 )
-def test_fails_deleting_artifact_data(
-    deletion_strategy, expected_status_code, db: Session, unversioned_client: TestClient
+def test_delete_artifact_data_failure(
+    deletion_strategy,
+    expected_status_code,
+    expected_status_code_for_getting_artifact,
+    unversioned_client: TestClient,
 ):
     # This test attempts to delete the artifact data, but fails - the request should
     # be failed or succeeded by the deletion strategy.
     _create_project(unversioned_client)
-    artifact = mlrun.artifacts.Artifact(key=KEY, body="123", target_path="dummy-path")
 
+    # Generate artifact
+    artifact_data = _generate_artifact_body()
     resp = unversioned_client.post(
-        STORE_API_ARTIFACTS_PATH.format(project=PROJECT, uid=UID, key=KEY, tag=TAG),
-        data=artifact.to_json(),
+        STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        json=artifact_data,
     )
+    assert resp.status_code == HTTPStatus.CREATED.value
+    artifact_response = resp.json()
+    artifact_uid = artifact_response["metadata"]["uid"]
+
+    # Check if the artifact is created successfully
+    artifact_url = _get_artifact_url(uid=artifact_uid)
+    resp = unversioned_client.get(artifact_url)
     assert resp.status_code == HTTPStatus.OK.value
 
     url = DELETE_API_ARTIFACTS_V2_PATH.format(project=PROJECT, key=KEY)
@@ -289,6 +305,10 @@ def test_fails_deleting_artifact_data(
             url_with_deletion_strategy.format(deletion_strategy=deletion_strategy)
         )
     assert resp.status_code == expected_status_code
+
+    # Verify artifact exists in DB based on the deletion strategy
+    resp = unversioned_client.get(artifact_url)
+    assert resp.status_code == expected_status_code_for_getting_artifact
 
 
 def test_delete_artifact_data_default_deletion_strategy(
@@ -403,6 +423,45 @@ def test_deleting_dataset_artifact_data_includes_one_file(
     assert resp.status_code == HTTPStatus.NO_CONTENT.value
 
 
+def test_delete_artifact_includes_multiple_results(
+    db: Session, unversioned_client: TestClient
+):
+    _create_project(unversioned_client)
+
+    # Create the first artifact (tree1)
+    artifact_data = _generate_artifact_body(tree="tree1")
+    resp = unversioned_client.post(
+        STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        json=artifact_data,
+    )
+    assert resp.status_code == HTTPStatus.CREATED.value
+    artifact_response = resp.json()
+    artifact1_uid = artifact_response["metadata"]["uid"]
+
+    # Create the second artifact (tree2)
+    artifact_data = _generate_artifact_body(tree="tree2")
+    resp = unversioned_client.post(
+        STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        json=artifact_data,
+    )
+    assert resp.status_code == HTTPStatus.CREATED.value
+    artifact_response = resp.json()
+    artifact2_uid = artifact_response["metadata"]["uid"]
+
+    assert artifact1_uid != artifact2_uid
+
+    artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT, key=KEY)
+    resp = unversioned_client.get(artifact_path)
+    assert resp.status_code == HTTPStatus.OK.value
+
+    # Attempt to delete the artifact
+    response = unversioned_client.delete(
+        DELETE_API_ARTIFACTS_V2_PATH.format(project=PROJECT, key=KEY)
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "Failed to delete artifact, multiple artifacts matching" in response.text
+
+
 def test_list_artifacts(db: Session, client: TestClient) -> None:
     _create_project(client)
 
@@ -445,7 +504,7 @@ def test_list_artifacts(db: Session, client: TestClient) -> None:
 def list_limit_unversioned_client(
     unversioned_client: TestClient, request
 ) -> TestClient:
-    def ensure_endpoint_limit(limit_: Optional[int] = None):
+    def ensure_endpoint_limit(limit_: int | None = None):
         for route in unversioned_client.app.routes:
             if route.path.endswith(LIST_API_ARTIFACTS_V2_PATH):
                 for qp in route.dependant.query_params:
@@ -458,34 +517,6 @@ def list_limit_unversioned_client(
         yield request.param, unversioned_client
     finally:
         ensure_endpoint_limit(None)
-
-
-@pytest.mark.parametrize("list_limit_unversioned_client", [2], indirect=True)
-def test_list_artifacts_with_limits(
-    db: Session, list_limit_unversioned_client: TestClient
-) -> None:
-    list_limit, unversioned_client = list_limit_unversioned_client
-    _create_project(unversioned_client, prefix="v1")
-
-    for i in range(list_limit + 1):
-        data = _generate_artifact_body()
-        resp = unversioned_client.post(
-            STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
-            json=data,
-        )
-        assert resp.status_code == HTTPStatus.CREATED.value
-
-    artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT)
-    resp = unversioned_client.get(f"{artifact_path}?limit={list_limit-1}")
-    assert resp.status_code == HTTPStatus.OK.value
-    artifacts = resp.json()["artifacts"]
-    assert len(artifacts) == list_limit - 1
-
-    # Get all artifacts
-    resp = unversioned_client.get(artifact_path)
-    assert resp.status_code == HTTPStatus.OK.value
-    artifacts = resp.json()["artifacts"]
-    assert len(artifacts) == list_limit
 
 
 def test_list_artifacts_with_producer_uri(
@@ -989,9 +1020,9 @@ def test_list_artifacts_with_time_filters(db: Session, unversioned_client: TestC
     artifacts = resp.json()["artifacts"]
     assert len(artifacts) == 3, "since t2 filter did not return 3 artifacts"
     artifact_keys = [artifact["metadata"]["key"] for artifact in artifacts]
-    assert (
-        artifact_keys.sort() == [key2, key3, key4].sort()
-    ), "since t2 filter returned the wrong artifacts"
+    assert artifact_keys.sort() == [key2, key3, key4].sort(), (
+        "since t2 filter returned the wrong artifacts"
+    )
 
     artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT)
     resp = unversioned_client.get(
@@ -1005,9 +1036,9 @@ def test_list_artifacts_with_time_filters(db: Session, unversioned_client: TestC
     artifacts = resp.json()["artifacts"]
     assert len(artifacts) == 2, "since t2 until t3 filter did not return 2 artifacts"
     artifact_keys = [artifact["metadata"]["key"] for artifact in artifacts]
-    assert (
-        artifact_keys.sort() == [key2, key4].sort()
-    ), "since t2 until t3 filter returned the wrong artifacts"
+    assert artifact_keys.sort() == [key2, key4].sort(), (
+        "since t2 until t3 filter returned the wrong artifacts"
+    )
 
     artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT)
     resp = unversioned_client.get(
@@ -1021,9 +1052,9 @@ def test_list_artifacts_with_time_filters(db: Session, unversioned_client: TestC
     artifacts = resp.json()["artifacts"]
     assert len(artifacts) == 2, "since t3 until start filter did not return 2 artifacts"
     artifact_keys = [artifact["metadata"]["key"] for artifact in artifacts]
-    assert (
-        artifact_keys.sort() == [key3, key4].sort()
-    ), "since t3 until start filter returned the wrong artifacts"
+    assert artifact_keys.sort() == [key3, key4].sort(), (
+        "since t3 until start filter returned the wrong artifacts"
+    )
 
     artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT)
     resp = unversioned_client.get(
@@ -1033,9 +1064,9 @@ def test_list_artifacts_with_time_filters(db: Session, unversioned_client: TestC
     artifacts = resp.json()["artifacts"]
     assert len(artifacts) == 1, "since start filter did not return 1 artifacts"
     artifact_keys = [artifact["metadata"]["key"] for artifact in artifacts]
-    assert (
-        artifact_keys.sort() == [key4].sort()
-    ), "since start filter returned the wrong artifacts"
+    assert artifact_keys.sort() == [key4].sort(), (
+        "since start filter returned the wrong artifacts"
+    )
 
     artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT)
     resp = unversioned_client.get(
@@ -1045,9 +1076,9 @@ def test_list_artifacts_with_time_filters(db: Session, unversioned_client: TestC
     artifacts = resp.json()["artifacts"]
     assert len(artifacts) == 4, "until start filter did not return 4 artifacts"
     artifact_keys = [artifact["metadata"]["key"] for artifact in artifacts]
-    assert (
-        artifact_keys.sort() == [key1, key2, key3, key4].sort()
-    ), "until start filter returned the wrong artifacts"
+    assert artifact_keys.sort() == [key1, key2, key3, key4].sort(), (
+        "until start filter returned the wrong artifacts"
+    )
 
     artifact_path = LIST_API_ARTIFACTS_V2_PATH.format(project=PROJECT)
     resp = unversioned_client.get(
@@ -1214,8 +1245,143 @@ def test_list_artifacts_partition_by(db: Session, unversioned_client: TestClient
     )
 
 
+def test_failed_to_delete_artifact_with_referenced_model_endpoint(
+    db: Session, unversioned_client: TestClient
+):
+    # Create a new project
+    _create_project(unversioned_client, project_name=PROJECT)
+
+    # Create and store a model artifact
+    # Generate artifact
+    artifact_data = _generate_artifact_body()
+    resp = unversioned_client.post(
+        STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        json=artifact_data,
+    )
+    assert resp.status_code == HTTPStatus.CREATED.value
+    artifact_response = resp.json()
+    artifact_uid = artifact_response["metadata"]["uid"]
+
+    # Check if the artifact is created successfully
+    artifact_url = _get_artifact_url(uid=artifact_uid)
+    resp = unversioned_client.get(artifact_url)
+    assert resp.status_code == HTTPStatus.OK.value
+
+    # Create a model endpoint that references the model artifact
+    model_endpoint = mlrun.common.schemas.ModelEndpoint(
+        metadata=mlrun.common.schemas.ModelEndpointMetadata(
+            project=PROJECT,
+            name="model-endpoint",
+        ),
+        spec=mlrun.common.schemas.ModelEndpointSpec(
+            model_class="model_class",
+            _model_id=1,
+        ),
+        status=mlrun.common.schemas.ModelEndpointStatus(state="ready"),
+    )
+
+    creation_strategy = mlrun.common.schemas.ModelEndpointCreationStrategy.INPLACE
+    response = unversioned_client.post(
+        f"/projects/{PROJECT}/model-endpoints?creation-strategy={creation_strategy}",
+        json=model_endpoint.dict(),
+    )
+    assert response.status_code == HTTPStatus.CREATED.value, (
+        f"Expected 201 CREATED when creating the model endpoint, got {response.status_code}: {response.text}"
+    )
+
+    # Attempt to delete the model artifact that is still referenced by the model endpoint
+    response = unversioned_client.delete(
+        DELETE_API_ARTIFACTS_V2_PATH.format(project=PROJECT, key=KEY)
+    )
+    # Assert that the deletion fails with a conflict because of the reference
+    assert response.status_code == HTTPStatus.CONFLICT.value, (
+        f"Expected 409 CONFLICT when deleting an artifact in use, got {response.status_code}: {response.text}"
+    )
+    assert "The artifact is used by" in response.text, (
+        f"Expected conflict explanation in response, got: {response.text}"
+    )
+
+    # Attempt to delete the model artifact that is still referenced by the model endpoint
+    response = unversioned_client.delete(
+        DELETE_API_MULTI_ARTIFACTS_V2_PATH.format(project=PROJECT)
+    )
+    # Assert that the deletion fails with a conflict because of the reference
+    assert response.status_code == HTTPStatus.CONFLICT.value, (
+        f"Expected 409 CONFLICT when deleting an artifact in use, got {response.status_code}: {response.text}"
+    )
+    assert "due to integrity" in response.text, (
+        f"Expected conflict explanation in response, got: {response.text}"
+    )
+
+
+def test_failed_to_delete_artifact_with_parent(
+    db: Session, unversioned_client: TestClient
+):
+    # Create a new project
+    _create_project(unversioned_client, project_name=PROJECT)
+
+    # Create and store a model artifact
+    # Generate artifact
+    artifact_data = _generate_artifact_body()
+    resp = unversioned_client.post(
+        STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        json=artifact_data,
+    )
+    assert resp.status_code == HTTPStatus.CREATED.value
+    artifact_response = resp.json()
+    artifact_uid = artifact_response["metadata"]["uid"]
+
+    # Check if the artifact is created successfully
+    artifact_url = _get_artifact_url(uid=artifact_uid)
+    resp = unversioned_client.get(artifact_url)
+    assert resp.status_code == HTTPStatus.OK.value
+
+    # Create and store a model artifact
+    # Generate artifact
+    artifact_data = _generate_artifact_body(
+        key="some-key-2", parent_uri=f"store://models/{PROJECT}/{KEY}"
+    )
+    resp = unversioned_client.post(
+        STORE_API_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        json=artifact_data,
+    )
+    assert resp.status_code == HTTPStatus.CREATED.value
+    artifact_response = resp.json()
+    artifact_uid = artifact_response["metadata"]["uid"]
+
+    # Check if the artifact is created successfully
+    artifact_url = _get_artifact_url(uid=artifact_uid, key="some-key-2")
+    resp = unversioned_client.get(artifact_url)
+    assert resp.status_code == HTTPStatus.OK.value
+
+    # Attempt to delete the model artifact that is still referenced by the model endpoint
+    response = unversioned_client.delete(
+        DELETE_API_ARTIFACTS_V2_PATH.format(project=PROJECT, key=KEY)
+    )
+    # Assert that the deletion fails with a conflict because of the reference
+    assert response.status_code == HTTPStatus.CONFLICT.value, (
+        f"Expected 409 CONFLICT when deleting an artifact in use, got {response.status_code}: {response.text}"
+    )
+    assert "The artifact has" in response.text, (
+        f"Expected conflict explanation in response, got: {response.text}"
+    )
+
+    # Attempt to delete the model artifact that is still referenced by the model endpoint
+    response = unversioned_client.delete(
+        DELETE_API_MULTI_ARTIFACTS_V2_PATH.format(project=PROJECT),
+        params={"name": [KEY]},
+    )
+    # Assert that the deletion fails with a conflict because of the reference
+    assert response.status_code == HTTPStatus.CONFLICT.value, (
+        f"Expected 409 CONFLICT when deleting an artifact in use, got {response.status_code}: {response.text}"
+    )
+    assert "due to integrity" in response.text, (
+        f"Expected conflict explanation in response, got: {response.text}"
+    )
+
+
 def _create_project(
-    client: TestClient, project_name: str = PROJECT, prefix: Optional[str] = None
+    client: TestClient, project_name: str = PROJECT, prefix: str | None = None
 ):
     project = mlrun.common.schemas.Project(
         metadata=mlrun.common.schemas.ProjectMetadata(name=project_name),
@@ -1237,6 +1403,7 @@ def _generate_artifact_body(
     body=None,
     producer=None,
     iteration=None,
+    parent_uri=None,
 ):
     tree = tree or str(uuid.uuid4())
     producer = producer or {"kind": "api", "uri": "my-uri:3000"}
@@ -1253,6 +1420,7 @@ def _generate_artifact_body(
             "db_key": key,
             "producer": producer,
             "target_path": "memory://aaa/aaa",
+            "parent_uri": parent_uri,
         },
         "status": {},
     }
@@ -1267,9 +1435,12 @@ def _generate_artifact_body(
 
 
 def _get_artifact_url(
-    uid: Optional[str] = None, tag: Optional[str] = None, tree: Optional[str] = None
+    uid: str | None = None,
+    tag: str | None = None,
+    tree: str | None = None,
+    key: str = KEY,
 ) -> str:
-    url = GET_API_ARTIFACT_V2_PATH.format(project=PROJECT, key=KEY)
+    url = GET_API_ARTIFACT_V2_PATH.format(project=PROJECT, key=key)
     params = []
 
     if uid:

@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import warnings
 from datetime import datetime
-from typing import Optional, Union
+from typing import Union
 
 import pandas as pd
 from storey import EmitEveryEvent, EmitPolicy
 
 import mlrun
 import mlrun.common.schemas
+import mlrun.feature_store.api
 
 from ..config import config as mlconf
 from ..data_types import InferOptions
@@ -149,16 +149,14 @@ class FeatureSetSpec(ModelObj):
                     entities[i] = Entity(entity)
                 elif isinstance(entity, Entity) and entity.name is None:
                     raise mlrun.errors.MLRunInvalidArgumentError(
-                        "You have to provide an "
-                        "Entity with valid name of string type"
+                        "You have to provide an Entity with valid name of string type"
                     )
                 elif isinstance(entity, dict) and (
                     "name" not in entity
                     or ("name" in entity and entity["name"] is None)
                 ):
                     raise mlrun.errors.MLRunInvalidArgumentError(
-                        "You have to provide an "
-                        "Entity with valid name of string type"
+                        "You have to provide an Entity with valid name of string type"
                     )
         self._entities = ObjectList.from_list(Entity, entities)
 
@@ -323,14 +321,14 @@ class FeatureSet(ModelObj):
 
     def __init__(
         self,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        entities: Optional[list[Union[Entity, str]]] = None,
-        timestamp_key: Optional[str] = None,
-        engine: Optional[str] = None,
-        label_column: Optional[str] = None,
-        relations: Optional[dict[str, Union[Entity, str]]] = None,
-        passthrough: Optional[bool] = None,
+        name: str | None = None,
+        description: str | None = None,
+        entities: list[Union[Entity, str]] | None = None,
+        timestamp_key: str | None = None,
+        engine: str | None = None,
+        label_column: str | None = None,
+        relations: dict[str, Union[Entity, str]] | None = None,
+        passthrough: bool | None = None,
     ):
         """Feature set object, defines a set of features and their data pipeline
 
@@ -414,11 +412,15 @@ class FeatureSet(ModelObj):
     @property
     def fullname(self) -> str:
         """full name in the form ``{project}/{name}[:{tag}]``"""
-        fullname = (
-            f"{self._metadata.project or mlconf.default_project}/{self._metadata.name}"
-        )
-        if self._metadata.tag:
-            fullname += ":" + self._metadata.tag
+        project = self._metadata.project or mlconf.active_project
+        name = self._metadata.name
+        tag = self._metadata.tag
+
+        fullname = name
+        if project:
+            fullname = f"{project}/{fullname}"
+        if tag:
+            fullname += f":{tag}"
         return fullname
 
     def _get_run_db(self):
@@ -447,7 +449,6 @@ class FeatureSet(ModelObj):
         targets=None,
         with_defaults=True,
         default_final_step=None,
-        default_final_state=None,
     ):
         """set the desired target list or defaults
 
@@ -457,17 +458,7 @@ class FeatureSet(ModelObj):
         :param default_final_step: the final graph step after which we add the
                                     target writers, used when the graph branches and
                                     the end cant be determined automatically
-        :param default_final_state: *Deprecated* - use default_final_step instead
         """
-        if default_final_state:
-            warnings.warn(
-                "The 'default_final_state' parameter is deprecated in 1.3.0 and will be remove in 1.5.0. "
-                "Use 'default_final_step' instead.",
-                # TODO: remove in 1.5.0
-                FutureWarning,
-            )
-            default_final_step = default_final_step or default_final_state
-
         if targets is not None and not isinstance(targets, list):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "targets can only be None or a list of kinds or DataTargetBase derivatives"
@@ -534,7 +525,7 @@ class FeatureSet(ModelObj):
                 )
 
     def purge_targets(
-        self, target_names: Optional[list[str]] = None, silent: bool = False
+        self, target_names: list[str] | None = None, silent: bool = False
     ):
         """Delete data of specific targets
         :param target_names: List of names of targets to delete (default: delete all ingested targets)
@@ -564,7 +555,7 @@ class FeatureSet(ModelObj):
     def update_targets_for_ingest(
         self,
         targets: list[DataTargetBase],
-        overwrite: Optional[bool] = None,
+        overwrite: bool | None = None,
     ):
         if not targets:
             return
@@ -584,7 +575,7 @@ class FeatureSet(ModelObj):
         update_targets_run_id_for_ingest(overwrite, targets, status_targets)
 
     def _reload_and_get_status_targets(
-        self, target_names: Optional[list[str]] = None, silent: bool = False
+        self, target_names: list[str] | None = None, silent: bool = False
     ):
         try:
             self.reload(update_spec=False)
@@ -621,8 +612,8 @@ class FeatureSet(ModelObj):
         self,
         name: str,
         value_type: mlrun.data_types.ValueType = None,
-        description: Optional[str] = None,
-        labels: Optional[dict[str, str]] = None,
+        description: str | None = None,
+        labels: dict[str, str] | None = None,
     ):
         """add/set an entity (dataset index)
 
@@ -634,7 +625,9 @@ class FeatureSet(ModelObj):
                 "ticks", entities=["stock"], timestamp_key="timestamp"
             )
             ticks.add_entity(
-                "country", mlrun.data_types.ValueType.STRING, description="stock country"
+                "country",
+                mlrun.data_types.ValueType.STRING,
+                description="stock country",
             )
             ticks.add_entity("year", mlrun.data_types.ValueType.INT16)
             ticks.save()
@@ -983,7 +976,7 @@ class FeatureSet(ModelObj):
     def save(self, tag="", versioned=False):
         """save to mlrun db"""
         db = self._get_run_db()
-        self.metadata.project = self.metadata.project or mlconf.default_project
+        self.metadata.project = self.metadata.project or mlconf.active_project
         tag = tag or self.metadata.tag or "latest"
         as_dict = self.to_dict()
         as_dict["spec"]["features"] = as_dict["spec"].get(
@@ -1006,7 +999,7 @@ class FeatureSet(ModelObj):
     def ingest(
         self,
         source=None,
-        targets: Optional[list[DataTargetBase]] = None,
+        targets: list[DataTargetBase] | None = None,
         namespace=None,
         return_df: bool = True,
         infer_options: InferOptions = InferOptions.default(),
@@ -1014,7 +1007,7 @@ class FeatureSet(ModelObj):
         mlrun_context=None,
         spark_context=None,
         overwrite=None,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Read local DataFrame, file, URL, or source into the feature store
         Ingest reads from the source, run the graph transformations, infers  metadata and stats
         and writes the results to the default of specified targets
@@ -1075,11 +1068,11 @@ class FeatureSet(ModelObj):
     def preview(
         self,
         source,
-        entity_columns: Optional[list] = None,
+        entity_columns: list | None = None,
         namespace=None,
         options: InferOptions = None,
         verbose: bool = False,
-        sample_size: Optional[int] = None,
+        sample_size: int | None = None,
     ) -> pd.DataFrame:
         """run the ingestion pipeline with local DataFrame/file data and infer features schema and stats
 
@@ -1108,8 +1101,8 @@ class FeatureSet(ModelObj):
     def deploy_ingestion_service(
         self,
         source: DataSource = None,
-        targets: Optional[list[DataTargetBase]] = None,
-        name: Optional[str] = None,
+        targets: list[DataTargetBase] | None = None,
+        name: str | None = None,
         run_config: RunConfig = None,
         verbose=False,
     ) -> tuple[str, BaseRuntime]:
@@ -1145,7 +1138,7 @@ class FeatureSet(ModelObj):
     def extract_relation_keys(
         self,
         other_feature_set,
-        relations: Optional[dict[str, Union[str, Entity]]] = None,
+        relations: dict[str, Union[str, Entity]] | None = None,
     ) -> list[str]:
         """
         Checks whether a feature set can be merged to the right of this feature set.

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import pytest
 
@@ -50,7 +49,7 @@ class TestLogCollector(tests.system.base.TestMLRunSystem):
             handler="handler",
             project=proj.name,
             filename=code_path,
-            image="mlrun/mlrun",
+            image=mlrun.mlconf.function_defaults.image_by_kind.job,
         )
         run = function.run(params={"life_cycle_seconds": life_cycle_seconds})
 

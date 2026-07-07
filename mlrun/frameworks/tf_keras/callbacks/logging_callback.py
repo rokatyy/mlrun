@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-from typing import Callable, Optional, Union
+
+from collections.abc import Callable
+from typing import Union
 
 import numpy as np
 import tensorflow as tf
-from tensorflow import Tensor, Variable
+from tensorflow import keras
 from tensorflow.python.keras.callbacks import Callback
 
 import mlrun
 
 from ..._common import LoggingMode
 from ..._dl_common.loggers import Logger
-from ..utils import TFKerasTypes
+from ..utils import TFKerasTypes, is_keras_3
 
 
 class LoggingCallback(Callback):
@@ -36,15 +37,14 @@ class LoggingCallback(Callback):
     def __init__(
         self,
         context: mlrun.MLClientCtx = None,
-        dynamic_hyperparameters: Optional[
-            dict[
-                str,
-                Union[list[Union[str, int]], Callable[[], TFKerasTypes.TrackableType]],
-            ]
-        ] = None,
-        static_hyperparameters: Optional[
-            dict[str, Union[TFKerasTypes.TrackableType, list[Union[str, int]]]]
-        ] = None,
+        dynamic_hyperparameters: dict[
+            str, Union[list[Union[str, int]], Callable[[], TFKerasTypes.TrackableType]]
+        ]
+        | None = None,
+        static_hyperparameters: dict[
+            str, Union[TFKerasTypes.TrackableType, list[Union[str, int]]]
+        ]
+        | None = None,
         auto_log: bool = False,
     ):
         """
@@ -70,7 +70,7 @@ class LoggingCallback(Callback):
                                         {
                                             "epochs": 7
                                         }
-        :param auto_log:                Whether or not to enable auto logging, trying to track common static and dynamic
+        :param auto_log:                Whether to enable auto logging, trying to track common static and dynamic
                                         hyperparameters.
         """
         super().__init__()
@@ -178,7 +178,7 @@ class LoggingCallback(Callback):
         """
         return self._logger.validation_iterations
 
-    def on_train_begin(self, logs: Optional[dict] = None):
+    def on_train_begin(self, logs: dict | None = None):
         """
         Called once at the beginning of training process (one time call).
 
@@ -188,7 +188,7 @@ class LoggingCallback(Callback):
         self._is_training = True
         self._setup_run()
 
-    def on_test_begin(self, logs: Optional[dict] = None):
+    def on_test_begin(self, logs: dict | None = None):
         """
         Called at the beginning of evaluation or validation. Will be called on each epoch according to the validation
         per epoch configuration.
@@ -205,7 +205,7 @@ class LoggingCallback(Callback):
         if not self._is_training:
             self._setup_run()
 
-    def on_test_end(self, logs: Optional[dict] = None):
+    def on_test_end(self, logs: dict | None = None):
         """
         Called at the end of evaluation or validation. Will be called on each epoch according to the validation
         per epoch configuration. The recent evaluation / validation results will be summarized and logged.
@@ -223,7 +223,7 @@ class LoggingCallback(Callback):
                 result=float(sum(epoch_values[-1]) / len(epoch_values[-1])),
             )
 
-    def on_epoch_begin(self, epoch: int, logs: Optional[dict] = None):
+    def on_epoch_begin(self, epoch: int, logs: dict | None = None):
         """
         Called at the start of an epoch, logging it and appending a new epoch to the logger's dictionaries.
 
@@ -239,7 +239,7 @@ class LoggingCallback(Callback):
             for metric in sum_dictionary:
                 sum_dictionary[metric] = 0
 
-    def on_epoch_end(self, epoch: int, logs: Optional[dict] = None):
+    def on_epoch_end(self, epoch: int, logs: dict | None = None):
         """
         Called at the end of an epoch, logging the training summaries and the current dynamic hyperparameters values.
 
@@ -265,7 +265,7 @@ class LoggingCallback(Callback):
                     value=self._get_hyperparameter(key_chain=key_chain),
                 )
 
-    def on_train_batch_begin(self, batch: int, logs: Optional[dict] = None):
+    def on_train_batch_begin(self, batch: int, logs: dict | None = None):
         """
         Called at the beginning of a training batch in `fit` methods. The logger will check if this batch is needed to
         be logged according to the configuration. Note that if the `steps_per_execution` argument to `compile` in
@@ -277,7 +277,7 @@ class LoggingCallback(Callback):
         """
         self._logger.log_training_iteration()
 
-    def on_train_batch_end(self, batch: int, logs: Optional[dict] = None):
+    def on_train_batch_end(self, batch: int, logs: dict | None = None):
         """
         Called at the end of a training batch in `fit` methods. The batch metrics results will be logged. Note that if
         the `steps_per_execution` argument to `compile` in `tf.keras.Model` is set to `N`, this method will only be
@@ -292,7 +292,7 @@ class LoggingCallback(Callback):
             logs=logs,
         )
 
-    def on_test_batch_begin(self, batch: int, logs: Optional[dict] = None):
+    def on_test_batch_begin(self, batch: int, logs: dict | None = None):
         """
         Called at the beginning of a batch in `evaluate` methods. Also called at the beginning of a validation batch in
         the `fit` methods, if validation data is provided. The logger will check if this batch is needed to be logged
@@ -305,7 +305,7 @@ class LoggingCallback(Callback):
         """
         self._logger.log_validation_iteration()
 
-    def on_test_batch_end(self, batch: int, logs: Optional[dict] = None):
+    def on_test_batch_end(self, batch: int, logs: dict | None = None):
         """
         Called at the end of a batch in `evaluate` methods. Also called at the end of a validation batch in the `fit`
         methods, if validation data is provided. The batch metrics results will be logged. Note that if the
@@ -385,18 +385,24 @@ class LoggingCallback(Callback):
             self._logger.log_context_parameters()
 
         # Add learning rate:
-        learning_rate_key = "lr"
-        learning_rate_key_chain = ["optimizer", "lr"]
-        if learning_rate_key not in self._dynamic_hyperparameters_keys and hasattr(
-            self.model, "optimizer"
-        ):
-            try:
-                self._get_hyperparameter(key_chain=learning_rate_key_chain)
+        learning_rate_keys = [
+            "learning_rate",
+            "lr",
+        ]  # "lr" is for backward compatibility in older keras versions.
+        if all(
+            learning_rate_key not in self._dynamic_hyperparameters_keys
+            for learning_rate_key in learning_rate_keys
+        ) and hasattr(self.model, "optimizer"):
+            for learning_rate_key in learning_rate_keys:
+                learning_rate_key_chain = ["optimizer", learning_rate_key]
+                try:
+                    self._get_hyperparameter(key_chain=learning_rate_key_chain)
+                except (KeyError, IndexError, AttributeError, ValueError):
+                    continue
                 self._dynamic_hyperparameters_keys[learning_rate_key] = (
                     learning_rate_key_chain
                 )
-            except (KeyError, IndexError, ValueError):
-                pass
+                break
 
     def _get_hyperparameter(
         self,
@@ -427,7 +433,7 @@ class LoggingCallback(Callback):
                         value = value[key]
                     else:
                         value = getattr(value, key)
-                except KeyError or IndexError as KeyChainError:
+                except KeyError or IndexError or AttributeError as KeyChainError:
                     raise KeyChainError(
                         f"Error during getting a hyperparameter value with the key chain {key_chain}. "
                         f"The {value.__class__} in it does not have the following key/index from the key provided: "
@@ -435,7 +441,9 @@ class LoggingCallback(Callback):
                     )
 
         # Parse the value:
-        if isinstance(value, Tensor) or isinstance(value, Variable):
+        if isinstance(value, tf.Tensor | tf.Variable) or (
+            is_keras_3() and isinstance(value, keras.KerasTensor | keras.Variable)
+        ):
             if int(tf.size(value)) == 1:
                 value = float(value)
             else:
@@ -451,12 +459,7 @@ class LoggingCallback(Callback):
                     f"The parameter with the following key chain: {key_chain} is a numpy.ndarray with {value.size} "
                     f"elements. numpy arrays are trackable only if they have 1 element."
                 )
-        elif not (
-            isinstance(value, float)
-            or isinstance(value, int)
-            or isinstance(value, str)
-            or isinstance(value, bool)
-        ):
+        elif not (isinstance(value, float | int | str | bool)):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 f"The parameter with the following key chain: {key_chain} is of type '{type(value)}'. The only "
                 f"trackable types are: float, int, str and bool."

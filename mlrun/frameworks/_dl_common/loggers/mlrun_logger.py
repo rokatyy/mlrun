@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 import itertools
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 import plotly.graph_objects as go
@@ -144,9 +144,9 @@ class MLRunLogger(Logger):
         self,
         model_handler: DLModelHandler,
         tag: str = "",
-        labels: Optional[dict[str, DLTypes.TrackableType]] = None,
-        parameters: Optional[dict[str, DLTypes.TrackableType]] = None,
-        extra_data: Optional[dict[str, Union[DLTypes.TrackableType, Artifact]]] = None,
+        labels: dict[str, DLTypes.TrackableType] | None = None,
+        parameters: dict[str, DLTypes.TrackableType] | None = None,
+        extra_data: dict[str, Union[DLTypes.TrackableType, Artifact]] | None = None,
     ):
         """
         Log the run, summarizing the validation metrics and dynamic hyperparameters across all epochs. If 'update' is

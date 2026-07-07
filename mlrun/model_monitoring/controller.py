@@ -11,34 +11,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import concurrent.futures
 import datetime
 import json
 import os
+import traceback
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from types import TracebackType
-from typing import Any, NamedTuple, Optional, cast
+from typing import Any, Final, NamedTuple, Union, cast
 
 import nuclio_sdk
+import numpy as np
+import pandas as pd
 
 import mlrun
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
-import mlrun.feature_store as fstore
 import mlrun.model_monitoring
+import mlrun.model_monitoring.db._schedules as schedules
 import mlrun.model_monitoring.helpers
-from mlrun.common.schemas import EndpointType
+import mlrun.platforms.iguazio
 from mlrun.common.schemas.model_monitoring.constants import (
     ControllerEvent,
-    ControllerEventKind,
+    ControllerEventEndpointPolicy,
 )
 from mlrun.errors import err_to_str
-from mlrun.model_monitoring.db._schedules import ModelMonitoringSchedulesFile
 from mlrun.model_monitoring.helpers import batch_dict2timedelta
-from mlrun.utils import datetime_now, logger
+from mlrun.utils import logger
 
 _SECONDS_IN_DAY = int(datetime.timedelta(days=1).total_seconds())
+_SECONDS_IN_MINUTE = 60
 
 
 class _Interval(NamedTuple):
@@ -47,14 +49,17 @@ class _Interval(NamedTuple):
 
 
 class _BatchWindow:
+    TIMESTAMP_RESOLUTION_MICRO: Final = 1e-6  # 0.000001 seconds or 1 microsecond
+
     def __init__(
         self,
         *,
-        schedules_file: ModelMonitoringSchedulesFile,
+        schedules_file: schedules.ModelMonitoringSchedulesFileEndpoint,
         application: str,
         timedelta_seconds: int,
-        last_updated: int,
-        first_request: int,
+        last_updated: float,
+        first_request: float,
+        endpoint_mode: mm_constants.EndpointMode = mm_constants.EndpointMode.REAL_TIME,
     ) -> None:
         """
         Initialize a batch window object that handles the batch interval time range
@@ -67,21 +72,34 @@ class _BatchWindow:
         self._stop = last_updated
         self._step = timedelta_seconds
         self._db = schedules_file
+        self._endpoint_mode = endpoint_mode
         self._start = self._get_last_analyzed()
 
-    def _get_saved_last_analyzed(self) -> Optional[int]:
-        return cast(int, self._db.get_application_time(self._application))
+    def _get_saved_last_analyzed(
+        self,
+    ) -> float | None:
+        return self._db.get_application_time(self._application)
 
-    def _update_last_analyzed(self, last_analyzed: int) -> None:
+    def _update_last_analyzed(self, last_analyzed: float) -> None:
         self._db.update_application_time(
             application=self._application, timestamp=last_analyzed
         )
 
-    def _get_initial_last_analyzed(self) -> int:
+    def _get_initial_last_analyzed(self) -> float:
+        if self._endpoint_mode == mm_constants.EndpointMode.BATCH:
+            logger.info(
+                "No last analyzed time was found for this endpoint and application, as this is "
+                "probably the first time this application is running. Initializing last analyzed "
+                "to the start of the batch time",
+                application=self._application,
+                start_batch_time=self._first_request,
+            )
+            return self._first_request
         logger.info(
             "No last analyzed time was found for this endpoint and application, as this is "
             "probably the first time this application is running. Initializing last analyzed "
-            "to the latest between first request time or last update time minus one day",
+            "to the latest between first request the latest between first request time or last "
+            "update time minus one day",
             application=self._application,
             first_request=self._first_request,
             last_updated=self._stop,
@@ -93,9 +111,12 @@ class _BatchWindow:
             self._stop - first_period_in_seconds,
         )
 
-    def _get_last_analyzed(self) -> int:
+    def _get_last_analyzed(self) -> float:
         saved_last_analyzed = self._get_saved_last_analyzed()
         if saved_last_analyzed is not None:
+            if self._endpoint_mode == mm_constants.EndpointMode.BATCH:
+                # Use the maximum between the saved last analyzed and the start of the batch
+                return max(saved_last_analyzed, self._first_request)
             return saved_last_analyzed
         else:
             last_analyzed = self._get_initial_last_analyzed()
@@ -106,16 +127,18 @@ class _BatchWindow:
     def get_intervals(self) -> Iterator[_Interval]:
         """Generate the batch interval time ranges."""
         entered = False
+        last_analyzed = None
         # Iterate timestamp from start until timestamp <= stop - step
         # so that the last interval will end at (timestamp + step) <= stop.
         # Add 1 to stop - step to get <= and not <.
-        for timestamp in range(self._start, self._stop - self._step + 1, self._step):
+        for timestamp in np.arange(
+            self._start, self._stop - self._step + 1, self._step
+        ):
             entered = True
-            start_time = datetime.datetime.fromtimestamp(
-                timestamp, tz=datetime.timezone.utc
-            )
+            start_time = datetime.datetime.fromtimestamp(timestamp, tz=datetime.UTC)
             end_time = datetime.datetime.fromtimestamp(
-                timestamp + self._step, tz=datetime.timezone.utc
+                timestamp - self.TIMESTAMP_RESOLUTION_MICRO + self._step,
+                tz=datetime.UTC,
             )
             yield _Interval(start_time, end_time)
 
@@ -125,6 +148,32 @@ class _BatchWindow:
                 "Updated the last analyzed time for this endpoint and application",
                 application=self._application,
                 last_analyzed=last_analyzed,
+            )
+
+        if self._endpoint_mode == mm_constants.EndpointMode.BATCH:
+            # If the endpoint is a batch endpoint, we need to update the last analyzed time
+            # to the end of the batch time.
+            if last_analyzed:
+                if last_analyzed - self.TIMESTAMP_RESOLUTION_MICRO < self._stop:
+                    # If the last analyzed time is earlier than the stop time,
+                    # yield the final partial interval from last_analyzed to stop
+                    yield _Interval(
+                        datetime.datetime.fromtimestamp(last_analyzed, tz=datetime.UTC),
+                        datetime.datetime.fromtimestamp(self._stop, tz=datetime.UTC),
+                    )
+            else:
+                # The time span between the start and end of the batch is shorter than the step,
+                # so we need to yield a partial interval covering that range.
+                yield _Interval(
+                    datetime.datetime.fromtimestamp(self._start, tz=datetime.UTC),
+                    datetime.datetime.fromtimestamp(self._stop, tz=datetime.UTC),
+                )
+
+            self._update_last_analyzed(last_analyzed=self._stop)
+            logger.debug(
+                "Updated the last analyzed time for this endpoint and application to the end of the batch time",
+                application=self._application,
+                last_analyzed=self._stop,
             )
 
         if not entered:
@@ -140,7 +189,7 @@ class _BatchWindow:
 
 class _BatchWindowGenerator(AbstractContextManager):
     def __init__(
-        self, project: str, endpoint_id: str, window_length: Optional[int] = None
+        self, project: str, endpoint_id: str, window_length: int | None = None
     ) -> None:
         """
         Initialize a batch window generator object that generates batch window objects
@@ -150,7 +199,7 @@ class _BatchWindowGenerator(AbstractContextManager):
         self._project = project
         self._endpoint_id = endpoint_id
         self._timedelta = window_length
-        self._schedules_file = ModelMonitoringSchedulesFile(
+        self._schedules_file = schedules.ModelMonitoringSchedulesFileEndpoint(
             project=project, endpoint_id=endpoint_id
         )
 
@@ -160,10 +209,10 @@ class _BatchWindowGenerator(AbstractContextManager):
 
     def __exit__(
         self,
-        exc_type: Optional[type[BaseException]],
-        exc_value: Optional[BaseException],
-        traceback: Optional[TracebackType],
-    ) -> Optional[bool]:
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
         self._schedules_file.__exit__(
             exc_type=exc_type, exc_value=exc_value, traceback=traceback
         )
@@ -171,33 +220,25 @@ class _BatchWindowGenerator(AbstractContextManager):
     def get_application_list(self) -> set[str]:
         return self._schedules_file.get_application_list()
 
-    def get_min_last_analyzed(self) -> Optional[int]:
+    def get_min_last_analyzed(self) -> float | None:
         return self._schedules_file.get_min_timestamp()
 
     @classmethod
     def _get_last_updated_time(
-        cls, last_request: datetime.datetime, not_batch_endpoint: bool
-    ) -> int:
+        cls,
+        last_request: datetime.datetime,
+        endpoint_mode: mm_constants.EndpointMode,
+    ) -> float:
         """
         Get the last updated time of a model endpoint.
         """
-        last_updated = int(
-            last_request.timestamp()
-            - cast(
+
+        if endpoint_mode == mm_constants.EndpointMode.REAL_TIME:
+            return last_request.timestamp() - cast(
                 float,
                 mlrun.mlconf.model_endpoint_monitoring.parquet_batching_timeout_secs,
             )
-        )
-        if not not_batch_endpoint:
-            # If the endpoint does not have a stream, `last_updated` should be
-            # the minimum between the current time and the last updated time.
-            # This compensates for the bumping mechanism - see
-            # `update_model_endpoint_last_request`.
-            last_updated = min(int(datetime_now().timestamp()), last_updated)
-            logger.debug(
-                "The endpoint does not have a stream", last_updated=last_updated
-            )
-        return last_updated
+        return last_request.timestamp()
 
     def get_intervals(
         self,
@@ -205,19 +246,21 @@ class _BatchWindowGenerator(AbstractContextManager):
         application: str,
         first_request: datetime.datetime,
         last_request: datetime.datetime,
-        not_batch_endpoint: bool,
+        endpoint_mode: mm_constants.EndpointMode,
     ) -> Iterator[_Interval]:
         """
         Get the batch window for a specific endpoint and application.
         `first_request` and `last_request` are the timestamps of the first request and last
         request to the endpoint, respectively. They are guaranteed to be nonempty at this point.
         """
+
         self.batch_window = _BatchWindow(
             schedules_file=self._schedules_file,
             application=application,
             timedelta_seconds=self._timedelta,
-            last_updated=self._get_last_updated_time(last_request, not_batch_endpoint),
-            first_request=int(first_request.timestamp()),
+            last_updated=self._get_last_updated_time(last_request, endpoint_mode),
+            first_request=first_request.timestamp(),
+            endpoint_mode=endpoint_mode,
         )
         yield from self.batch_window.get_intervals()
 
@@ -242,7 +285,7 @@ class MonitoringApplicationController:
 
     def __init__(self) -> None:
         """Initialize Monitoring Application Controller"""
-        self.project = cast(str, mlrun.mlconf.default_project)
+        self.project = cast(str, mlrun.mlconf.active_project)
         self.project_obj = mlrun.get_run_db().get_project(name=self.project)
         logger.debug(f"Initializing {self.__class__.__name__}", project=self.project)
 
@@ -250,22 +293,103 @@ class MonitoringApplicationController:
 
         self.model_monitoring_access_key = self._get_model_monitoring_access_key()
         self.v3io_access_key = mlrun.mlconf.get_v3io_access_key()
-        self.storage_options = None
-        if mlrun.mlconf.artifact_path.startswith("s3://"):
-            self.storage_options = mlrun.mlconf.get_s3_storage_options()
+        self._controller_stream: (
+            Union[
+                mlrun.platforms.iguazio.OutputStream,
+                mlrun.platforms.iguazio.KafkaOutputStream,
+            ]
+            | None
+        ) = None
+        self._model_monitoring_stream: (
+            Union[
+                mlrun.platforms.iguazio.OutputStream,
+                mlrun.platforms.iguazio.KafkaOutputStream,
+            ]
+            | None
+        ) = None
+        self.applications_streams: dict[
+            str,
+            Union[
+                mlrun.platforms.iguazio.OutputStream,
+                mlrun.platforms.iguazio.KafkaOutputStream,
+            ],
+        ] = {}
+        self.tsdb_connector = mlrun.model_monitoring.get_tsdb_connector(
+            project=self.project
+        )
+        self._legacy_endpoints_warned = False
+
+    @property
+    def controller_stream(
+        self,
+    ) -> Union[
+        mlrun.platforms.iguazio.OutputStream,
+        mlrun.platforms.iguazio.KafkaOutputStream,
+    ]:
+        if self._controller_stream is None:
+            self._controller_stream = mlrun.model_monitoring.helpers.get_output_stream(
+                project=self.project,
+                function_name=mm_constants.MonitoringFunctionNames.APPLICATION_CONTROLLER,
+                v3io_access_key=self.v3io_access_key,
+            )
+        return self._controller_stream
+
+    @property
+    def model_monitoring_stream(
+        self,
+    ) -> Union[
+        mlrun.platforms.iguazio.OutputStream,
+        mlrun.platforms.iguazio.KafkaOutputStream,
+    ]:
+        if self._model_monitoring_stream is None:
+            self._model_monitoring_stream = (
+                mlrun.model_monitoring.helpers.get_output_stream(
+                    project=self.project,
+                    function_name=mm_constants.MonitoringFunctionNames.STREAM,
+                    v3io_access_key=self.model_monitoring_access_key,
+                )
+            )
+        return self._model_monitoring_stream
 
     @staticmethod
-    def _get_model_monitoring_access_key() -> Optional[str]:
+    def _get_model_monitoring_access_key() -> str | None:
         access_key = os.getenv(mm_constants.ProjectSecretKeys.ACCESS_KEY)
         # allow access key to be empty and don't fetch v3io access key if not needed
         if access_key is None:
             access_key = mlrun.mlconf.get_v3io_access_key()
         return access_key
 
-    @staticmethod
     def _should_monitor_endpoint(
-        endpoint: mlrun.common.schemas.ModelEndpoint, application_names: set
+        self,
+        endpoint: mlrun.common.schemas.ModelEndpoint,
+        application_names: set,
+        base_period_minutes: int,
+        schedules_file: schedules.ModelMonitoringSchedulesFileChief,
     ) -> bool:
+        """
+        checks if there is a need to monitor the given endpoint, we should monitor endpoint if it stands in the
+        next conditions:
+            1.  monitoring_mode is enabled
+            2.  first request exists
+            3.  last request exists
+            4.  endpoint_type is not ROUTER
+        if the four above conditions apply we require one of the two condition monitor:
+            1.  never monitored the one of the endpoint applications meaning min_last_analyzed is None
+            2.  min_last_analyzed stands in the condition for sending NOP event and this the first time regular event
+            is sent with the combination of  current last_request  & current last_analyzed  per endpoint.
+        """
+        last_timestamp_sent = schedules_file.get_endpoint_last_request(
+            endpoint.metadata.uid
+        )
+        last_analyzed_sent = schedules_file.get_endpoint_last_analyzed(
+            endpoint.metadata.uid
+        )
+        logger.debug(
+            "Chief should monitor endpoint check",
+            last_timestamp_sent=last_timestamp_sent,
+            last_analyzed_sent=last_analyzed_sent,
+            uid=endpoint.metadata.uid,
+        )
         if (
             # Is the model endpoint monitored?
             endpoint.status.monitoring_mode == mm_constants.ModelMonitoringMode.enabled
@@ -280,22 +404,42 @@ class MonitoringApplicationController:
                 project=endpoint.metadata.project,
                 endpoint_id=endpoint.metadata.uid,
             ) as batch_window_generator:
-                if application_names != batch_window_generator.get_application_list():
+                current_time = mlrun.utils.datetime_now()
+                current_min_last_analyzed = (
+                    batch_window_generator.get_min_last_analyzed()
+                )
+                if (
+                    # Different application names, or last analyzed never updated while there are application to monitor
+                    application_names
+                    and (
+                        application_names
+                        != batch_window_generator.get_application_list()
+                        or not current_min_last_analyzed
+                    )
+                ):
                     return True
                 elif (
-                    not batch_window_generator.get_min_last_analyzed()
-                    or batch_window_generator.get_min_last_analyzed()
-                    <= int(endpoint.status.last_request.timestamp())
+                    # Does nop event will be sent to close the relevant window
+                    self._should_send_nop_event(
+                        base_period_minutes, current_min_last_analyzed, current_time
+                    )
+                    and (
+                        endpoint.status.last_request.timestamp() != last_timestamp_sent
+                        or current_min_last_analyzed != last_analyzed_sent
+                    )
                 ):
+                    # Write to schedule chief file the last_request, min_last_analyzed we pushed event to stream
+                    schedules_file.update_endpoint_timestamps(
+                        endpoint_uid=endpoint.metadata.uid,
+                        last_request=endpoint.status.last_request.timestamp(),
+                        last_analyzed=current_min_last_analyzed,
+                    )
                     return True
                 else:
                     logger.info(
                         "All the possible intervals were already analyzed, didn't push regular event",
                         endpoint_id=endpoint.metadata.uid,
-                        last_analyzed=datetime.datetime.fromtimestamp(
-                            batch_window_generator.get_min_last_analyzed(),
-                            tz=datetime.timezone.utc,
-                        ),
+                        last_analyzed=current_min_last_analyzed,
                         last_request=endpoint.status.last_request,
                     )
         else:
@@ -309,6 +453,21 @@ class MonitoringApplicationController:
                 feature_set_uri=endpoint.spec.monitoring_feature_set_uri,
             )
         return False
+
+    @staticmethod
+    def _should_send_nop_event(
+        base_period_minutes: int,
+        min_last_analyzed: float,
+        current_time: datetime.datetime,
+    ):
+        if min_last_analyzed:
+            return (
+                current_time.timestamp() - min_last_analyzed
+                >= datetime.timedelta(minutes=base_period_minutes).total_seconds()
+                + mlrun.mlconf.model_endpoint_monitoring.parquet_batching_timeout_secs
+            )
+        else:
+            return True
 
     def run(self, event: nuclio_sdk.Event) -> None:
         """
@@ -334,7 +493,7 @@ class MonitoringApplicationController:
 
     def model_endpoint_process(
         self,
-        event: Optional[dict] = None,
+        event: dict | None = None,
     ) -> None:
         """
         Process a model endpoint and trigger the monitoring applications. This function running on different process
@@ -347,24 +506,66 @@ class MonitoringApplicationController:
         try:
             project_name = event[ControllerEvent.PROJECT]
             endpoint_id = event[ControllerEvent.ENDPOINT_ID]
-            endpoint_name = event[ControllerEvent.ENDPOINT_NAME]
-            applications_names = event[ControllerEvent.ENDPOINT_POLICY][
-                "monitoring_applications"
-            ]
+            if (
+                event[ControllerEvent.KIND]
+                == mm_constants.ControllerEventKind.BATCH_COMPLETE
+            ):
+                monitoring_functions = (
+                    self.project_obj.list_model_monitoring_functions()
+                )
+                if monitoring_functions:
+                    applications_names = list(
+                        {app.metadata.name for app in monitoring_functions}
+                    )
+                    last_stream_timestamp = datetime.datetime.fromisoformat(
+                        event[ControllerEvent.LAST_TIMESTAMP]
+                    )
+                    first_request = datetime.datetime.fromisoformat(
+                        event[ControllerEvent.FIRST_TIMESTAMP]
+                    )
+                    endpoint_mode = mm_constants.EndpointMode.BATCH
+                    model_endpoint = self.project_obj.list_model_endpoints(
+                        uids=[endpoint_id],
+                        latest_only=True,
+                    ).endpoints
 
-            not_batch_endpoint = (
-                event[ControllerEvent.ENDPOINT_POLICY] != EndpointType.BATCH_EP
-            )
-            m_fs = fstore.get_feature_set(event[ControllerEvent.FEATURE_SET_URI])
+                    if not model_endpoint:
+                        logger.error(
+                            "Batch model endpoint not found",
+                            endpoint_id=endpoint_id,
+                            project=project_name,
+                        )
+                        return
+
+                    endpoint_name = model_endpoint[0].metadata.name
+                    endpoint_updated = model_endpoint[0].metadata.updated.isoformat()
+
+                else:
+                    logger.info("No monitoring functions found", project=self.project)
+                    return
+
+            else:
+                endpoint_name = event[ControllerEvent.ENDPOINT_NAME]
+                applications_names = event[ControllerEvent.ENDPOINT_POLICY][
+                    ControllerEventEndpointPolicy.MONITORING_APPLICATIONS
+                ]
+                last_stream_timestamp = datetime.datetime.fromisoformat(
+                    event[ControllerEvent.TIMESTAMP]
+                )
+                first_request = datetime.datetime.fromisoformat(
+                    event[ControllerEvent.FIRST_REQUEST]
+                )
+
+                endpoint_updated = event[ControllerEvent.ENDPOINT_POLICY][
+                    ControllerEventEndpointPolicy.ENDPOINT_UPDATED
+                ]
+
+                endpoint_mode = mm_constants.EndpointMode.REAL_TIME
+
             logger.info(
-                "Starting analyzing for", timestamp=event[ControllerEvent.TIMESTAMP]
+                "Starting to analyze", timestamp=last_stream_timestamp.isoformat()
             )
-            last_stream_timestamp = datetime.datetime.fromisoformat(
-                event[ControllerEvent.TIMESTAMP]
-            )
-            first_request = datetime.datetime.fromisoformat(
-                event[ControllerEvent.FIRST_REQUEST]
-            )
+
             with _BatchWindowGenerator(
                 project=project_name,
                 endpoint_id=endpoint_id,
@@ -376,17 +577,18 @@ class MonitoringApplicationController:
                         end_infer_time,
                     ) in batch_window_generator.get_intervals(
                         application=application,
-                        not_batch_endpoint=not_batch_endpoint,
                         first_request=first_request,
                         last_request=last_stream_timestamp,
+                        endpoint_mode=endpoint_mode,
                     ):
-                        df = m_fs.to_dataframe(
-                            start_time=start_infer_time,
-                            end_time=end_infer_time,
-                            time_column=mm_constants.EventFieldType.TIMESTAMP,
-                            storage_options=self.storage_options,
+                        # Get the relevant window data from the TSDB
+                        prediction_metric = self.tsdb_connector.read_predictions(
+                            start=start_infer_time,
+                            end=end_infer_time,
+                            endpoint_id=endpoint_id,
                         )
-                        if len(df) == 0:
+
+                        if not prediction_metric.data:
                             logger.info(
                                 "No data found for the given interval",
                                 start=start_infer_time,
@@ -401,49 +603,60 @@ class MonitoringApplicationController:
                                 endpoint_id=endpoint_id,
                             )
                             self._push_to_applications(
-                                start_infer_time=start_infer_time,
+                                start_infer_time=start_infer_time
+                                - datetime.timedelta(
+                                    batch_window_generator.batch_window.TIMESTAMP_RESOLUTION_MICRO
+                                ),  # We subtract a microsecond to ensure that the apps will retrieve start time data.
                                 end_infer_time=end_infer_time,
                                 endpoint_id=endpoint_id,
                                 endpoint_name=endpoint_name,
                                 project=project_name,
                                 applications_names=[application],
                                 model_monitoring_access_key=self.model_monitoring_access_key,
+                                endpoint_updated=endpoint_updated,
                             )
-                base_period = event[ControllerEvent.ENDPOINT_POLICY]["base_period"]
-                current_time = mlrun.utils.datetime_now()
+
                 if (
-                    current_time.timestamp()
-                    - batch_window_generator.get_min_last_analyzed()
-                    >= datetime.timedelta(minutes=base_period).total_seconds()
-                    and event[ControllerEvent.KIND] != ControllerEventKind.NOP_EVENT
+                    event[ControllerEvent.KIND]
+                    == mm_constants.ControllerEventKind.REGULAR_EVENT
                 ):
-                    event = {
-                        ControllerEvent.KIND: mm_constants.ControllerEventKind.NOP_EVENT,
-                        ControllerEvent.PROJECT: project_name,
-                        ControllerEvent.ENDPOINT_ID: endpoint_id,
-                        ControllerEvent.ENDPOINT_NAME: endpoint_name,
-                        ControllerEvent.TIMESTAMP: current_time.isoformat(
-                            timespec="microseconds"
-                        ),
-                        ControllerEvent.ENDPOINT_POLICY: event[
-                            ControllerEvent.ENDPOINT_POLICY
-                        ],
-                        ControllerEvent.ENDPOINT_TYPE: event[
-                            ControllerEvent.ENDPOINT_TYPE
-                        ],
-                        ControllerEvent.FEATURE_SET_URI: event[
-                            ControllerEvent.FEATURE_SET_URI
-                        ],
-                        ControllerEvent.FIRST_REQUEST: event[
-                            ControllerEvent.FIRST_REQUEST
-                        ],
-                    }
-                    self._push_to_main_stream(
-                        event=event,
-                        endpoint_id=endpoint_id,
-                    )
+                    base_period = event[ControllerEvent.ENDPOINT_POLICY][
+                        ControllerEventEndpointPolicy.BASE_PERIOD
+                    ]
+                    current_time = mlrun.utils.datetime_now()
+                    if self._should_send_nop_event(
+                        base_period,
+                        batch_window_generator.get_min_last_analyzed(),
+                        current_time,
+                    ):
+                        event = {
+                            ControllerEvent.KIND: mm_constants.ControllerEventKind.NOP_EVENT,
+                            ControllerEvent.PROJECT: project_name,
+                            ControllerEvent.ENDPOINT_ID: endpoint_id,
+                            ControllerEvent.ENDPOINT_NAME: endpoint_name,
+                            ControllerEvent.TIMESTAMP: current_time.isoformat(
+                                timespec="microseconds"
+                            ),
+                            ControllerEvent.ENDPOINT_POLICY: event[
+                                ControllerEvent.ENDPOINT_POLICY
+                            ],
+                            ControllerEvent.ENDPOINT_TYPE: event[
+                                ControllerEvent.ENDPOINT_TYPE
+                            ],
+                            ControllerEvent.FEATURE_SET_URI: event[
+                                ControllerEvent.FEATURE_SET_URI
+                            ],
+                            ControllerEvent.FIRST_REQUEST: event[
+                                ControllerEvent.FIRST_REQUEST
+                            ],
+                        }
+                        self._push_to_main_stream(
+                            event=event,
+                            endpoint_id=endpoint_id,
+                        )
             logger.info(
-                "Finish analyze for", timestamp=event[ControllerEvent.TIMESTAMP]
+                "Finish analyze for",
+                timestamp=last_stream_timestamp,
             )
 
         except Exception:
@@ -452,8 +665,8 @@ class MonitoringApplicationController:
                 endpoint_id=event[ControllerEvent.ENDPOINT_ID],
             )
 
-    @staticmethod
     def _push_to_applications(
+        self,
         start_infer_time: datetime.datetime,
         end_infer_time: datetime.datetime,
         endpoint_id: str,
@@ -461,6 +674,7 @@ class MonitoringApplicationController:
         project: str,
         applications_names: list[str],
         model_monitoring_access_key: str,
+        endpoint_updated: str,
     ):
         """
         Pushes data to multiple stream applications.
@@ -471,7 +685,7 @@ class MonitoringApplicationController:
         :param project: mlrun               Project name.
         :param applications_names:          List of application names to which data will be pushed.
         :param model_monitoring_access_key: Access key to apply the model monitoring process.
-
+        :param endpoint_updated:            str isoformet for the timestamp the model endpoint was updated
         """
         data = {
             mm_constants.ApplicationEvent.START_INFER_TIME: start_infer_time.isoformat(
@@ -482,15 +696,19 @@ class MonitoringApplicationController:
             ),
             mm_constants.ApplicationEvent.ENDPOINT_ID: endpoint_id,
             mm_constants.ApplicationEvent.ENDPOINT_NAME: endpoint_name,
+            mm_constants.ApplicationEvent.ENDPOINT_UPDATED: endpoint_updated,
         }
         for app_name in applications_names:
             data.update({mm_constants.ApplicationEvent.APPLICATION_NAME: app_name})
-
-            app_stream = mlrun.model_monitoring.helpers.get_output_stream(
-                project=project,
-                function_name=app_name,
-                v3io_access_key=model_monitoring_access_key,
-            )
+            if app_name not in self.applications_streams:
+                self.applications_streams[app_name] = (
+                    mlrun.model_monitoring.helpers.get_output_stream(
+                        project=project,
+                        function_name=app_name,
+                        v3io_access_key=model_monitoring_access_key,
+                    )
+                )
+            app_stream = self.applications_streams.get(app_name)
 
             logger.info(
                 "Pushing data to application stream",
@@ -498,19 +716,54 @@ class MonitoringApplicationController:
                 app_name=app_name,
                 app_stream_type=str(type(app_stream)),
             )
-            app_stream.push([data])
+            app_stream.push([data], partition_key=endpoint_id)
 
     def push_regular_event_to_controller_stream(self) -> None:
         """
         pushes a regular event to the controller stream.
-        :param event: the nuclio trigger event
         """
         logger.info("Starting monitoring controller chief")
         applications_names = []
-        endpoints = self.project_obj.list_model_endpoints(tsdb_metrics=True).endpoints
+        endpoints = self.project_obj.list_model_endpoints(
+            tsdb_metrics=False,
+            modes=[
+                mm_constants.EndpointMode.REAL_TIME,
+                mm_constants.EndpointMode.BATCH_LEGACY,
+            ],
+        ).endpoints
+
+        legacy_endpoints = [
+            endpoint
+            for endpoint in endpoints
+            if endpoint.metadata.mode == mm_constants.EndpointMode.BATCH_LEGACY
+        ]
+        endpoints = [
+            endpoint
+            for endpoint in endpoints
+            if endpoint.metadata.mode != mm_constants.EndpointMode.BATCH_LEGACY
+        ]
+
+        if legacy_endpoints and not self._legacy_endpoints_warned:
+            logger.warning(
+                "Legacy batch model endpoints are no longer monitored by the controller; "
+                "re-create them via job-based serving to resume monitoring",
+                project=self.project,
+                count=len(legacy_endpoints),
+            )
+            self._legacy_endpoints_warned = True
+
         if not endpoints:
             logger.info("No model endpoints found", project=self.project)
             return
+
+        last_request_dict = self.tsdb_connector.get_last_request(
+            endpoint_ids=[mep.metadata.uid for mep in endpoints]
+        )
+        if isinstance(last_request_dict, pd.DataFrame):
+            last_request_dict = last_request_dict.set_index(
+                mm_constants.EventFieldType.ENDPOINT_ID
+            )[mm_constants.ModelEndpointSchema.LAST_REQUEST].to_dict()
+
         monitoring_functions = self.project_obj.list_model_monitoring_functions()
         if monitoring_functions:
             # if monitoring_functions: - TODO : ML-7700
@@ -534,8 +787,8 @@ class MonitoringApplicationController:
             logger.info("No monitoring functions found", project=self.project)
             return
         policy = {
-            "monitoring_applications": applications_names,
-            "base_period": int(
+            ControllerEventEndpointPolicy.MONITORING_APPLICATIONS: applications_names,
+            ControllerEventEndpointPolicy.BASE_PERIOD: int(
                 batch_dict2timedelta(
                     json.loads(
                         cast(
@@ -544,34 +797,65 @@ class MonitoringApplicationController:
                         )
                     )
                 ).total_seconds()
-                // 60
+                // _SECONDS_IN_MINUTE
             ),
         }
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(len(endpoints), 10)
         ) as pool:
-            for endpoint in endpoints:
-                pool.submit(
-                    MonitoringApplicationController.endpoint_to_regular_event,
-                    endpoint,
-                    policy,
-                    set(applications_names),
-                    self.v3io_access_key,
-                )
+            with schedules.ModelMonitoringSchedulesFileChief(
+                self.project
+            ) as schedule_file:
+                for endpoint in endpoints:
+                    last_request = last_request_dict.get(endpoint.metadata.uid, None)
+                    if isinstance(last_request, float):
+                        last_request = datetime.datetime.fromtimestamp(
+                            last_request, tz=datetime.UTC
+                        )
+                    elif isinstance(last_request, pd.Timestamp):
+                        last_request = last_request.to_pydatetime()
+                    endpoint.status.last_request = (
+                        last_request or endpoint.status.last_request
+                    )
+                    futures = {
+                        pool.submit(
+                            self.endpoint_to_regular_event,
+                            endpoint,
+                            policy,
+                            set(applications_names),
+                            schedule_file,
+                        ): endpoint
+                    }
+                for future in concurrent.futures.as_completed(futures):
+                    if future.exception():
+                        exception = future.exception()
+                        error = (
+                            f"Failed to push event. Endpoint name: {futures[future].metadata.name}, "
+                            f"endpoint uid: {futures[future].metadata.uid}, traceback:\n"
+                        )
+                        error += "".join(
+                            traceback.format_exception(
+                                None, exception, exception.__traceback__
+                            )
+                        )
+                        logger.error(error)
         logger.info("Finishing monitoring controller chief")
 
-    @staticmethod
     def endpoint_to_regular_event(
+        self,
         endpoint: mlrun.common.schemas.ModelEndpoint,
         policy: dict,
         applications_names: set,
-        v3io_access_key: str,
+        schedule_file: schedules.ModelMonitoringSchedulesFileChief,
     ) -> None:
-        if MonitoringApplicationController._should_monitor_endpoint(
-            endpoint, set(applications_names)
+        if self._should_monitor_endpoint(
+            endpoint,
+            set(applications_names),
+            policy.get(ControllerEventEndpointPolicy.BASE_PERIOD, 10),
+            schedule_file,
         ):
-            logger.info(
-                "Regular event is being pushed to controller stream for model endpoint",
+            logger.debug(
+                "Endpoint data is being prepared for regular event",
                 endpoint_id=endpoint.metadata.uid,
                 endpoint_name=endpoint.metadata.name,
                 timestamp=endpoint.status.last_request.isoformat(
@@ -584,12 +868,14 @@ class MonitoringApplicationController:
                 feature_set_uri=endpoint.spec.monitoring_feature_set_uri,
                 endpoint_policy=json.dumps(policy),
             )
-            MonitoringApplicationController.push_to_controller_stream(
+            policy[ControllerEventEndpointPolicy.ENDPOINT_UPDATED] = (
+                endpoint.metadata.updated.isoformat()
+            )
+            self.push_to_controller_stream(
                 kind=mm_constants.ControllerEventKind.REGULAR_EVENT,
                 project=endpoint.metadata.project,
                 endpoint_id=endpoint.metadata.uid,
                 endpoint_name=endpoint.metadata.name,
-                stream_access_key=v3io_access_key,
                 timestamp=endpoint.status.last_request.isoformat(
                     sep=" ", timespec="microseconds"
                 ),
@@ -601,13 +887,12 @@ class MonitoringApplicationController:
                 endpoint_policy=policy,
             )
 
-    @staticmethod
     def push_to_controller_stream(
+        self,
         kind: str,
         project: str,
         endpoint_id: str,
         endpoint_name: str,
-        stream_access_key: str,
         timestamp: str,
         first_request: str,
         endpoint_type: int,
@@ -625,7 +910,6 @@ class MonitoringApplicationController:
         :param endpoint_name: the endpoint name string
         :param endpoint_type: Enum of the endpoint type
         :param feature_set_uri: the feature set uri string
-        :param stream_access_key: access key to apply the model monitoring process.
         """
         event = {
             ControllerEvent.KIND.value: kind,
@@ -638,18 +922,13 @@ class MonitoringApplicationController:
             ControllerEvent.FEATURE_SET_URI.value: feature_set_uri,
             ControllerEvent.ENDPOINT_POLICY.value: endpoint_policy,
         }
-        controller_stream = mlrun.model_monitoring.helpers.get_output_stream(
-            project=project,
-            function_name=mm_constants.MonitoringFunctionNames.APPLICATION_CONTROLLER,
-            v3io_access_key=stream_access_key,
-        )
         logger.info(
             "Pushing data to controller stream",
             event=event,
             endpoint_id=endpoint_id,
-            controller_stream_type=str(type(controller_stream)),
+            controller_stream_type=str(type(self.controller_stream)),
         )
-        controller_stream.push([event], partition_key=endpoint_id)
+        self.controller_stream.push([event], partition_key=endpoint_id)
 
     def _push_to_main_stream(self, event: dict, endpoint_id: str) -> None:
         """
@@ -657,18 +936,13 @@ class MonitoringApplicationController:
         :param event: event dictionary to push to stream
         :param endpoint_id: endpoint id string
         """
-        mm_stream = mlrun.model_monitoring.helpers.get_output_stream(
-            project=event.get(ControllerEvent.PROJECT),
-            function_name=mm_constants.MonitoringFunctionNames.APPLICATION_CONTROLLER,
-            v3io_access_key=self.v3io_access_key,
-        )
         logger.info(
             "Pushing data to main stream, NOP event is been generated",
             event=json.dumps(event),
             endpoint_id=endpoint_id,
-            mm_stream_type=str(type(mm_stream)),
+            mm_stream_type=str(type(self.model_monitoring_stream)),
         )
-        mm_stream.push([event], partition_key=endpoint_id)
+        self.model_monitoring_stream.push([event], partition_key=endpoint_id)
 
 
 def handler(context: nuclio_sdk.Context, event: nuclio_sdk.Event) -> None:

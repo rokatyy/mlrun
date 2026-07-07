@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import asyncio
-import typing
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from http import HTTPStatus
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Literal, Union
 
-from fastapi import APIRouter, Depends, Path, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
@@ -30,19 +29,19 @@ import mlrun.common.schemas.model_monitoring.model_endpoints as mm_endpoints
 import mlrun.model_monitoring
 import mlrun.utils.helpers
 from mlrun import MLRunInvalidArgumentError
+from mlrun.model_monitoring.helpers import validate_time_range
 from mlrun.utils import logger
 
 import framework.api.deps
 import framework.utils.auth.verifier
+import services.api.common.constants as api_constants
 import services.api.crud
 from framework.api import deps
 
 router = APIRouter(prefix="/projects/{project}/model-endpoints")
 
-ProjectAnnotation = Annotated[str, Path(pattern=mm_constants.PROJECT_PATTERN)]
-EndpointIDAnnotation = Annotated[
-    str, Path(pattern=mm_constants.MODEL_ENDPOINT_ID_PATTERN)
-]
+ProjectAnnotation = api_constants.ProjectAnnotation
+EndpointIDAnnotation = api_constants.EndpointIDAnnotation
 
 
 @router.post(
@@ -53,15 +52,18 @@ EndpointIDAnnotation = Annotated[
 async def create_model_endpoint(
     model_endpoint: schemas.ModelEndpoint,
     project: ProjectAnnotation,
-    creation_strategy: mm_constants.ModelEndpointCreationStrategy,
+    delete_background_task: BackgroundTasks,
+    creation_strategy: mm_constants.ModelEndpointCreationStrategy | None = Query(
+        None, alias="creation-strategy"
+    ),
     auth_info: schemas.AuthInfo = Depends(framework.api.deps.authenticate_request),
     db_session: Session = Depends(framework.api.deps.get_db_session),
 ) -> schemas.ModelEndpoint:
     """
     Create a new model endpoint record in the DB.
-    :param model_endpoint:  The model endpoint object.
-    :param project:         The name of the project.
-    :param creation_strategy: Strategy for creating or updating the model endpoint:
+    :param model_endpoint:         The model endpoint object.
+    :param project:                The name of the project.
+    :param creation_strategy:      Strategy for creating or updating the model endpoint:
         * **overwrite**:
         1. If model endpoints with the same name exist, delete the `latest` one.
         2. Create a new model endpoint entry and set it as `latest`.
@@ -71,8 +73,9 @@ async def create_model_endpoint(
         * **archive**:
         1. If model endpoints with the same name exist, preserve them.
         2. Create a new model endpoint with the same name and set it to `latest`.
-    :param auth_info:       The auth info of the request.
-    :param db_session:      A session that manages the current dialog with the database.
+    :param delete_background_task: A background task that will be used to delete old TSDB records (if required).
+    :param auth_info:              The auth info of the request.
+    :param db_session:             A session that manages the current dialog with the database.
 
     :return: A Model endpoint object without operative data.
     """
@@ -99,11 +102,13 @@ async def create_model_endpoint(
         _,
         _,
         _,
-    ) = await services.api.crud.ModelEndpoints().create_model_endpoint(
+    ) = await run_in_threadpool(
+        services.api.crud.ModelEndpoints().create_model_endpoint,
         db_session=db_session,
         model_endpoint=model_endpoint,
         creation_strategy=creation_strategy,
         upsert=True,
+        delete_background_task=delete_background_task,
     )
     return model_endpoint
 
@@ -152,7 +157,8 @@ async def patch_model_endpoint(
     )
     attributes = {key: model_endpoint.get(key) for key in attributes_keys}
 
-    return await services.api.crud.ModelEndpoints().patch_model_endpoint(
+    return await run_in_threadpool(
+        services.api.crud.ModelEndpoints().patch_model_endpoint,
         name=model_endpoint.metadata.name,
         project=project,
         function_name=model_endpoint.spec.function_name,
@@ -170,22 +176,25 @@ async def patch_model_endpoint(
 async def delete_model_endpoint(
     project: ProjectAnnotation,
     name: str,
-    function_name: Optional[str] = None,
-    function_tag: Optional[str] = None,
-    endpoint_id: typing.Optional[EndpointIDAnnotation] = "*",
+    delete_background_task: BackgroundTasks,
+    function_name: str | None = Query(None, alias="function-name"),
+    function_tag: str | None = Query(None, alias="function-tag"),
+    endpoint_id: EndpointIDAnnotation | None = Query(None, alias="endpoint-id"),
     auth_info: schemas.AuthInfo = Depends(framework.api.deps.authenticate_request),
     db_session: Session = Depends(framework.api.deps.get_db_session),
 ) -> None:
     """
     Delete a model endpoint record from the DB.
-    :param project:         The name of the project.
-    :param name:            The model endpoint name.
-    :param function_name:   The name of the function.
-    :param function_tag:    The tag of the function.
-    :param endpoint_id:     The unique id of the model endpoint.
-    :param auth_info:       The auth info of the request.
-    :param db_session:      A session that manages the current dialog with the database.
+    :param project:                The name of the project.
+    :param name:                   The model endpoint name.
+    :param delete_background_task: A background task that will be used to delete old TSDB records.
+    :param function_name:          The name of the function.
+    :param function_tag:           The tag of the function.
+    :param endpoint_id:            The unique id of the model endpoint.
+    :param auth_info:              The auth info of the request.
+    :param db_session:             A session that manages the current dialog with the database.
     """
+    endpoint_id = endpoint_id or "*"
 
     await (
         framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
@@ -197,13 +206,15 @@ async def delete_model_endpoint(
         )
     )
 
-    await services.api.crud.ModelEndpoints().delete_model_endpoint(
+    await run_in_threadpool(
+        services.api.crud.ModelEndpoints().delete_model_endpoint,
         project=project,
         name=name,
         function_name=function_name,
         function_tag=function_tag,
         db_session=db_session,
         endpoint_id=endpoint_id,
+        delete_background_task=delete_background_task,
     )
 
 
@@ -214,18 +225,20 @@ async def delete_model_endpoint(
 )
 async def list_model_endpoints(
     project: ProjectAnnotation,
-    name: Optional[str] = None,
-    model_name: Optional[str] = None,
-    model_tag: Optional[str] = None,
-    function_name: Optional[str] = None,
-    function_tag: Optional[str] = None,
+    names: list[str] | None = Query(None, alias="name"),
+    model_name: str | None = Query(None, alias="model-name"),
+    model_tag: str | None = Query(None, alias="model-tag"),
+    function_name: str | None = Query(None, alias="function-name"),
+    function_tag: str | None = Query(None, alias="function-tag"),
     labels: list[str] = Query([], alias="label"),
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
     top_level: bool = Query(False, alias="top-level"),
-    tsdb_metrics: bool = True,
+    modes: list[mm_constants.EndpointMode] | None = Query(None, alias="mode"),
+    tsdb_metrics: bool = Query(True, alias="tsdb-metrics"),
+    metric_list: list[str] | None = Query(None, alias="metric"),
     uids: list[str] = Query(None, alias="uid"),
-    latest_only: bool = False,
+    latest_only: bool = Query(False, alias="latest-only"),
     auth_info: schemas.AuthInfo = Depends(framework.api.deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
 ) -> schemas.ModelEndpointList:
@@ -233,15 +246,21 @@ async def list_model_endpoints(
     List model endpoints.
 
     :param project:         The name of the project.
-    :param name:            The model endpoint name.
+    :param names:           The model endpoints names.
     :param model_name:      The model name.
+    :param model_tag:       The model tag.
     :param function_name:   The function name.
     :param function_tag:    The function tag.
     :param labels:          The labels of the model endpoint.
     :param start:           The start time to filter by.Corresponding to the `created` field.
     :param end:             The end time to filter by. Corresponding to the `created` field.
     :param tsdb_metrics:    Whether to include metrics from the time series DB.
+    :param metric_list:     List of metrics to include from the time series DB. Defaults to all metrics.
+                            If tsdb_metrics=False, this parameter will be ignored and no tsdb metrics
+                            will be included.
     :param top_level:       Whether to return only top level model endpoints.
+    :param modes:           Specifies the mode of the model endpoint. Can be "real-time" (0), "batch" (1),
+                            "batch_legacy" (2). If set to None, all are included.
     :param uids:            A list of unique ids to filter by.
     :param latest_only:     Whether to return only the latest model endpoint for each name.
     :param auth_info:       The auth info of the request.
@@ -254,9 +273,10 @@ async def list_model_endpoints(
         auth_info=auth_info,
     )
 
-    endpoints = await services.api.crud.ModelEndpoints().list_model_endpoints(
+    endpoints = await run_in_threadpool(
+        services.api.crud.ModelEndpoints().list_model_endpoints,
         project=project,
-        name=name,
+        names=names,
         model_name=model_name,
         model_tag=model_tag,
         function_name=function_name,
@@ -265,7 +285,9 @@ async def list_model_endpoints(
         start=start,
         end=end,
         top_level=top_level,
+        modes=modes,
         tsdb_metrics=tsdb_metrics,
+        metric_list=metric_list,
         uids=uids,
         latest_only=latest_only,
         db_session=db_session,
@@ -367,16 +389,13 @@ async def get_model_endpoint_monitoring_metrics(
     return metrics
 
 
-@router.get(
-    "/metrics",
-    response_model=dict[str, list[mm_endpoints.ModelEndpointMonitoringMetric]],
-)
 async def get_metrics_by_multiple_endpoints(
     project: ProjectAnnotation,
     auth_info: schemas.AuthInfo = Depends(framework.api.deps.authenticate_request),
     type: Literal["results", "metrics", "all"] = "all",
-    endpoint_ids: list[EndpointIDAnnotation] = Query(None, alias="endpoint-id"),
-    events_format: mm_constants.GetEventsFormat = mm_constants.GetEventsFormat.SEPARATION,
+    endpoint_ids: list[EndpointIDAnnotation] = Query([], alias="endpoint-id"),
+    events_format: mm_constants.GetEventsFormat = Query(None, alias="events-format"),
+    db_session: Session = Depends(deps.get_db_session),
 ) -> dict[str, list[mm_endpoints.ModelEndpointMonitoringMetric]]:
     """
     :param project:       The name of the project.
@@ -385,12 +404,14 @@ async def get_metrics_by_multiple_endpoints(
                           and "metrics".
     :param endpoint_ids:  The unique id of the model endpoint. Can be a single id or a list of ids.
     :param events_format: response format:
+    :param db_session:    A session that manages the current dialog with the database.
 
                           separation: {"mep_id1":[...], "mep_id2":[...]}
                           intersection {"intersect_metrics":[], "intersect_results":[]}
     :returns:             A dictionary of application metrics and/or results for the model endpoints,
                           formatted by events_format.
     """
+    events_format = events_format or mm_constants.GetEventsFormat.SEPARATION
     events = {}
     permissions_tasks = []
     is_metrics_supported = type == "metrics" or type == "all"
@@ -405,6 +426,20 @@ async def get_metrics_by_multiple_endpoints(
         )
 
     await asyncio.gather(*permissions_tasks)
+
+    # verify all endpoints exist in the project
+    endpoints_data = await run_in_threadpool(
+        services.api.crud.ModelEndpoints().list_model_endpoints,
+        project=project,
+        uids=endpoint_ids,
+        db_session=db_session,
+    )
+    returned_uids = [endpoint.metadata.uid for endpoint in endpoints_data.endpoints]
+    if len(returned_uids) < len(endpoint_ids):
+        missing_endpoints = set(endpoint_ids) - set(returned_uids)
+        raise mlrun.errors.MLRunNotFoundError(
+            f"Model endpoints with ids {missing_endpoints} were not found in project {project}."
+        )
 
     task_results = await _collect_get_metrics_tasks_results(
         endpoint_ids=endpoint_ids,
@@ -448,11 +483,12 @@ async def get_metrics_by_multiple_endpoints(
 async def get_model_endpoint(
     name: str,
     project: ProjectAnnotation,
-    function_name: Optional[str] = None,
-    function_tag: Optional[str] = None,
-    endpoint_id: Optional[EndpointIDAnnotation] = None,
-    tsdb_metrics: bool = True,
-    feature_analysis: bool = False,
+    function_name: str | None = Query(None, alias="function-name"),
+    function_tag: str | None = Query(None, alias="function-tag"),
+    endpoint_id: EndpointIDAnnotation | None = Query(None, alias="endpoint-id"),
+    tsdb_metrics: bool = Query(True, alias="tsdb-metrics"),
+    metric_list: list[str] | None = Query(None, alias="metric"),
+    feature_analysis: bool = Query(False, alias="feature-analysis"),
     auth_info: schemas.AuthInfo = Depends(framework.api.deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
 ) -> schemas.ModelEndpoint:
@@ -465,6 +501,9 @@ async def get_model_endpoint(
     :param function_tag:        The tag of the function.
     :param endpoint_id:         The unique id of the model endpoint.
     :param tsdb_metrics:        Whether to include metrics from the time series DB.
+    :param metric_list:         List of metrics to include from the time series DB. Defaults to all metrics.
+                                If tsdb_metrics=False, this parameter will be ignored and no tsdb metrics
+                                will be included.
     :param feature_analysis:    Whether to include feature analysis.
     :param auth_info:           The auth info of the request.
     :param db_session:          A session that manages the current dialog with the database.
@@ -474,7 +513,8 @@ async def get_model_endpoint(
         project=project, name_or_uid=name, auth_info=auth_info
     )
 
-    return await services.api.crud.ModelEndpoints().get_model_endpoint(
+    return await run_in_threadpool(
+        services.api.crud.ModelEndpoints().get_model_endpoint,
         name=name,
         project=project,
         function_name=function_name,
@@ -482,6 +522,7 @@ async def get_model_endpoint(
         endpoint_id=endpoint_id,
         feature_analysis=feature_analysis,
         tsdb_metrics=tsdb_metrics,
+        metric_list=metric_list,
         db_session=db_session,
     )
 
@@ -503,8 +544,8 @@ async def _get_metrics_values_params(
         list[str],
         Query(pattern=mm_constants.FQN_PATTERN),
     ],
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
     auth_info: schemas.AuthInfo = Depends(framework.api.deps.authenticate_request),
 ) -> _MetricsValuesParams:
     """
@@ -522,22 +563,7 @@ async def _get_metrics_values_params(
     await _verify_model_endpoint_read_permission(
         project=project, name_or_uid=endpoint_id, auth_info=auth_info
     )
-    if start is None and end is None:
-        end = mlrun.utils.helpers.datetime_now()
-        start = end - timedelta(days=1)
-    elif start is not None and end is not None:
-        if start.tzinfo is None or end.tzinfo is None:
-            raise mlrun.errors.MLRunInvalidArgumentTypeError(
-                "Custom start and end times must contain the timezone."
-            )
-        if start > end:
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                "The start time must precede the end time."
-            )
-    else:
-        raise mlrun.errors.MLRunInvalidArgumentError(
-            "Provided only one of start time, end time. Please provide both or neither."
-        )
+    start, end = validate_time_range(start, end)
 
     metrics = []
     results = []

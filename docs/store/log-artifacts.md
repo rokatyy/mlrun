@@ -1,19 +1,24 @@
 (log-artifacts)=
 # Logging artifacts
-To log artifacts that are not of kind model or dataset, use the {py:meth}`~mlrun.execution.MLClientCtx.log_artifact` method.
+Learn how to log artifacts of kind Plotly, directory, and dataset, using the {py:meth}`~mlrun.execution.MLClientCtx.log_artifact` method.
 You can apply this method to the project object or the context object when logging an artifact in runtime, for example a job.
 
 **In this section**
 - [Basic logging of an artifacts file](#basic-logging-of-an-artifacts-file)
 - [Log a Plotly object as an HTML file](#log-a-plotly-object-as-an-html-file)
-- [Logging Plotly artifacts](#logging-plotly-artifacts)
-- [Logging directory artifacts](#logging-directory-artifacts)
+- [Log Plotly artifacts](#log-plotly-artifacts)
+- [Log directory artifacts](#log-directory-artifacts)
+- [Log dataset artifacts](#log-dataset-artifacts)
 
 **See also**
-- {ref}`working-with-data-and-model-artifacts`
-- {ref}`models`
+- [Log LLM prompt artifacts](llm-artifacts.md#log-llm-prompt-artifacts)
+- [Log code artifacts](code-artifacts.md#log-a-code-artifact)
+- [Log model artifacts](models.md#train-exaluate-and-log-a-model-trained-with-scikit-learn)
 - {ref}`logging_datasets`
-- [Logging a Databricks response as an artifact](../runtimes/databricks.ipynb#logging-a-databricks-response-as-an-artifact)
+- [Log a Databricks response as an artifact](../runtimes/databricks.ipynb#logging-a-databricks-response-as-an-artifact)
+- {ref}`artifacts`
+- {ref}`working-with-data-and-model-artifacts`
+
 ## Basic logging of an artifacts file
 `log_artifact` can be used to log many kinds of files, for example `html`,`pkl` and more. This is the most general method of logging artifacts. 
 ```{admonition} Tip
@@ -66,7 +71,7 @@ project.log_artifact(
     format="html",
 )
 ```
-## Logging Plotly artifacts 
+## Log Plotly artifacts 
 This example illustrates using MLRun to convert and handle the object: 
 ```python
 # Use mlrun to convert the python object
@@ -74,7 +79,7 @@ plotly_artifact = mlrun.artifacts.PlotlyArtifact(figure=fig, key="sin_x")
 # Log the artifact
 context.log_artifact(plotly_artifact)
 ```
-## Logging directory artifacts 
+## Log directory artifacts 
 When using `log_artifact` to log a directory, by default:
 - The artifact is logged as an `mlrun.artifacts.DirArtifact` object.
 - The files are not uploaded. If you want to upload the files, set `upload=True`.
@@ -85,3 +90,12 @@ project.log_artifact(
     labels={"Dir": "dir-example"},
 )
 ```
+
+
+## Log dataset artifacts
+```python
+# Log the dataset as an artifact
+dataset_artifact = project.log_dataset(key="to-index", df=data)
+dataset_artifact.uri
+```
+See a full example in {ref}`working-with-rag`.

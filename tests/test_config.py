@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import os
 import pathlib
 import subprocess
@@ -25,14 +24,12 @@ from tempfile import NamedTemporaryFile
 import deepdiff
 import dotenv
 import pytest
-import requests_mock as requests_mock_package
 import yaml
 
 import mlrun
 import mlrun.errors
 import mlrun.projects.project
 from mlrun.common.schemas import SecurityContextEnrichmentModes
-from mlrun.db.httpdb import HTTPRunDB
 from tests.conftest import out_path
 
 assets_path = pathlib.Path(__file__).parent / "assets"
@@ -504,20 +501,35 @@ def test_get_default_function_node_selector():
     assert mlrun.mlconf.get_default_function_node_selector() == {}
 
 
-def test_setting_dbpath_trigger_connect(requests_mock: requests_mock_package.Mocker):
-    api_url = "http://mlrun-api-url:8080"
-    remote_host = "some-namespace"
-    response_body = {
-        "version": "some-version",
-        "remote_host": remote_host,
-    }
-    requests_mock.get(
-        f"{api_url}/{HTTPRunDB.get_api_path_prefix()}/client-spec",
-        json=response_body,
+def test_validate_config_rejects_malformed_default_function_pod_labels(monkeypatch):
+    monkeypatch.setattr(
+        mlrun.mlconf, "default_function_pod_labels", "not-valid-base64!@#"
     )
-    assert "" == mlrun.mlconf.remote_host
-    mlrun.mlconf.dbpath = api_url
-    assert remote_host == mlrun.mlconf.remote_host
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentTypeError):
+        mlrun.config._validate_config(mlrun.mlconf)
+
+
+def test_db_connection_deferred_until_reload(monkeypatch):
+    """
+    This test verifies that setting `mlconf.dbpath` does not eagerly trigger a DB connection.
+    Instead, the connection should be established only at the end of `mlconf.reload()` when populating the config.
+    """
+
+    url = "https://mlrun-api"
+    monkeypatch.setenv("MLRUN_DBPATH", url)
+    import mlrun
+
+    with unittest.mock.patch("mlrun.db.get_run_db") as mock_get_run_db:
+        mlrun.mlconf.dbpath = url
+
+        # ensure setting dbpath does not trigger DB connection
+        mock_get_run_db.assert_not_called()
+
+        # this triggers config update and calls get_run_db at the end
+        mlrun.mlconf.reload()
+
+        # verify the connection happened
+        mock_get_run_db.assert_called_once_with(url, force_reconnect=True)
 
 
 def test_verify_security_context_enrichment_mode_is_allowed_success():
@@ -588,15 +600,12 @@ def test_set_environment_cred():
 def test_env_from_file():
     env_path = str(assets_path / "envfile")
     env_dict = mlrun.set_env_from_file(env_path, return_dict=True)
-
-    assert env_dict == collections.OrderedDict(
-        {
-            "MLRUN_HTTPDB__HTTP__VERIFY": "false",
-            "MLRUN_KFP_TTL": "12345",
-            "ENV_ARG1": "123",
-            "ENV_ARG2": "abc",
-        }
-    )
+    assert env_dict == {
+        "ENV_ARG1": "123",
+        "ENV_ARG2": "abc",
+        "MLRUN_HTTPDB__HTTP__VERIFY": "false",
+        "MLRUN_KFP_TTL": "12345",
+    }
     assert mlrun.mlconf.kfp_ttl == 12345
     for key, value in env_dict.items():
         assert os.environ[key] == value
@@ -610,6 +619,34 @@ def test_env_from_file():
         assert os.environ[key] == value
     for key in env_dict.keys():
         del os.environ[key]
+
+
+def test_env_from_file_overrides_default_env_file(tmp_path):
+    """Test that set_env_from_file values take precedence over ~/.mlrun.env"""
+    # Create a "default" env file simulating ~/.mlrun.env
+    default_env = tmp_path / "default.env"
+    default_env.write_text("MLRUN_KFP_TTL=111\n")
+
+    # Create a project-specific env file with different value
+    project_env = tmp_path / "project.env"
+    project_env.write_text("MLRUN_KFP_TTL=222\n")
+
+    original_default = mlrun.config.default_env_file
+    original_kfp_ttl = os.environ.get("MLRUN_KFP_TTL")
+    try:
+        mlrun.config.default_env_file = str(default_env)
+        env_dict = mlrun.set_env_from_file(str(project_env), return_dict=True)
+
+        # The project file value must win over the default env file
+        assert os.environ["MLRUN_KFP_TTL"] == "222"
+        assert env_dict["MLRUN_KFP_TTL"] == "222"
+        assert mlrun.mlconf.kfp_ttl == 222
+    finally:
+        mlrun.config.default_env_file = original_default
+        if original_kfp_ttl is None:
+            os.environ.pop("MLRUN_KFP_TTL", None)
+        else:
+            os.environ["MLRUN_KFP_TTL"] = original_kfp_ttl
 
 
 def test_mock_functions():
@@ -665,6 +702,24 @@ def test_deduct_v3io_paths():
     assert conf["v3io_framesd"] == "https://framesd" + cluster
 
 
+def test_read_env_httpdb_priority():
+    """
+    Test that `read_env` correctly prioritizes the 'MLRUN_HTTPDB__HTTP__VERIFY' env variable by ensuring that
+    'httpdb' appears first in the configuration dictionary.
+    """
+    env = {
+        "MLRUN_DBPATH": "https://mlrun-api",
+        "MLRUN_KFP_TTL": "12345",
+        "MLRUN_HTTPDB__HTTP__VERIFY": "false",
+    }
+    conf = mlrun.config.read_env(env=env)
+
+    # Ensure that httpdb is returned first in the config
+    first_key = next(iter(conf))
+    assert first_key == "httpdb", "httpdb was not prioritized first"
+    assert conf["httpdb"]["http"]["verify"] is False
+
+
 def test_set_config():
     env_path = f"{out_path}/env/myenv.env"
     api = "http://localhost:8080"
@@ -715,6 +770,53 @@ def test_set_and_load_default_config():
         del os.environ["YYYY"]
     if "MLRUN_KFP_TTL" in os.environ:
         del os.environ["MLRUN_KFP_TTL"]
+
+
+@pytest.mark.parametrize(
+    "service_account_str, expected_service_accounts",
+    [
+        ("", []),
+        ("service-account-1", ["service-account-1"]),
+        (
+            "service-account-1,service-account-2, service-account-3 ",
+            ["service-account-1", "service-account-2", "service-account-3"],
+        ),
+    ],
+)
+def test_default_forbidden_service_account_config(
+    service_account_str, expected_service_accounts
+):
+    mlrun.mlconf.function.spec.service_account.forbidden_service_accounts = (
+        service_account_str
+    )
+    assert (
+        mlrun.mlconf.default_forbidden_service_accounts() == expected_service_accounts
+    )
+
+
+def test_config_keys_and_values():
+    """Test that Config.keys() and Config.values() return the correct data.
+
+    Regression test for a bug where keys() and values() referenced self.data
+    (which doesn't exist) instead of self._cfg, causing AttributeError.
+    """
+    cfg = mlrun.config.Config({"a": 1, "b": 2, "nested": {"x": 10}})
+
+    # keys() should return all top-level keys
+    keys = list(cfg.keys())
+    assert sorted(keys) == ["a", "b", "nested"]
+
+    # values() should return all top-level values
+    values = list(cfg.values())
+    assert sorted(values, key=str) == sorted([1, 2, {"x": 10}], key=str)
+
+    # items() should match keys and values
+    items = list(cfg.items())
+    assert sorted(items) == sorted([("a", 1), ("b", 2), ("nested", {"x": 10})])
+
+    # __iter__ should yield the same keys
+    iter_keys = list(cfg)
+    assert sorted(iter_keys) == ["a", "b", "nested"]
 
 
 def _exec_mlrun(cmd, cwd=None):

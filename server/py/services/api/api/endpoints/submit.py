@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
+
 from http import HTTPStatus
-from typing import Optional
 
 import fastapi.concurrency
 from fastapi import APIRouter, Depends, Header, Request
@@ -40,13 +39,16 @@ router = APIRouter()
 @router.post("/submit_job/")
 async def submit_job(
     request: Request,
-    username: Optional[str] = Header(None, alias="x-remote-user"),
+    background_tasks: fastapi.BackgroundTasks,
+    username: str | None = Header(
+        None, alias=mlrun.common.schemas.HeaderNames.remote_user
+    ),
     auth_info: mlrun.common.schemas.AuthInfo = Depends(deps.authenticate_request),
     db_session: Session = Depends(deps.get_db_session),
-    client_version: Optional[str] = Header(
+    client_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.client_version
     ),
-    client_python_version: Optional[str] = Header(
+    client_python_version: str | None = Header(
         None, alias=mlrun.common.schemas.HeaderNames.python_version
     ),
 ):
@@ -136,4 +138,6 @@ async def submit_job(
                 mlrun_constants.MLRunInternalLabels.client_python_version: client_python_version
             }
         )
-    return await framework.api.utils.submit_run(db_session, auth_info, data)
+    return await framework.api.utils.submit_run(
+        db_session, auth_info, background_tasks, data
+    )
